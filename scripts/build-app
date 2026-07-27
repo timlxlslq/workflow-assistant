@@ -1,0 +1,29 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BUILD="$ROOT/build"
+APP="$BUILD/工作流程助手.app"
+CONTENTS="$APP/Contents"
+RESOURCES="$CONTENTS/Resources/project"
+
+rm -rf "$APP"
+mkdir -p "$CONTENTS/MacOS" "$RESOURCES"
+MODULE_CACHE="/tmp/traveler-assistant-module-cache"
+mkdir -p "$MODULE_CACHE"
+/usr/bin/xcrun --sdk macosx swiftc -module-cache-path "$MODULE_CACHE" -Xcc -fmodules-cache-path="$MODULE_CACHE" -parse-as-library "$ROOT/macos/TravelerAssistant.swift" -o "$CONTENTS/MacOS/TravelerAssistant" -framework SwiftUI -framework AppKit -framework UserNotifications
+cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"
+cp "$ROOT/assets/icons/AppIcon.png" "$CONTENTS/Resources/AppIcon.png"
+cp -R "$ROOT/traveler_assistant" "$RESOURCES/"
+cp -R "$ROOT/config" "$RESOURCES/"
+cp -R "$ROOT/scripts" "$RESOURCES/"
+cp -R "$ROOT/vendor" "$RESOURCES/"
+cp -R "$ROOT/tools" "$RESOURCES/"
+mkdir -p "$RESOURCES/bin" "$RESOURCES/node_modules"
+cp "/Users/lantian/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node" "$RESOURCES/bin/node"
+cp -RL "/Users/lantian/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright" "$RESOURCES/node_modules/playwright"
+cp -RL "/Users/lantian/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright-core" "$RESOURCES/node_modules/playwright-core"
+chmod +x "$RESOURCES/bin/node"
+chmod +x "$RESOURCES/scripts/traveler-assistant"
+/usr/bin/codesign --force --deep --sign - "$APP"
+echo "$APP"

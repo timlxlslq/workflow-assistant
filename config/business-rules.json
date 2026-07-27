@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "sheet_materials": {
+    "thickness_aliases": {
+      "5": 5.4
+    },
+    "plywood": {
+      "thicknesses_mm": [18, 14.5, 5.4],
+      "standard_size_mm": [2440, 1220]
+    },
+    "panel": {
+      "thicknesses_mm": [19.1, 8, 9],
+      "standard_size_mm": [2745, 1220]
+    },
+    "display_order_mm": [18, 14.5, 5.4, 19.1, 9, 8],
+    "edge_decimals": 2
+  },
+  "materials_workbook": {
+    "plywood_columns": {
+      "3": 18,
+      "4": 14.5,
+      "5": 5.4
+    },
+    "panel_rows": {
+      "3/4": 19.1,
+      "1/4": 9
+    }
+  },
+  "fittings": {
+    "direct_codes": {
+      "WJ-CBT": "Shelf Holder",
+      "71T950A": "Hinge"
+    },
+    "paired_codes": {
+      "H-RAIL": "H-Rail",
+      "L-RAIL": "L-Rail"
+    },
+    "units": {
+      "Hinge": "pcs/个",
+      "Shelf Holder": "pcs/个",
+      "H-Rail": "set/套",
+      "L-Rail": "set/套"
+    }
+  }
+}

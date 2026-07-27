@@ -1,0 +1,39 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SOURCE_APP="$ROOT/build/工作流程助手.app"
+DEST_APP="/Applications/工作流程助手.app"
+OLD_APP="/Applications/Work Order Traveler Assistant.app"
+BACKUP_DIR="/tmp/traveler-assistant-install-backup"
+LAUNCH_PLIST="$HOME/Library/LaunchAgents/com.pacificpride.traveler-assistant.plist"
+
+if [[ ! -d "$SOURCE_APP" ]]; then
+  echo "App has not been built: $SOURCE_APP" >&2
+  exit 1
+fi
+
+mkdir -p "$BACKUP_DIR"
+OLD_STATE="$HOME/Library/Application Support/Work Order Traveler Assistant"
+NEW_STATE="$HOME/Library/Application Support/工作流程助手"
+if [[ -d "$OLD_STATE" && ! -e "$NEW_STATE" ]]; then
+  mv "$OLD_STATE" "$NEW_STATE"
+fi
+if [[ -d "$OLD_APP" ]]; then
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  mv "$OLD_APP" "$BACKUP_DIR/Work Order Traveler Assistant-$stamp.app"
+fi
+if [[ -d "$DEST_APP" ]]; then
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  mv "$DEST_APP" "$BACKUP_DIR/工作流程助手-$stamp.app"
+fi
+/usr/bin/ditto "$SOURCE_APP" "$DEST_APP"
+
+/bin/launchctl bootout "gui/$(id -u)/com.pacificpride.traveler-assistant" >/dev/null 2>&1 || true
+if [[ -f "$LAUNCH_PLIST" ]]; then
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  mv "$LAUNCH_PLIST" "$BACKUP_DIR/com.pacificpride.traveler-assistant-$stamp.plist"
+fi
+
+echo "$DEST_APP"
+echo "Automatic scheduling disabled; run the app manually."

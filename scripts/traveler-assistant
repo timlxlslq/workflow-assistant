@@ -1,0 +1,10 @@
+#!/bin/bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHON_BIN="${TRAVELER_PYTHON:-/usr/bin/python3}"
+VENDOR_DIR="$PROJECT_DIR/vendor"
+
+export PYTHONPATH="$PROJECT_DIR:$VENDOR_DIR${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PYTHON_BIN" -m traveler_assistant.core "$@"
+
