@@ -10,6 +10,8 @@
 - 新工厂单校验通过后生成 Traveler；已有 Traveler 有变化时只生成差异，等待人工决定。
 - 保存运行记录、提醒状态和忽略五金状态。
 - 提供 macOS SwiftUI 界面，所有任务由用户手工打开应用后启动。
+- 库存出库页可选择 Traveler、执行全量预检、显示商品映射和异常，并在后台模拟填写到保存前。
+- 真实保存已启用；每次只允许选择一份 Traveler，且必须在独立确认弹窗中再次确认。
 
 详细业务规则见 [docs/business-rules.md](docs/business-rules.md)。
 程序实际读取的可量化规则见 [config/business-rules.json](config/business-rules.json)。
@@ -18,6 +20,7 @@
 
 - `config/business-rules.json`：厚度、尺寸、五金代码等机器可执行规则；保存后下次启动程序生效。
 - `docs/business-rules.md`：解释业务原因、复杂流程、异常处理和人工决定，供检查、讨论及修改审批使用。
+- `docs/inventory-outbound-rules.md`：库存商品匹配、其他出库单、同步状态和异常处理的完整业务流程。
 - 修改 JSON 后必须运行完整测试；修改复杂流程说明后，仍需同步修改代码和测试。
 
 ## 开发运行
@@ -28,6 +31,17 @@
 ```
 
 `preview` 永不写入 Traveler；`scan` 只会自动创建全新且校验通过的 Traveler，不覆盖已有文件。
+
+新版按订单工作流使用独立入口，旧命令继续保留：
+
+```bash
+./scripts/traveler-assistant order list
+./scripts/traveler-assistant order preview --folder "/Volumes/server-1/Optimized Orders/pp0068"
+./scripts/traveler-assistant order generate --folder "/Volumes/server-1/Optimized Orders/pp0068"
+```
+
+应用中的“Traveler生成”页会先列文件夹，点击后预览并校验。旧版扫描入口目前已隐藏，
+其业务逻辑暂时保留备用；待新版流程稳定后，应提醒用户确认并删除旧版界面代码。
 
 ## 凭据安全
 

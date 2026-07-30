@@ -26,7 +26,11 @@ from traveler_assistant.core import (
 )
 
 
-SAMPLE = Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/PacificPride/Other/pp0047/pp0047kitchen/Report"
+SAMPLE_LOCATIONS = (
+    Path("/Volumes/server/Optimized Orders/pp0047/pp0047kitchen/Report"),
+    Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/PacificPride/Other/pp0047/pp0047kitchen/Report",
+)
+SAMPLE = next((path for path in SAMPLE_LOCATIONS if path.is_dir()), SAMPLE_LOCATIONS[0])
 
 
 class CoreTests(unittest.TestCase):
@@ -64,7 +68,7 @@ class CoreTests(unittest.TestCase):
             lookup_aimes_names(Config(aimes_username=""), ["F999"])
         self.assertEqual(raised.exception.code, "aimes_credentials")
 
-    @unittest.skipUnless(SAMPLE.is_dir(), "PP0047 iCloud sample is not available")
+    @unittest.skipUnless(SAMPLE.is_dir(), "PP0047 server or iCloud sample is not available")
     def test_parse_kitchen_samples(self):
         board = SAMPLE / "pp-板材清单-newPC124429962607020002.xlsx"
         fittings = SAMPLE / "FittingslistPC124429962607020002.xlsx"

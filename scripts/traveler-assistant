@@ -6,5 +6,12 @@ PYTHON_BIN="${TRAVELER_PYTHON:-/usr/bin/python3}"
 VENDOR_DIR="$PROJECT_DIR/vendor"
 
 export PYTHONPATH="$PROJECT_DIR:$VENDOR_DIR${PYTHONPATH:+:$PYTHONPATH}"
+if [[ "${1:-}" == "inventory" ]]; then
+  shift
+  exec "$PYTHON_BIN" -m traveler_assistant.inventory "$@"
+fi
+if [[ "${1:-}" == "order" ]]; then
+  shift
+  exec "$PYTHON_BIN" -m traveler_assistant.order_workflow "$@"
+fi
 exec "$PYTHON_BIN" -m traveler_assistant.core "$@"
-

@@ -16,3 +16,6 @@ build/
 settings.json
 secrets.json
 credentials.json
+data/todo-items.json
+# Real inventory exports contain company product, stock, and purchasing data.
+resources/inventory/*.xlsx

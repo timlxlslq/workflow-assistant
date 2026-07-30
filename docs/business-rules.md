@@ -20,7 +20,7 @@
 |---|---|
 | 公司 Wi-Fi | `SpectrumSetup-7C81` |
 | SMB 地址 | `smb://GUEST:@server/G` |
-| 服务器目录 | `/Volumes/server/Optimized Orders` |
+| 当前测试来源目录 | `~/Downloads`（暂时代替服务器目录，可在设置中恢复） |
 | Traveler 目标 | `~/Library/Mobile Documents/com~apple~CloudDocs/PacificPride/Order` |
 | 模板 | `~/Library/Mobile Documents/com~apple~CloudDocs/PacificPride/模版/Work Order Traveler().xlsx` |
 | 备份目录 | `~/Library/Mobile Documents/com~apple~CloudDocs/PacificPride/Work Order Traveler Backups` |
@@ -96,7 +96,7 @@
 | 任务前置检查 | 每次任务最先确认服务器目录可读且 AIMES 首页可打开；任一失败均不开始后续处理 |
 | 重试 | 手工任务内的AIMES多工厂单查询保留既定重试；服务器或iCloud失败立即显示在界面，由用户决定何时重试 |
 | 无变化 | 不发送系统通知，只记日志 |
-| 备份清理 | 后续改为在手工任务完成时检查；当前自动月底提醒已随定时任务取消，待界面功能补充 |
+| 备份清理 | 已取消三个月前备份的月底清理提醒；现有备份继续保留，除非用户另行要求清理 |
 | 日志 | 保留一年；超过一年提醒清理；达到 100MB 提醒 |
 
 设置界面允许修改初始扫描日期、公司 Wi-Fi、服务器目录、订单目录、模板、备份目录、尺寸容差及 AIMES 用户名；AIMES 密码只保存在 macOS 钥匙串。
@@ -121,3 +121,20 @@
       └─ 存在且不同：显示差异，等待人工决定
   → 保存日志并按需通知
 ```
+
+## 8. 新版按订单生成 Traveler
+
+旧版扫描与更新逻辑继续保留为备用入口。新版默认流程如下：
+
+1. 只读取服务器根目录下名称完全符合 `PP####`、`PP####-数字` 或 `CS###` 的文件夹并显示；点击前不读取 Excel。
+2. 点击订单后，在订单根目录寻找唯一一个文件名包含 `materials` 的 `.xlsx`，忽略 `~$` 临时文件。
+3. materials 中 Plywood 读取 `Total Qty:` 行；多颜色 Panel/封边读取 Color Table，单颜色且 Color Table 为空时回退读取 `Total Qty:` 行的 Finish Panel、Edge Banding 和 Color。
+4. `Khaki`、`Khaki (7x9)` 在预览中统一显示为正式名称 `Penelope FA44`，插入 Traveler 的原始 materials 工作簿不改内容。
+5. Plywood、19.1mm Panel 和 8/9mm 背板数量必须为非负整数；1/4 Finish Panel 在预览中显示为 8mm。任何小数均停止。
+6. 只要某个有 Panel 数量的颜色封边为空、为 0 或为负数，整单停止。
+7. 遍历所有板材清单，按“订 单 号”和“订单名称”右侧单元格建立工厂单名称映射。缺失名称先读本机缓存，再查询 AIMES；查询成功后写入本机应用状态缓存。
+8. 遍历所有 `Fittingslist*.xlsx`。同一工厂单重复且内容不同时采用修改时间唯一最新的文件，并在操作记录提示；最高修改时间并列且内容不同时停止。
+9. 五金忽略偏好按标准化后的名称、Code、Size、Unit 全局保存，对所有订单默认生效；预览中灰显并允许恢复。
+10. 校验通过后，一个订单只生成 `Order/<订单号>/Work Order Traveler(<订单号>).xlsx`。已有同名文件不覆盖。
+11. 原始 materials 的唯一工作簿原样复制到 `WorkOrderTraveler` 后；不再把板材和封边写入 `WorkOrderTraveler` 或 `Pickinglist`。
+12. `Pickinglist` 删除旧 Panel 区域，每个工厂单向下复制一套“工厂单名称、Fitting、Hardware Accessory”区块，只写未忽略五金。

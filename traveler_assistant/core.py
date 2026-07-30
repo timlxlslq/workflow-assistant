@@ -15,6 +15,7 @@ import math
 import urllib.error
 import urllib.request
 import sys
+import zipfile
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -371,7 +372,27 @@ def parse_board(path: Path, threshold: float) -> tuple[str, str, list[PanelItem]
 
 
 def parse_fittings_groups(path: Path) -> list[tuple[str, list[FittingItem]]]:
-    wb = load_workbook(path, data_only=True, read_only=True)
+    invalid_dimension = False
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for name in archive.namelist():
+                if name.startswith("xl/worksheets/") and name.endswith(".xml"):
+                    head = archive.read(name)[:1024]
+                    if re.search(br'<dimension[^>]+ref="[^"]*\?[^"]*"', head):
+                        invalid_dimension = True
+                        break
+    except (OSError, zipfile.BadZipFile):
+        pass
+    try:
+        wb = load_workbook(path, data_only=True, read_only=not invalid_dimension)
+    except ValueError:
+        # Some AICNC exports contain an invalid worksheet dimension such as
+        # A1:?0. Normal mode ignores that optional dimension and can still
+        # determine whether the workbook contains usable fitting data.
+        try:
+            wb = load_workbook(path, data_only=True, read_only=False)
+        except Exception as exc:
+            raise RuleError("fittings_file_invalid", f"五金清单文件损坏或无法读取：{path.name}") from exc
     if wb.sheetnames != ["Page1"]:
         raise RuleError("fittings_schema", f"五金清单工作表结构变化：{wb.sheetnames}", path=str(path))
     ws = wb["Page1"]
@@ -874,7 +895,7 @@ def generate_traveler(
         else:
             pick.cell(pick_edge_row, 3).value = "Edge banding"
             pick.cell(pick_edge_row, 5).value = "M/米"
-            pick.cell(pick_edge_row, 7).value = None
+            pick.cell(pick_edge_row, 7).value = 0
 
         fitting_rows = {
             "Hinge": _find_row(pick, "Hinge"),
@@ -886,7 +907,7 @@ def generate_traveler(
         for name, row in fitting_rows.items():
             pick.cell(row, 3).value = name
             pick.cell(row, 5).value = units[name]
-            pick.cell(row, 7).value = report.fittings.get(name) or None
+            pick.cell(row, 7).value = report.fittings.get(name) or 0
 
         wb.save(draft)
         check = load_workbook(draft, data_only=False, read_only=True)
