@@ -11,7 +11,7 @@ import tempfile
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from decimal import Decimal, ROUND_HALF_UP
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -315,18 +315,59 @@ def _fitting_signature(items: list[FittingItem]) -> tuple:
     ))
 
 
+def _has_positive_fitting_quantity(path: Path) -> bool | None:
+    """Return None when the workbook cannot be opened, so corruption is never ignored."""
+    try:
+        wb = load_workbook(path, data_only=True, read_only=True)
+    except Exception:
+        # Empty AICNC reports can carry the same invalid A1:?0 worksheet
+        # dimension as usable reports. Normal mode ignores that optional
+        # dimension and lets us distinguish an empty report from corruption.
+        try:
+            wb = load_workbook(path, data_only=True, read_only=False)
+        except Exception:
+            return None
+    for ws in wb.worksheets:
+        for row in ws.iter_rows(min_col=11, max_col=11, values_only=True):
+            value = row[0]
+            if isinstance(value, (int, float)) and math.isfinite(float(value)) and float(value) > 0:
+                return True
+    return False
+
+
 def _choose_fittings(folder: Path) -> tuple[dict[str, list[FittingItem]], list[str]]:
     occurrences: dict[str, list[tuple[Path, float, list[FittingItem], tuple]]] = defaultdict(list)
+    warnings = []
+    found_files = False
     for path in folder.rglob("*.xlsx"):
         if path.name.startswith("~$") or not path.name.lower().startswith("fittingslist"):
             continue
-        for factory, items in parse_fittings_groups(path):
+        found_files = True
+        try:
+            groups = parse_fittings_groups(path)
+        except RuleError:
+            has_quantity = _has_positive_fitting_quantity(path)
+            if has_quantity is False:
+                warnings.append(
+                    f"{path.name} 无有效五金数量，已按无五金报表跳过；Traveler 仍可生成"
+                )
+                continue
+            raise
+        for factory, items in groups:
+            if not any(item.quantity > 0 for item in items):
+                warnings.append(
+                    f"{path.name} 的 {factory} 没有有效五金数量，已按无五金处理"
+                )
+                continue
             occurrences[factory].append((path, path.stat().st_mtime, items, _fitting_signature(items)))
     if not occurrences:
-        raise RuleError("missing_fittings", "订单目录下找不到 Fittingslist Excel")
+        if not found_files:
+            warnings.append("未找到 Fittingslist Excel，本订单将按无五金继续生成 Traveler")
+        elif not warnings:
+            warnings.append("所有 Fittingslist 均没有有效五金数量，本订单将按无五金继续生成 Traveler")
+        return {}, warnings
 
     selected: dict[str, list[FittingItem]] = {}
-    warnings = []
     for factory, matches in sorted(occurrences.items()):
         newest_time = max(item[1] for item in matches)
         newest = [item for item in matches if abs(item[1] - newest_time) < EPSILON]
@@ -397,10 +438,6 @@ def _factory_names(config: Config, folder: Path, factories: set[str]) -> tuple[d
         if previous and previous != name:
             raise RuleError("factory_name_conflict", f"{factory} 在板材清单中对应多个名称：{previous} / {name}")
         names[factory] = name
-    extra = set(names) - factories
-    if extra:
-        raise RuleError("factory_mismatch", f"板材清单出现五金文件中不存在的工厂单：{', '.join(sorted(extra))}")
-
     state = _load_state(config)
     cache = state["factory_names"]
     warnings = []
@@ -431,17 +468,31 @@ def preview_order(config: Config, folder: Path) -> OrderPreview:
     materials_files = sorted(
         path for path in folder.iterdir()
         if path.is_file() and path.suffix.lower() == ".xlsx"
-        and "materials" in path.name.lower() and not path.name.startswith("~$")
+        and "material" in path.name.lower() and not path.name.startswith("~$")
     )
     if not materials_files:
-        raise RuleError("missing_materials", f"{order_id} 根目录找不到文件名包含 materials 的 Excel")
+        raise RuleError("missing_materials", f"{order_id} 根目录找不到文件名包含 material 的 Excel")
     if len(materials_files) > 1:
-        raise RuleError("multiple_materials", f"{order_id} 找到多个 materials Excel，请只保留一个", files=[str(x) for x in materials_files])
+        raise RuleError("multiple_materials", f"{order_id} 找到多个 material Excel，请只保留一个", files=[str(x) for x in materials_files])
     materials_path = materials_files[0]
     sheet_name, materials, edges = parse_order_materials(order_id, materials_path)
+    if order_id.startswith("CS"):
+        return OrderPreview(
+            order_id, folder, materials_path, sheet_name, materials, edges, [],
+            ["来料加工订单只读取板材和封边数量，不读取或写入五金"],
+        )
     fittings, warnings = _choose_fittings(folder)
     names, name_warnings = _factory_names(config, folder, set(fittings))
     warnings.extend(name_warnings)
+    board_only = sorted(set(names) - set(fittings))
+    for factory in board_only:
+        fittings[factory] = []
+    if board_only:
+        warnings.append(
+            f"{', '.join(board_only)} 在板材清单中存在但没有有效五金数量，已按无五金工厂单处理"
+        )
+    if not fittings:
+        raise RuleError("missing_factory_orders", "板材清单和五金文件都无法取得工厂单号，不能生成 Traveler")
     state = _load_state(config)
     legacy_ignored = state["ignored_fittings"]
     mappings = InventoryMappings(config.state_dir / "inventory" / "mappings.json")
@@ -600,6 +651,24 @@ def _write_merged(ws, row: int, col: int, value) -> None:
             return
 
 
+def _write_initial_traveler_date(ws) -> None:
+    for row in ws.iter_rows():
+        for cell in row:
+            if _normalized_label(cell.value) == _normalized_label("Date/日期："):
+                target = ws.cell(cell.row, cell.column + 1)
+                if isinstance(target, MergedCell):
+                    _write_merged(ws, cell.row, cell.column + 1, date.today())
+                    for merged in ws.merged_cells.ranges:
+                        if merged.min_row <= cell.row <= merged.max_row and merged.min_col <= cell.column + 1 <= merged.max_col:
+                            target = ws.cell(merged.min_row, merged.min_col)
+                            break
+                else:
+                    target.value = date.today()
+                target.number_format = "yyyy.m.d"
+                return
+    raise RuleError("template_schema", "Traveler 模板缺少 Date/日期 字段")
+
+
 def _snapshot_rows(ws, first: int, last: int) -> dict:
     return {
         "cells": {
@@ -741,7 +810,9 @@ def _prepare_pickinglist(wb, preview: OrderPreview) -> None:
             row = first_item_row + index
             item = included[index] if index < len(included) else None
             ws.cell(row, 1).value = index + 1
-            ws.cell(row, 2).value = item.code if item else None
+            # The source report's code identifies its own component; it is
+            # not an inventory SKU and must never be written into SKU NO.
+            ws.cell(row, 2).value = None
             _write_merged(ws, row, 3, item.name if item else None)
             _write_merged(ws, row, 5, item.unit if item else None)
             ws.cell(row, 7).value = item.quantity if item else None
@@ -761,6 +832,7 @@ def generate_order_traveler(config: Config, preview: OrderPreview) -> Path:
         if "WorkOrderTraveler" not in wb.sheetnames or "Pickinglist" not in wb.sheetnames:
             raise RuleError("template_schema", "Traveler 模板缺少 WorkOrderTraveler 或 Pickinglist")
         wb["WorkOrderTraveler"]["B5"] = preview.order_id
+        _write_initial_traveler_date(wb["WorkOrderTraveler"])
         _copy_materials_sheet(preview.materials_path, wb, wb.sheetnames.index("WorkOrderTraveler"))
         _prepare_pickinglist(wb, preview)
         wb.save(draft)

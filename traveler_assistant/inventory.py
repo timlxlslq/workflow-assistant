@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -21,7 +22,7 @@ from .core import Config, RuleError, _normalize_name, _text, progress
 
 
 TRAVELER_RE = re.compile(r"^Work Order Traveler\(.+\)\.xlsx$", re.IGNORECASE)
-PP_FOLDER_RE = re.compile(r"^PP\d{4}$", re.IGNORECASE)
+PP_FOLDER_RE = re.compile(r"^(?:PP\d{4}(?:-\d+)?|CS\d{3})$", re.IGNORECASE)
 TB_RE = re.compile(r"^TB(\d+)$", re.IGNORECASE)
 PANEL_RE = re.compile(r"^(\d+(?:\.\d+)?)mm--(.+)$", re.IGNORECASE)
 EDGE_RE = re.compile(r"^Edge banding-+(.+)$", re.IGNORECASE)
@@ -34,21 +35,28 @@ class TravelerItem:
     section: str
     name: str
     quantity: float
+    document_remark: str = ""
 
 
 @dataclass
 class TravelerData:
     path: Path
     pp_folder: str
+    order_id: str
     order_name: str
     items: list[TravelerItem]
     zero_items: list[TravelerItem]
+    documents: dict[str, list[TravelerItem]]
     modified_at: str
     fingerprint: str
 
     def content_snapshot(self) -> dict:
         return {
-            "order_name": self.order_name,
+            "order_id": self.order_id,
+            "documents": {
+                remark: [asdict(item) for item in items]
+                for remark, items in sorted(self.documents.items())
+            },
             "items": [asdict(item) for item in self.items],
             "zero_items": [asdict(item) for item in self.zero_items],
         }
@@ -73,6 +81,7 @@ class OutboundItem:
     quantity: float
     section: str
     match_source: str
+    document_remark: str = ""
 
 
 @dataclass
@@ -88,10 +97,12 @@ class InventoryPreview:
         return not self.missing_items
 
     def payload(self) -> dict:
+        documents = self.document_payloads()
         return {
             "traveler": {
                 "path": str(self.traveler.path),
                 "pp_folder": self.traveler.pp_folder,
+                "order_id": self.traveler.order_id,
                 "order_name": self.traveler.order_name,
                 "modified_at": self.traveler.modified_at,
                 "fingerprint": self.traveler.fingerprint,
@@ -101,8 +112,26 @@ class InventoryPreview:
             "ignored_items": self.ignored_items,
             "missing_items": self.missing_items,
             "warnings": self.warnings,
+            "documents": documents,
             "ready": self.ready,
         }
+
+    def document_payloads(self) -> list[dict]:
+        mapped: dict[str, list[OutboundItem]] = {}
+        for item in self.outbound_items:
+            mapped.setdefault(item.document_remark, []).append(item)
+        ignored_by_remark: dict[str, list[dict]] = {}
+        for item in self.ignored_items:
+            ignored_by_remark.setdefault(str(item.get("document_remark", "")), []).append(item)
+        return [
+            {
+                "remark": remark,
+                "kind": "materials" if remark == self.traveler.order_id else "hardware",
+                "items": [asdict(item) for item in mapped.get(remark, [])],
+                "ignored_items": ignored_by_remark.get(remark, []),
+            }
+            for remark in self.traveler.documents
+        ]
 
 
 def _fingerprint(payload: dict) -> str:
@@ -130,6 +159,132 @@ def _order_name_candidates(ws) -> list[str]:
     return candidates
 
 
+def _normalized_label(value) -> str:
+    return re.sub(r"\s+", "", _text(value)).lower()
+
+
+def _find_label_row(ws, label: str) -> int:
+    wanted = _normalized_label(label)
+    for row in range(1, ws.max_row + 1):
+        if any(_normalized_label(ws.cell(row, col).value) == wanted for col in range(1, ws.max_column + 1)):
+            return row
+    raise RuleError("traveler_usage_schema", f"Usage List 缺少“{label}”")
+
+
+def _displayed_integer(cell, label: str) -> float:
+    value = cell.value
+    if value in (None, ""):
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise RuleError("traveler_quantity", f"{label} 不是有效数字：{value}")
+    number = float(value)
+    if number < 0:
+        raise RuleError("traveler_quantity", f"{label} 不能为负数：{number:g}")
+    if abs(number - round(number)) <= 1e-9:
+        return float(round(number))
+    first_format = _text(cell.number_format).split(";", 1)[0]
+    if first_format.lower() != "general" and "." not in first_format and re.search(r"[0#?]", first_format):
+        return float(Decimal(str(number)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    raise RuleError("traveler_quantity", f"{label} 数量为 {number:g}，板材数量必须为整数")
+
+
+def _nonnegative_number(cell, label: str) -> float:
+    value = cell.value
+    if value in (None, ""):
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        raise RuleError("traveler_quantity", f"{label} 不是有效数字：{value}")
+    number = float(value)
+    if number < 0:
+        raise RuleError("traveler_quantity", f"{label} 不能为负数：{number:g}")
+    return number
+
+
+def _canonical_usage_color(value: str) -> str:
+    color = _text(value)
+    if re.fullmatch(r"khaki(?:\s*\(7x9\))?", color, re.IGNORECASE):
+        return "Penelope FA44"
+    return color
+
+
+def _usage_list_items(ws, order_id: str) -> tuple[list[TravelerItem], list[TravelerItem]]:
+    total_row = _find_label_row(ws, "Total Qty:")
+    color_title_row = _find_label_row(ws, "Color Table")
+    header_map = {
+        _normalized_label(ws.cell(2, col).value): col
+        for col in range(1, ws.max_column + 1)
+        if _text(ws.cell(2, col).value)
+    }
+    positive = []
+    zero = []
+
+    def add(row: int, name: str, quantity: float) -> None:
+        item = TravelerItem(row, "板材与封边", name, quantity, order_id)
+        (positive if quantity > 0 else zero).append(item)
+
+    for label, name in (
+        ("3/4 Plywood", "18mm--Plywood"),
+        ("5/8 Plywood", "14.5mm--Plywood"),
+        ("1/4 Plywood", "5.4mm--Plywood"),
+    ):
+        col = header_map.get(_normalized_label(label))
+        if not col:
+            raise RuleError("traveler_usage_schema", f"Usage List 缺少 {label} 列")
+        add(total_row, name, _displayed_integer(ws.cell(total_row, col), label))
+
+    color_row = None
+    for row in range(color_title_row + 1, min(ws.max_row, color_title_row + 5) + 1):
+        if any(_normalized_label(ws.cell(row, col).value) == "color:" for col in range(1, ws.max_column + 1)):
+            color_row = row
+            break
+    if color_row is None:
+        raise RuleError("traveler_usage_schema", "Usage List 的 Color Table 缺少 Color 行")
+    row_34 = _find_label_row(ws, "Sheets (3/4):")
+    row_14 = _find_label_row(ws, "Sheets (1/4):")
+    row_edge = _find_label_row(ws, "Edge Banding (m):")
+    colors = [
+        (col, _text(ws.cell(color_row, col).value))
+        for col in range(1, ws.max_column + 1)
+        if _text(ws.cell(color_row, col).value)
+        and _normalized_label(ws.cell(color_row, col).value) != "color:"
+    ]
+    single_total_headers = all(
+        header_map.get(_normalized_label(label))
+        for label in ("3/4 Finish Panel", "1/4 Finish Panel", "Edge Banding (m)")
+    )
+    if len(colors) > 1 or (colors and not single_total_headers):
+        for col, source_color in colors:
+            color = _canonical_usage_color(source_color)
+            qty_34 = _displayed_integer(ws.cell(row_34, col), f"{color} Sheets (3/4)")
+            qty_14 = _displayed_integer(ws.cell(row_14, col), f"{color} Sheets (1/4)")
+            edge = _nonnegative_number(ws.cell(row_edge, col), f"{color} Edge Banding")
+            add(row_34, f"19.1mm--{color}", qty_34)
+            add(row_14, f"8mm--{color}", qty_14)
+            add(row_edge, f"Edge banding--{color}", edge)
+    else:
+        required = {
+            "3/4 Finish Panel": "19.1mm",
+            "1/4 Finish Panel": "8mm",
+        }
+        color_col = header_map.get(_normalized_label("Color"))
+        edge_col = header_map.get(_normalized_label("Edge Banding (m)"))
+        if not color_col or not edge_col:
+            raise RuleError("traveler_usage_schema", "单颜色 Usage List 缺少 Color 或 Edge Banding 列")
+        color = _canonical_usage_color(
+            colors[0][1] if colors else _text(ws.cell(total_row, color_col).value)
+        )
+        if not color:
+            raise RuleError("traveler_usage_schema", "单颜色 Usage List 缺少颜色名称")
+        for label, thickness in required.items():
+            col = header_map.get(_normalized_label(label))
+            if not col:
+                raise RuleError("traveler_usage_schema", f"单颜色 Usage List 缺少 {label} 列")
+            add(total_row, f"{thickness}--{color}", _displayed_integer(ws.cell(total_row, col), label))
+        edge = _nonnegative_number(ws.cell(total_row, edge_col), f"{color} Edge Banding")
+        add(total_row, f"Edge banding--{color}", edge)
+    return positive, zero
+
+
 def parse_traveler(path: Path) -> TravelerData:
     if not path.is_file() or path.suffix.lower() != ".xlsx":
         raise RuleError("traveler_missing", f"Traveler 文件不存在或格式不是 xlsx：{path}")
@@ -137,32 +292,47 @@ def parse_traveler(path: Path) -> TravelerData:
         wb = load_workbook(path, data_only=True, read_only=True)
     except Exception as exc:
         raise RuleError("traveler_open", f"无法打开 Traveler：{path.name}") from exc
-    required = {"WorkOrderTraveler", "Pickinglist"}
+    required = {"WorkOrderTraveler", "Usage List", "Pickinglist"}
     if not required.issubset(wb.sheetnames):
         raise RuleError("traveler_schema", f"Traveler 缺少必要工作表：{sorted(required - set(wb.sheetnames))}")
-    names = {
-        sheet: _order_name_candidates(wb[sheet])
-        for sheet in ("WorkOrderTraveler", "Pickinglist")
-    }
-    for sheet, values in names.items():
-        if len(set(values)) > 1:
-            raise RuleError("traveler_identity", f"{sheet} 中出现多个不同工厂单名称：{values}")
-    main_name = names["WorkOrderTraveler"][0] if names["WorkOrderTraveler"] else ""
-    pick_name = names["Pickinglist"][0] if names["Pickinglist"] else ""
-    if main_name and pick_name and main_name != pick_name:
-        raise RuleError("traveler_identity", f"两个工作表的工厂单名称不一致：{main_name} / {pick_name}")
-    order_name = main_name or pick_name
-    if not order_name:
-        raise RuleError("traveler_identity", "Traveler 两个工作表都没有工厂单名称")
-    if order_name.strip() in {"0", "-"}:
-        raise RuleError("traveler_identity", f"Traveler 的工厂单名称无效：{order_name}")
+    work_names = _order_name_candidates(wb["WorkOrderTraveler"])
+    work_order = work_names[0].upper() if work_names else ""
+    usage = wb["Usage List"]
+    usage_order = ""
+    for row in usage.iter_rows():
+        for index, cell in enumerate(row):
+            if _normalized_label(cell.value) == "job:":
+                usage_order = next((_text(item.value).upper() for item in row[index + 1:] if _text(item.value)), "")
+                break
+        if usage_order:
+            break
+    folder_order = next((parent.name.upper() for parent in path.parents if PP_FOLDER_RE.fullmatch(parent.name)), "")
+    filename_match = re.fullmatch(r"Work Order Traveler\(([^)]+)\)\.xlsx", path.name, re.IGNORECASE)
+    filename_order = filename_match.group(1).strip().upper() if filename_match else ""
+    candidates = [value for value in (folder_order, filename_order, usage_order, work_order) if PP_FOLDER_RE.fullmatch(value)]
+    if not candidates:
+        raise RuleError("traveler_identity", "无法从订单文件夹、文件名、Usage List 或 WorkOrderTraveler 取得订单号")
+    order_id = candidates[0]
+    if any(value != order_id for value in candidates[1:]):
+        raise RuleError("traveler_identity", f"Traveler 订单号不一致：{candidates}")
 
     ws = wb["Pickinglist"]
     section = ""
+    current_factory = ""
     name_col = qty_col = None
-    items: list[TravelerItem] = []
-    zero_items: list[TravelerItem] = []
+    fitting_totals: dict[tuple[str, str], TravelerItem] = {}
+    fitting_zero: list[TravelerItem] = []
+    documents: dict[str, list[TravelerItem]] = {}
     for row_number, row in enumerate(ws.iter_rows(values_only=True), 1):
+        for index, value in enumerate(row):
+            if _text(value) == "Name/工厂单名称":
+                current_factory = next((_text(item) for item in row[index + 1:] if _text(item)), "")
+                if not current_factory:
+                    raise RuleError("traveler_identity", f"Pickinglist 第 {row_number} 行缺少工厂单名称")
+                documents.setdefault(current_factory, [])
+                section = ""
+                name_col = qty_col = None
+                break
         first = _text(row[0]) if row else ""
         if first and not isinstance(row[0], (int, float)) and first not in {"No.", "Picking List领料单", "Name/工厂单名称"}:
             if _find_header(row, "Name名字") is None and _find_header(row, "QTY数量") is None:
@@ -186,33 +356,43 @@ def parse_traveler(path: Path) -> TravelerData:
             if value not in (None, "", 0, 0.0):
                 raise RuleError("traveler_schema", f"Pickinglist 第 {row_number} 行有数量但没有名称")
             continue
+        if not current_factory:
+            raise RuleError("traveler_identity", f"Pickinglist 第 {row_number} 行五金没有对应工厂单名称")
         if value in (None, "", 0, 0.0):
-            zero_items.append(TravelerItem(row_number, section, name, 0.0))
+            fitting_zero.append(TravelerItem(row_number, section, name, 0.0, current_factory))
             continue
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise RuleError("traveler_quantity", f"{name} 的数量不是有效数字：{value}", row=row_number)
         if float(value) < 0:
             raise RuleError("traveler_quantity", f"{name} 的数量不能为负数：{value}", row=row_number)
-        items.append(TravelerItem(row_number, section, name, float(value)))
-    duplicates = [name for name, count in Counter(_normalize_name(item.name) for item in items).items() if count > 1]
-    if duplicates:
-        detail = [
-            asdict(item) for item in items
-            if _normalize_name(item.name) in duplicates
-        ]
-        raise RuleError("traveler_duplicate_item", "Traveler 中存在重复领料名称，需要人工判断", items=detail)
-    pp_folder = next((parent.name.upper() for parent in path.parents if PP_FOLDER_RE.fullmatch(parent.name)), path.parent.name)
+        key = (current_factory, _normalize_name(name))
+        if key in fitting_totals:
+            fitting_totals[key].quantity += float(value)
+        else:
+            fitting_totals[key] = TravelerItem(row_number, section, name, float(value), current_factory)
+    material_items, material_zero = _usage_list_items(usage, order_id)
+    documents[order_id] = material_items
+    for item in fitting_totals.values():
+        documents.setdefault(item.document_remark, []).append(item)
+    items = material_items + list(fitting_totals.values())
+    zero_items = material_zero + fitting_zero
+    pp_folder = folder_order or path.parent.name
     snapshot = {
-        "order_name": order_name,
-        "items": [asdict(item) for item in items],
+        "order_id": order_id,
+        "documents": {
+            remark: [asdict(item) for item in values]
+            for remark, values in sorted(documents.items())
+        },
         "zero_items": [asdict(item) for item in zero_items],
     }
     return TravelerData(
         path=path.resolve(),
         pp_folder=pp_folder,
-        order_name=order_name,
+        order_id=order_id,
+        order_name=order_id,
         items=items,
         zero_items=zero_items,
+        documents=documents,
         modified_at=datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
         fingerprint=_fingerprint(snapshot),
     )
@@ -369,28 +549,34 @@ def _single(catalog: ProductCatalog, matches: list[Product], traveler_name: str,
 
 
 def match_item(catalog: ProductCatalog, mappings: InventoryMappings, item: TravelerItem) -> list[OutboundItem]:
+    def outbound(product: Product, quantity: float, source: str) -> OutboundItem:
+        return OutboundItem(
+            item.name, product.code, product.name, quantity, item.section, source,
+            item.document_remark,
+        )
+
     ignored = mappings.ignored_reason(item.name)
     if ignored is not None:
         return []
     manual = mappings.manual_code(item.name)
     if manual:
         product = catalog.require_code(manual)
-        return [OutboundItem(item.name, product.code, product.name, item.quantity, item.section, "人工指定")]
+        return [outbound(product, item.quantity, "人工指定")]
     normalized = _normalize_name(item.name)
     if normalized == "PUSHOPEN":
         results = []
         for code in ("M1068", "M1069"):
             product = catalog.require_code(code)
-            results.append(OutboundItem(item.name, product.code, product.name, item.quantity, item.section, "Push Open 1:1拆分"))
+            results.append(outbound(product, item.quantity, "Push Open 1:1拆分"))
         return results
     fixed = FIXED_CODES.get(normalized)
     if fixed:
         product = catalog.require_code(fixed)
-        return [OutboundItem(item.name, product.code, product.name, item.quantity, item.section, "已确认规则")]
+        return [outbound(product, item.quantity, "已确认规则")]
     if match := TB_RE.fullmatch(item.name.strip()):
         token = f"TB{match.group(1)}用"
         product, source = _single(catalog, catalog.find(category="Hardware/Trash Can", contains=token), item.name, "TB型号规则")
-        return [OutboundItem(item.name, product.code, product.name, item.quantity, item.section, source)]
+        return [outbound(product, item.quantity, source)]
     if match := EDGE_RE.fullmatch(item.name.strip()):
         color = match.group(1).strip()
         matches = catalog.find(category="Edge band", name=f"{color} Edge Banding")
@@ -407,7 +593,7 @@ def match_item(catalog: ProductCatalog, mappings: InventoryMappings, item: Trave
         product, source = _single(catalog, matches, item.name, source)
         rounded = float(Decimal(str(item.quantity)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
         source = f"{source}（{item.quantity:g}m→{rounded:g}m，四舍五入取整）"
-        return [OutboundItem(item.name, product.code, product.name, rounded, item.section, source)]
+        return [outbound(product, rounded, source)]
     if match := PANEL_RE.fullmatch(item.name.strip()):
         thickness = float(match.group(1))
         color = match.group(2).strip()
@@ -418,11 +604,11 @@ def match_item(catalog: ProductCatalog, mappings: InventoryMappings, item: Trave
                 item.name,
                 "Panel颜色和规格",
             )
-            return [OutboundItem(item.name, product.code, product.name, item.quantity, item.section, source)]
+            return [outbound(product, item.quantity, source)]
     exact_matches = catalog.find(name=item.name)
     if exact_matches:
         product, source = _single(catalog, exact_matches, item.name, "库存商品名称精确匹配")
-        return [OutboundItem(item.name, product.code, product.name, item.quantity, item.section, source)]
+        return [outbound(product, item.quantity, source)]
     raise RuleError(
         "product_match",
         f"找不到与 {item.name} 名称完全一致的库存商品，需要人工指定",
@@ -452,12 +638,17 @@ def build_preview(path: Path, catalog_path: Path, mapping_path: Path) -> Invento
                 "message": str(exc),
                 **exc.context,
             })
-    duplicates = [
-        code for code, count in Counter(item.product_code for item in outbound).items()
-        if count > 1 and _normalize_name(code) not in {"M1068", "M1069"}
+    duplicate_keys = [
+        key for key, count in Counter(
+            (item.document_remark, item.product_code) for item in outbound
+        ).items()
+        if count > 1 and _normalize_name(key[1]) not in {"M1068", "M1069"}
     ]
-    if duplicates:
-        conflicts = [asdict(item) for item in outbound if item.product_code in duplicates]
+    if duplicate_keys:
+        conflicts = [
+            asdict(item) for item in outbound
+            if (item.document_remark, item.product_code) in duplicate_keys
+        ]
         missing.append({"code": "duplicate_product_code", "message": "多个 Traveler 项目映射到同一商品编号", "items": conflicts})
     return InventoryPreview(traveler, outbound, ignored, missing)
 
@@ -506,7 +697,7 @@ class InventorySyncStore:
     def __init__(self, path: Path, backup_root: Path):
         self.path = path
         self.backup_root = backup_root / "Inventory Sync Records"
-        self.data = {"version": 1, "records": {}}
+        self.data = {"version": 2, "records": {}}
         if path.is_file():
             try:
                 self.data = json.loads(path.read_text(encoding="utf-8"))
@@ -514,54 +705,140 @@ class InventorySyncStore:
                 raise RuleError("inventory_sync", f"库存同步记录无法读取：{path}") from exc
 
     @staticmethod
-    def key(order_name: str, path: str) -> str:
-        return hashlib.sha256(f"{_normalize_name(order_name)}\n{Path(path).resolve()}".encode()).hexdigest()
+    def key(order_id: str, remark: str) -> str:
+        return hashlib.sha256(
+            f"{_normalize_name(order_id)}\n{_normalize_name(remark)}".encode()
+        ).hexdigest()
 
-    def record_for(self, traveler: TravelerData) -> dict | None:
-        return self.data.get("records", {}).get(self.key(traveler.order_name, str(traveler.path)))
+    @staticmethod
+    def raw_document_fingerprint(items: list[TravelerItem]) -> str:
+        return _fingerprint({
+            "items": sorted(
+                (
+                    _normalize_name(item.name),
+                    float(item.quantity),
+                )
+                for item in items
+            )
+        })
+
+    @staticmethod
+    def mapped_document_fingerprint(items: list[OutboundItem]) -> str:
+        return _fingerprint({
+            "items": sorted(
+                (item.product_code.upper(), float(item.quantity))
+                for item in items
+            )
+        })
+
+    def record_for_document(self, order_id: str, remark: str) -> dict | None:
+        return self.data.get("records", {}).get(self.key(order_id, remark))
+
+    def records_for_order(self, order_id: str) -> list[dict]:
+        normalized = _normalize_name(order_id)
+        return [
+            record for record in self.data.get("records", {}).values()
+            if _normalize_name(str(record.get("order_id", ""))) == normalized
+        ]
 
     def status_for(self, traveler: TravelerData) -> tuple[str, str]:
-        record = self.record_for(traveler)
-        if not record:
+        records = self.records_for_order(traveler.order_id)
+        if not records:
             return "未出库", ""
-        if record.get("status") in {"结果未知", "失败", "原单据不可编辑"}:
-            return record["status"], record.get("document_number", "")
-        if record.get("fingerprint") != traveler.fingerprint:
-            return "需要更新", record.get("document_number", "")
-        return "已出库", record.get("document_number", "")
+        current_remarks = set(traveler.documents)
+        if any(
+            record.get("remark") not in current_remarks
+            or not traveler.documents.get(str(record.get("remark", "")), [])
+            for record in records
+        ):
+            return "需要人工处理", ""
+        document_numbers = []
+        missing = False
+        changed = False
+        for remark, items in traveler.documents.items():
+            if not items:
+                continue
+            record = self.record_for_document(traveler.order_id, remark)
+            if not record:
+                missing = True
+                continue
+            document_numbers.append(str(record.get("document_number", "")))
+            if record.get("raw_fingerprint") != self.raw_document_fingerprint(items):
+                changed = True
+        if changed:
+            return "需要更新", "、".join(filter(None, document_numbers))
+        if missing:
+            return "未出库", "、".join(filter(None, document_numbers))
+        return "已出库", "、".join(filter(None, document_numbers))
 
-    def save_success(self, preview: InventoryPreview, document_number: str, document_url: str = "") -> None:
-        self._backup_current()
-        key = self.key(preview.traveler.order_name, str(preview.traveler.path))
-        self.data.setdefault("records", {})[key] = {
-            "traveler_path": str(preview.traveler.path),
-            "order_name": preview.traveler.order_name,
-            "fingerprint": preview.traveler.fingerprint,
-            "document_number": document_number,
-            "document_url": document_url,
-            "status": "已出库",
-            "items": [asdict(item) for item in preview.outbound_items],
-            "ignored_items": preview.ignored_items,
-            "synced_at": datetime.now().isoformat(timespec="seconds"),
+    def prepare_documents(self, preview: InventoryPreview) -> list[dict]:
+        previous = {
+            str(record.get("remark", "")): record
+            for record in self.records_for_order(preview.traveler.order_id)
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        current = set(preview.traveler.documents)
+        disappeared = sorted(
+            remark for remark in previous
+            if remark and (remark not in current or not preview.traveler.documents.get(remark))
+        )
+        if disappeared:
+            raise RuleError(
+                "inventory_manual_void",
+                "以下已出库工厂单在当前 Traveler 中消失或五金为空，请人工删除或作废旧出库单后再处理："
+                + "、".join(disappeared),
+                remarks=disappeared,
+            )
+        payloads = []
+        for document in preview.document_payloads():
+            remark = document["remark"]
+            items = [
+                OutboundItem(**item) for item in document["items"]
+            ]
+            if not items:
+                continue
+            record = self.record_for_document(preview.traveler.order_id, remark)
+            mapped_fingerprint = self.mapped_document_fingerprint(items)
+            payloads.append({
+                "remark": remark,
+                "kind": document["kind"],
+                "items": [
+                    {"productCode": item.product_code, "quantity": item.quantity}
+                    for item in items
+                ],
+                "changed": not record or record.get("mapped_fingerprint") != mapped_fingerprint,
+                "knownDocumentNumber": str(record.get("document_number", "")) if record else "",
+                "mappedFingerprint": mapped_fingerprint,
+                "rawFingerprint": self.raw_document_fingerprint(
+                    preview.traveler.documents.get(remark, [])
+                ),
+            })
+        return payloads
 
-    def save_discovered(self, traveler: TravelerData, document_number: str) -> None:
+    def save_success(self, preview: InventoryPreview, results: list[dict]) -> None:
         self._backup_current()
-        key = self.key(traveler.order_name, str(traveler.path))
-        self.data.setdefault("records", {})[key] = {
-            "traveler_path": str(traveler.path),
-            "order_name": traveler.order_name,
-            "fingerprint": traveler.fingerprint,
-            "document_number": document_number,
-            "document_url": "",
-            "status": "已出库",
-            "items": [],
-            "ignored_items": [],
-            "source": "库存系统记录查询",
-            "synced_at": datetime.now().isoformat(timespec="seconds"),
-        }
+        prepared = {item["remark"]: item for item in self.prepare_documents(preview)}
+        for result in results:
+            if not result.get("saved") and not result.get("unchanged"):
+                continue
+            remark = str(result.get("remark", ""))
+            plan = prepared.get(remark)
+            if not plan:
+                continue
+            key = self.key(preview.traveler.order_id, remark)
+            self.data.setdefault("records", {})[key] = {
+                "traveler_path": str(preview.traveler.path),
+                "order_id": preview.traveler.order_id,
+                "remark": remark,
+                "kind": plan["kind"],
+                "raw_fingerprint": plan["rawFingerprint"],
+                "mapped_fingerprint": plan["mappedFingerprint"],
+                "document_number": str(result.get("documentNumber", "")),
+                "document_url": str(result.get("url", "")),
+                "status": "已出库",
+                "items": plan["items"],
+                "synced_at": datetime.now().isoformat(timespec="seconds"),
+            }
+        self.data["version"] = 2
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
@@ -585,7 +862,7 @@ def _mapping_path(config: Config) -> Path:
 
 
 def _sync_path(config: Config) -> Path:
-    return config.state_dir / "inventory-sync.json"
+    return Path.home() / "Documents" / "工作流程助手" / "data" / "inventory-outbound-records.json"
 
 
 def bootstrap_catalog(config: Config) -> Path:
@@ -604,7 +881,7 @@ def bootstrap_catalog(config: Config) -> Path:
 
 def reconcile_folder_status(config: Config, folder: str) -> dict:
     folder = folder.strip().upper()
-    if not re.fullmatch(r"PP\d{4}", folder):
+    if not re.fullmatch(r"(?:PP\d{4}|CS\d{3})", folder):
         raise RuleError("inventory_argument", f"文件夹编号格式无效：{folder}")
     paths = sorted((config.order_root / folder).glob("Work Order Traveler(*).xlsx"))
     travelers = [parse_traveler(path) for path in paths]
@@ -624,7 +901,6 @@ def reconcile_folder_status(config: Config, folder: str) -> dict:
         ))
         if len(document_numbers) == 1:
             number = document_numbers[0].upper()
-            store.save_discovered(traveler, number)
             found.append({"order_name": traveler.order_name, "document_number": number})
         elif not document_numbers:
             not_found.append({
@@ -728,6 +1004,23 @@ def import_catalog(config: Config, source: Path) -> dict:
     return {"path": str(destination), "source": str(source), "count": len(catalog.products)}
 
 
+def update_catalog_online(config: Config) -> dict:
+    """Export the current product catalog from JDY and install it atomically."""
+    inventory_dir = _catalog_path(config).parent
+    inventory_dir.mkdir(parents=True, exist_ok=True)
+    download = inventory_dir / f".products-download-{os.getpid()}.xlsx"
+    try:
+        progress("正在从库存系统导出商品资料")
+        run_jdy(config, "exportProducts", download_path=download)
+        if not download.is_file():
+            raise RuleError("product_catalog_download", "库存系统导出完成，但没有找到下载的商品资料文件")
+        result = import_catalog(config, download)
+        progress(f"商品资料已更新，共 {result['count']} 个商品")
+        return {"ok": True, **result}
+    finally:
+        download.unlink(missing_ok=True)
+
+
 def _local_setting(config: Config, name: str) -> str:
     settings = config.state_dir / "settings.json"
     if not settings.is_file():
@@ -799,13 +1092,16 @@ def run_jdy(config: Config, action: str, traveler_path: Path | None = None, conf
         if not preview.ready:
             raise RuleError("inventory_precheck", "Traveler 存在未映射材料，禁止打开库存系统",
                             missing_items=preview.missing_items)
+        store = InventorySyncStore(_sync_path(config), config.backup_root)
+        documents = store.prepare_documents(preview)
+        if not documents:
+            raise RuleError("inventory_empty", "Traveler 没有需要出库的板材、封边或五金")
         request.update({
-            "orderName": preview.traveler.order_name,
-            "items": [
-                {"productCode": item.product_code, "quantity": item.quantity}
-                for item in preview.outbound_items
-            ],
+            "orderName": preview.traveler.order_id,
+            "documents": documents,
             "confirmSave": confirm_save,
+            "queryDateFrom": (datetime.now().date() - timedelta(days=550)).isoformat(),
+            "queryDateTo": (datetime.now().date() + timedelta(days=45)).isoformat(),
         })
     elif action == "exportProducts":
         if not download_path:
@@ -815,27 +1111,66 @@ def run_jdy(config: Config, action: str, traveler_path: Path | None = None, conf
     env["NODE_PATH"] = str(root / "node_modules") if (root / "node_modules").is_dir() else (
         "/Users/lantian/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules"
     )
-    result = subprocess.run(
-        [str(node), str(helper)],
-        input=json.dumps(request, ensure_ascii=False),
-        text=True, capture_output=True, env=env, check=False,
-    )
-    if result.stderr:
-        sys.stderr.write(result.stderr)
-    if result.returncode != 0:
-        raise RuleError("jdy_browser", _jdy_error_detail(result.stderr))
+    requests = [request]
+    if action == "outbound":
+        requests = [
+            {
+                **request,
+                "orderName": document["remark"],
+                "remark": document["remark"],
+                "kind": document["kind"],
+                "items": document["items"],
+                "changed": document["changed"],
+                "knownDocumentNumber": document["knownDocumentNumber"],
+            }
+            for document in request["documents"]
+        ]
+    responses = []
+    for browser_request in requests:
+        result = subprocess.run(
+            [str(node), str(helper)],
+            input=json.dumps(browser_request, ensure_ascii=False),
+            text=True, capture_output=True, env=env, check=False,
+        )
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+        if result.returncode != 0:
+            if action == "outbound" and preview is not None and confirm_save and responses:
+                completed = [
+                    item for item in responses
+                    if item.get("saved") or item.get("unchanged")
+                ]
+                if completed:
+                    InventorySyncStore(_sync_path(config), config.backup_root).save_success(
+                        preview, completed
+                    )
+            raise RuleError("jdy_browser", _jdy_error_detail(result.stderr))
+        try:
+            responses.append(json.loads(result.stdout))
+        except json.JSONDecodeError as exc:
+            raise RuleError("jdy_browser", "库存系统返回结果无法解析") from exc
     try:
-        response = json.loads(result.stdout)
+        response = responses[0] if action != "outbound" else {
+            "ok": True,
+            "saved": confirm_save and all(
+                item.get("saved") or item.get("unchanged") for item in responses
+            ),
+            "results": responses,
+            "simulated": not confirm_save,
+        }
         if action == "outbound" and response.get("saved"):
-            document_number = str(response.get("documentNumber", "")).strip()
-            if not document_number or preview is None:
-                raise RuleError("jdy_save_result", "库存单已返回保存成功，但缺少单据编号；结果需要人工核实")
+            results = response["results"]
+            if preview is None or any(
+                not str(item.get("documentNumber", "")).strip()
+                for item in results
+            ):
+                raise RuleError("jdy_save_result", "库存单已返回成功，但缺少分单结果或单据编号；结果需要人工核实")
             store = InventorySyncStore(_sync_path(config), config.backup_root)
-            store.save_success(preview, document_number, str(response.get("url", "")))
+            store.save_success(preview, results)
             response["syncRecorded"] = True
         return response
-    except json.JSONDecodeError as exc:
-        raise RuleError("jdy_browser", "库存系统返回结果无法解析") from exc
+    except (TypeError, KeyError) as exc:
+        raise RuleError("jdy_browser", "库存系统返回结果结构不完整") from exc
 
 
 def inventory_main(argv: list[str] | None = None) -> int:
@@ -843,7 +1178,7 @@ def inventory_main(argv: list[str] | None = None) -> int:
     parser.add_argument("action", choices=(
         "list", "list-names", "preview", "import-products", "preflight", "outbound",
         "find-outbound", "reconcile-folder", "ignore-item", "unignore-item",
-        "search-products", "set-mapping",
+        "search-products", "set-mapping", "update-products",
     ))
     parser.add_argument("--traveler", type=Path)
     parser.add_argument("--source", type=Path)
@@ -877,6 +1212,8 @@ def inventory_main(argv: list[str] | None = None) -> int:
             if not args.source:
                 raise RuleError("inventory_argument", "import-products 必须提供 --source")
             result = import_catalog(config, args.source)
+        elif args.action == "update-products":
+            result = update_catalog_online(config)
         elif args.action == "preflight":
             result = run_jdy(config, "preflight")
         elif args.action == "find-outbound":

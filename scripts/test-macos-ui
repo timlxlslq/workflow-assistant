@@ -1,0 +1,19 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+CACHE="/tmp/traveler-assistant-ui-test-module-cache"
+BINARY="/tmp/traveler-assistant-ui-tests"
+mkdir -p "$CACHE"
+/usr/bin/xcrun --sdk macosx swiftc \
+  -DTESTING \
+  -module-cache-path "$CACHE" \
+  -Xcc -fmodules-cache-path="$CACHE" \
+  -parse-as-library \
+  "$ROOT/macos/TravelerAssistant.swift" \
+  "$ROOT/tests/test_macos_ui.swift" \
+  -o "$BINARY" \
+  -framework SwiftUI \
+  -framework AppKit \
+  -framework UserNotifications
+"$BINARY"

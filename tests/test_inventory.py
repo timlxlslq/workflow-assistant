@@ -2,9 +2,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from openpyxl import Workbook, load_workbook
 
+from traveler_assistant.core import Config, RuleError
 from traveler_assistant.inventory import (
     InventoryMappings,
     InventorySyncStore,
@@ -12,6 +15,8 @@ from traveler_assistant.inventory import (
     _jdy_error_detail,
     build_preview,
     parse_traveler,
+    reconcile_folder_status,
+    update_catalog_online,
 )
 
 
@@ -19,13 +24,52 @@ def make_traveler(path: Path, items):
     workbook = Workbook()
     main = workbook.active
     main.title = "WorkOrderTraveler"
-    main.append(["Name/工厂单名称", "PP0099-KITCHEN"])
+    main.append(["Name/工厂单名称", "PP0099"])
+    usage = workbook.create_sheet("Usage List")
+    usage.append(["Job:", "PP0099"])
+    usage.append(["", "", "3/4 Plywood", "5/8 Plywood", "1/4 Plywood"])
+    usage.append([])
+    usage.append([])
+    usage.append(["Total Qty:", "", 0, 0, 0])
+    usage.append([])
+    usage.append(["Color Table"])
+    colors = []
+    material_quantities = {}
+    hardware = []
+    for name, quantity in items:
+        if name == "18mm--Plywood":
+            usage.cell(5, 3, quantity)
+        elif name == "14.5mm--Plywood":
+            usage.cell(5, 4, quantity)
+        elif name == "5.4mm--Plywood":
+            usage.cell(5, 5, quantity)
+        elif "--" in name and (
+            name.lower().startswith(("8mm--", "9mm--", "19.1mm--", "edge banding--"))
+        ):
+            color = name.split("--", 1)[1]
+            if color not in colors:
+                colors.append(color)
+            material_quantities[name] = quantity
+        else:
+            hardware.append((name, quantity))
+    colors = colors or ["TEST COLOR"]
+    usage.append(["Color:"] + colors)
+    usage.append(["Sheets (3/4):"] + [
+        material_quantities.get(f"19.1mm--{color}", 0) for color in colors
+    ])
+    usage.append(["Sheets (1/4):"] + [
+        material_quantities.get(f"8mm--{color}", material_quantities.get(f"9mm--{color}", 0))
+        for color in colors
+    ])
+    usage.append(["Edge Banding (m):"] + [
+        material_quantities.get(f"Edge banding--{color}", 0) for color in colors
+    ])
     picking = workbook.create_sheet("Pickinglist")
     picking.append(["Picking List领料单"])
     picking.append(["Name/工厂单名称", "PP0099-KITCHEN"])
     picking.append(["Panel板材"])
     picking.append(["No.", "Name名字", "QTY数量"])
-    for number, (name, quantity) in enumerate(items, 1):
+    for number, (name, quantity) in enumerate(hardware, 1):
         picking.append([number, name, quantity])
     workbook.save(path)
 
@@ -47,6 +91,44 @@ def make_catalog(path: Path):
 
 
 class InventoryTests(unittest.TestCase):
+    def test_cut_to_size_folder_status_can_be_reconciled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            folder = root / "orders" / "CS004"
+            folder.mkdir(parents=True)
+            (folder / "Work Order Traveler(CS004).xlsx").touch()
+            config = Config(
+                order_root=root / "orders",
+                backup_root=root / "backups",
+                state_dir=root / "state",
+            )
+            traveler = SimpleNamespace(order_name="CS004")
+            with patch("traveler_assistant.inventory.parse_traveler", return_value=traveler), \
+                 patch(
+                     "traveler_assistant.inventory.run_jdy",
+                     return_value={"matches": ["CS004 QTCK000123"]},
+                 ):
+                result = reconcile_folder_status(config, "cs004")
+            self.assertEqual(result["found"][0]["document_number"], "QTCK000123")
+
+    def test_online_catalog_update_exports_validates_and_installs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = Config(state_dir=root / "state")
+
+            def fake_export(_config, action, **kwargs):
+                self.assertEqual(action, "exportProducts")
+                make_catalog(kwargs["download_path"])
+                return {"ok": True}
+
+            with patch("traveler_assistant.inventory.run_jdy", side_effect=fake_export):
+                result = update_catalog_online(config)
+
+            installed = root / "state" / "inventory" / "current-products.xlsx"
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["count"], len(ProductCatalog(installed).products))
+            self.assertFalse(any(installed.parent.glob(".products-download-*.xlsx")))
+
     def test_browser_error_preserves_specific_reason(self):
         stderr = (
             '{"event":"progress","message":"正在保存"}\n'
@@ -67,7 +149,7 @@ class InventoryTests(unittest.TestCase):
             path = Path(directory) / "Work Order Traveler(PP0099-KITCHEN).xlsx"
             make_traveler(path, [("18mm--Plywood", 2), ("Hinge", 0)])
             traveler = parse_traveler(path)
-            self.assertEqual(traveler.order_name, "PP0099-KITCHEN")
+            self.assertEqual(traveler.order_name, "PP0099")
             self.assertEqual(traveler.items[0].quantity, 2)
             self.assertEqual(traveler.zero_items[0].quantity, 0)
 
@@ -206,11 +288,50 @@ class InventoryTests(unittest.TestCase):
             mapping_path.write_text('{"manual": {}, "ignored": {}}', encoding="utf-8")
             preview = build_preview(path, catalog_path, mapping_path)
             store = InventorySyncStore(root / "sync.json", root / "backups")
-            store.save_success(preview, "CK-001")
+            store.save_success(preview, [{
+                "remark": "PP0099",
+                "saved": True,
+                "documentNumber": "CK-001",
+            }])
             self.assertEqual(store.status_for(parse_traveler(path))[0], "已出库")
             make_traveler(path, [("18mm--Plywood", 3)])
             reloaded = InventorySyncStore(root / "sync.json", root / "backups")
             self.assertEqual(reloaded.status_for(parse_traveler(path))[0], "需要更新")
+
+    def test_previous_hardware_block_becoming_empty_requires_manual_void(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "Work Order Traveler(PP0099).xlsx"
+            catalog_path = root / "products.xlsx"
+            mapping_path = root / "mappings.json"
+            make_traveler(path, [("Hinge", 2)])
+            make_catalog(catalog_path)
+            mapping_path.write_text('{"manual": {}, "ignored": {}}', encoding="utf-8")
+            preview = build_preview(path, catalog_path, mapping_path)
+            store = InventorySyncStore(root / "sync.json", root / "backups")
+            plans = store.prepare_documents(preview)
+            results = [
+                {
+                    "remark": plan["remark"],
+                    "saved": True,
+                    "documentNumber": f"CK-{index:03d}",
+                }
+                for index, plan in enumerate(plans, 1)
+            ]
+            store.save_success(preview, results)
+            make_traveler(path, [])
+            empty_preview = build_preview(path, catalog_path, mapping_path)
+            with self.assertRaisesRegex(RuleError, "人工删除或作废"):
+                InventorySyncStore(root / "sync.json", root / "backups").prepare_documents(empty_preview)
+
+    def test_same_hardware_name_is_aggregated_within_factory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Work Order Traveler(PP0099).xlsx"
+            make_traveler(path, [("Hinge", 2), ("Hinge", 3)])
+            traveler = parse_traveler(path)
+            hardware = traveler.documents["PP0099-KITCHEN"]
+            self.assertEqual(len(hardware), 1)
+            self.assertEqual(hardware[0].quantity, 5)
 
 
 if __name__ == "__main__":

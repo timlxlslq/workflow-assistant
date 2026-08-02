@@ -3,12 +3,13 @@ import tempfile
 import time
 import unittest
 import zipfile
+from datetime import date
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
 from traveler_assistant.core import Config, RuleError, parse_fittings_groups
-from traveler_assistant.inventory import InventoryMappings, set_ignored_mapping
+from traveler_assistant.inventory import InventoryMappings, parse_traveler, set_ignored_mapping
 from traveler_assistant.order_workflow import (
     _choose_fittings,
     find_existing_traveler,
@@ -78,6 +79,8 @@ def make_template(path: Path):
     main = wb.active
     main.title = "WorkOrderTraveler"
     main["B5"] = ""
+    main["C4"] = "Date/日期："
+    main["D4"] = "2026.6."
     pick = wb.create_sheet("Pickinglist")
     pick["A1"] = "Picking List领料单"
     pick["A3"] = "Name/工厂单名称"
@@ -120,6 +123,80 @@ def make_template(path: Path):
 
 
 class OrderWorkflowTests(unittest.TestCase):
+    def test_cut_to_size_requires_materials_workbook(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            order = root / "CS004"
+            order.mkdir()
+            config = Config(source_root=root, state_dir=root / "state")
+            with self.assertRaises(RuleError) as raised:
+                preview_order(config, order)
+            self.assertEqual(raised.exception.code, "missing_materials")
+            self.assertIn("material", str(raised.exception))
+
+    def test_cut_to_size_generates_materials_only_traveler(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            order = root / "CS004"
+            order.mkdir()
+            make_materials(order / "material.xlsx", order_id="CS004")
+            # Even if an old source folder happens to contain a fitting file,
+            # cut-to-size orders must not read or write it.
+            make_fittings(order / "Fittingslist-old.xlsx", [("F999", 7)])
+            template = root / "template.xlsx"
+            make_template(template)
+            config = Config(
+                source_root=root,
+                order_root=root / "orders",
+                template=template,
+                backup_root=root / "backups",
+                state_dir=root / "state",
+            )
+
+            preview = preview_order(config, order)
+            self.assertEqual(preview.order_id, "CS004")
+            self.assertEqual(preview.factories, [])
+            self.assertTrue(any("不读取或写入五金" in item for item in preview.warnings))
+
+            output = generate_order_traveler(config, preview)
+            wb = load_workbook(output, data_only=False)
+            self.assertEqual(wb["WorkOrderTraveler"]["B5"].value, "CS004")
+            self.assertEqual(wb["Usage List"]["B1"].value, "CS004")
+            self.assertNotIn(
+                "Name/工厂单名称",
+                [cell.value for row in wb["Pickinglist"].iter_rows() for cell in row],
+            )
+            traveler = parse_traveler(output)
+            self.assertEqual(set(traveler.documents), {"CS004"})
+            self.assertTrue(traveler.documents["CS004"])
+
+    def test_source_component_code_is_not_written_as_sku(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            order = root / "PP9999"
+            report = order / "Report"
+            report.mkdir(parents=True)
+            make_materials(order / "material.xlsx")
+            make_board(report / "板材清单.xlsx", "F100", "PP9999-KITCHEN")
+            make_fittings(report / "Fittingslist.xlsx", [("F100", 4)])
+            template = root / "template.xlsx"
+            make_template(template)
+            config = Config(
+                source_root=root,
+                order_root=root / "orders",
+                template=template,
+                backup_root=root / "backups",
+                state_dir=root / "state",
+            )
+            output = generate_order_traveler(config, preview_order(config, order))
+            picking = load_workbook(output, data_only=False)["Pickinglist"]
+            hinge_rows = [
+                row for row in range(1, picking.max_row + 1)
+                if picking.cell(row, 3).value == "Hinge"
+            ]
+            self.assertTrue(hinge_rows)
+            self.assertTrue(all(picking.cell(row, 2).value is None for row in hinge_rows))
+
     def test_invalid_empty_dimension_returns_one_business_error(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -186,6 +263,49 @@ class OrderWorkflowTests(unittest.TestCase):
                 _choose_fittings(root)
             self.assertEqual(raised.exception.code, "fittings_timestamp_tie")
 
+    def test_empty_malformed_fittings_is_skipped_and_traveler_can_generate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            order = root / "PP9999"
+            report = order / "Room" / "Report"
+            report.mkdir(parents=True)
+            make_materials(order / "PP9999 materials.xlsx")
+            make_board(report / "板材清单.xlsx", "F100", "PP9999-CLOSET")
+            empty = Workbook()
+            empty.active["A1"] = "No fittings were used"
+            empty.save(report / "Fittingslist-empty.xlsx")
+            template = root / "template.xlsx"
+            make_template(template)
+            config = Config(
+                source_root=root,
+                order_root=root / "orders",
+                template=template,
+                backup_root=root / "backups",
+                state_dir=root / "state",
+            )
+
+            preview = preview_order(config, order)
+            self.assertEqual([factory.factory_order for factory in preview.factories], ["F100"])
+            self.assertEqual(preview.factories[0].fittings, [])
+            self.assertTrue(any("按无五金" in warning for warning in preview.warnings))
+
+            output = generate_order_traveler(config, preview)
+            wb = load_workbook(output, data_only=False)
+            picking = wb["Pickinglist"]
+            self.assertIn(
+                "PP9999-CLOSET",
+                [picking.cell(row, 4).value for row in range(1, picking.max_row + 1)],
+            )
+            self.assertEqual(
+                [
+                    picking.cell(row, 7).value
+                    for row in range(1, picking.max_row + 1)
+                    if isinstance(picking.cell(row, 1).value, int)
+                    and 3 <= row <= 9
+                ],
+                [None, None, None, None],
+            )
+
     def test_global_ignore_and_generate_one_order_workbook(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -231,6 +351,7 @@ class OrderWorkflowTests(unittest.TestCase):
             wb = load_workbook(output, data_only=False)
             self.assertEqual(wb.sheetnames[:3], ["WorkOrderTraveler", "Usage List", "Pickinglist"])
             self.assertEqual(wb["WorkOrderTraveler"]["B5"].value, "PP9999")
+            self.assertEqual(wb["WorkOrderTraveler"]["D4"].value.date(), date.today())
             picking = wb["Pickinglist"]
             values = [picking.cell(row, 1).value for row in range(1, picking.max_row + 1)]
             self.assertEqual(values.count("Name/工厂单名称"), 2)
@@ -256,6 +377,7 @@ class OrderWorkflowTests(unittest.TestCase):
             self.assertEqual(preview_payload(config, preview)["existing_traveler"], str(output))
 
             wb["WorkOrderTraveler"]["C5"] = "人工填写内容"
+            wb["WorkOrderTraveler"]["D4"] = "保留原日期"
             wb.save(output)
             materials_wb = load_workbook(order / "anything materials final.xlsx")
             materials_wb.active["C14"] = 8
@@ -266,6 +388,7 @@ class OrderWorkflowTests(unittest.TestCase):
             self.assertTrue(backup.is_file())
             updated_wb = load_workbook(updated, data_only=False)
             self.assertEqual(updated_wb["WorkOrderTraveler"]["C5"].value, "人工填写内容")
+            self.assertEqual(updated_wb["WorkOrderTraveler"]["D4"].value, "保留原日期")
             self.assertEqual(updated_wb["Usage List"]["C14"].value, 8)
             self.assertEqual(updated_wb.sheetnames.count("Usage List"), 1)
 

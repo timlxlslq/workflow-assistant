@@ -43,6 +43,14 @@
 | AIMES 重试 | 仅多工厂单异常触发；失败后约 30 秒、60 秒重试，共三次，仍失败停止并提醒 |
 | AIMES 登录 | 直接进入 3VJ Passport 官方登录页；真实进入 AIMES dashboard 后才算成功。账号或密码错误立即停止，避免重复尝试导致锁定 |
 
+### 来料加工订单
+
+- 服务器来源为 `/Volumes/server/CUT TO SIZE`，只列出 `CS` + 三位数字的文件夹。
+- 每个订单只读取根目录文件名包含 `materials` 的 `.xlsx`；缺失时停止并明确提示。
+- 来料加工不读取五金报表，Traveler 保留空的 `Pickinglist`，只写入板材和封边。
+- 输出位置与自有订单一致：`Order/CS###/Work Order Traveler(CS###).xlsx`。
+- 所有订单的服务器五金报表 `code` 都不是库存 SKU，不写入 Traveler 的 `SKU NO.`。
+
 ## 3. 板材与封边
 
 | 类别 | 规则 |

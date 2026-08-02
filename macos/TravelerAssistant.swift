@@ -15,6 +15,29 @@ struct OrderMaterialPreview: Identifiable {
     let quantity: Double
 }
 
+func orderMaterialDisplayName(_ row: OrderMaterialPreview) -> String {
+    let thickness = row.thickness
+    if row.kind == "panel" {
+        return row.color.isEmpty ? "Panel" : row.color
+    }
+    if abs(thickness - 18) < 0.01 { return "柜体板" }
+    if abs(thickness - 14.5) < 0.01 { return "抽屉板" }
+    if abs(thickness - 5.4) < 0.01 { return "背板" }
+    return "Plywood"
+}
+
+func panelColorsNeedingThicknessWarning(_ rows: [OrderMaterialPreview]) -> Set<String> {
+    let panels = rows.filter { $0.kind == "panel" && !$0.color.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    let grouped = Dictionary(grouping: panels) {
+        $0.color.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+    return Set(grouped.compactMap { color, items in
+        let hasDoorPanel = items.contains { abs($0.thickness - 19.1) < 0.01 }
+        let hasBackPanel = items.contains { abs($0.thickness - 8) < 0.01 || abs($0.thickness - 9) < 0.01 }
+        return hasDoorPanel && hasBackPanel ? color : nil
+    })
+}
+
 struct OrderFactoryPreview: Identifiable {
     let id: String
     let factoryOrder: String
@@ -42,6 +65,23 @@ struct InventoryTraveler: Identifiable {
     let modifiedAt: String
     let status: String
     let documentNumber: String
+}
+
+func groupInventoryTravelersByNewest(_ travelers: [InventoryTraveler]) -> [(String, [InventoryTraveler])] {
+    Dictionary(grouping: travelers, by: \.ppFolder)
+        .map { folder, files in
+            let sortedFiles = files.sorted {
+                if $0.modifiedAt != $1.modifiedAt { return $0.modifiedAt > $1.modifiedAt }
+                return $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending
+            }
+            return (folder, sortedFiles)
+        }
+        .sorted {
+            let leftDate = $0.1.first?.modifiedAt ?? ""
+            let rightDate = $1.1.first?.modifiedAt ?? ""
+            if leftDate != rightDate { return leftDate > rightDate }
+            return $0.0.localizedStandardCompare($1.0) == .orderedAscending
+        }
 }
 
 struct InventoryPreviewRow: Identifiable {
@@ -145,6 +185,7 @@ final class AppModel: ObservableObject {
     @Published var inventoryProductCandidates: [InventoryProductCandidate] = []
     @Published var inventoryProductSearchStatus = ""
     @Published var orderFolders: [OrderFolderItem] = []
+    @Published var orderSourceKind = "owned"
     @Published var selectedOrderPath = ""
     @Published var selectedOrderId = ""
     @Published var orderMaterialsFile = ""
@@ -168,6 +209,11 @@ final class AppModel: ObservableObject {
     private var inventoryRawErrors = ""
     private var orderStderrBuffer = ""
     private var orderRawErrors = ""
+
+    var orderPreviewReady: Bool {
+        !selectedOrderPath.isEmpty && orderError.isEmpty && !orderMaterialsFile.isEmpty &&
+            (selectedOrderId.hasPrefix("CS") || !orderFactories.isEmpty)
+    }
 
     init() {
         loadSettings()
@@ -509,6 +555,17 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func updateInventoryCatalog() {
+        beginInventoryOperation("更新商品资料")
+        runInventory(["update-products"]) { object in
+            let count = object["count"] as? Int ?? 0
+            self.inventoryCatalogStatus = "\(count) 个商品 · 刚刚更新"
+            self.inventoryStatus = "商品资料更新完成"
+            self.finishRunningInventoryStep("已导出、校验并替换本地商品资料，共 \(count) 个商品", "success")
+        }
+        inventoryStatus = "正在在线更新商品资料…"
+    }
+
     func refreshInventoryFolder(_ folder: String) {
         beginInventoryOperation("更新 \(folder) 出库状态")
         addInventoryStep("查询库存系统", "正在按 \(folder) 和工厂单名称查询其他出库单", "running")
@@ -602,11 +659,21 @@ final class AppModel: ObservableObject {
                 self.inventoryStatus = "模拟填写完成，已在保存前停止"
                 self.addInventoryStep("任务完成", "所有字段已填写并核对，未点击保存", "success")
             } else if object["saved"] as? Bool == true {
-                let number = object["documentNumber"] as? String ?? "未知单号"
-                self.inventoryStatus = "✅✅ 出库成功！单据编号：\(number)"
-                self.inventorySuccessMessage = "出库成功！库存单 \(number) 已保存"
-                self.addInventoryStep("✅ 出库成功", "单据编号 \(number)，库存及本机同步记录均已更新", "success")
-                self.markInventoryTravelerSaved(path: paths[0], documentNumber: number)
+                let results = object["results"] as? [[String: Any]] ?? []
+                let numbers = results.compactMap { $0["documentNumber"] as? String }
+                let detail = results.map { result -> String in
+                    let remark = result["remark"] as? String ?? "未知备注"
+                    let number = result["documentNumber"] as? String ?? "未知单号"
+                    if result["unchanged"] as? Bool == true {
+                        return "\(remark)：\(number) 无变化，已跳过"
+                    }
+                    return "\(remark)：\(number) \(result["updated"] as? Bool == true ? "已更新" : "已新增")"
+                }.joined(separator: "；")
+                let numberText = numbers.isEmpty ? "未知单号" : numbers.joined(separator: "、")
+                self.inventoryStatus = "✅✅ 出库处理成功！\(numberText)"
+                self.inventorySuccessMessage = "出库处理成功！\(detail)"
+                self.addInventoryStep("✅ 出库处理成功", "\(detail)；本机同步记录已更新", "success")
+                self.markInventoryTravelerSaved(path: paths[0], documentNumber: numberText)
                 self.addInventoryStep("左侧状态已更新", "当前 Traveler 已立即标记为“已出库”", "success")
             } else {
                 self.inventoryStatus = "库存系统模拟填写已结束"
@@ -973,7 +1040,11 @@ final class AppModel: ObservableObject {
         orderExistingTravelerPath = ""
         orderStatus = "正在读取服务器文件夹列表…"
         addOrderStep("读取服务器目录", "只读取订单文件夹名称，不打开 Excel", "running")
-        runOrder(["list"]) { object in
+        var arguments = ["list"]
+        if orderSourceKind == "cutToSize" {
+            arguments += ["--source-root", "/Volumes/server/CUT TO SIZE"]
+        }
+        runOrder(arguments) { object in
             let rows = object["orders"] as? [[String: Any]] ?? []
             self.orderFolders = rows.map {
                 OrderFolderItem(
@@ -983,7 +1054,8 @@ final class AppModel: ObservableObject {
                 )
             }
             self.orderStatus = "已读取 \(rows.count) 个订单文件夹；点击后才会校验 Excel"
-            self.finishOrderStep("找到 \(rows.count) 个 PP/CS 订单文件夹", "success")
+            let kind = self.orderSourceKind == "cutToSize" ? "来料加工" : "自有"
+            self.finishOrderStep("找到 \(rows.count) 个\(kind)订单文件夹", "success")
         }
     }
 
@@ -1008,16 +1080,28 @@ final class AppModel: ObservableObject {
                 )
             }
         }
-        addOrderStep("读取并校验", "materials、板材清单和 Fittingslist", "running")
+        addOrderStep(
+            "读取并校验",
+            item.orderId.hasPrefix("CS") ? "material 板材与封边数量" : "material、板材清单和 Fittingslist",
+            "running"
+        )
         runOrder(["preview", "--folder", item.id]) { object in
             self.applyOrderPreview(object)
-            self.orderStatus = self.orderExistingTravelerPath.isEmpty
-                ? "\(item.orderId) 校验通过，可以选择忽略五金或生成 Traveler"
-                : "\(item.orderId) 校验通过，已找到本机 Traveler，可直接更新"
-            self.finishOrderStep(
-                "发现 \(self.orderFactories.count) 个工厂单、\(self.orderFittings.count) 项五金",
-                self.orderWarnings.isEmpty ? "success" : "warning"
-            )
+            let existing = !self.orderExistingTravelerPath.isEmpty
+            if item.orderId.hasPrefix("CS") {
+                self.orderStatus = existing
+                    ? "\(item.orderId) 板材和封边校验通过，可更新 Traveler"
+                    : "\(item.orderId) 板材和封边校验通过，可生成 Traveler"
+                self.finishOrderStep("来料加工订单无五金，板材与封边数量已读取", "success")
+            } else {
+                self.orderStatus = existing
+                    ? "\(item.orderId) 校验通过，已找到本机 Traveler，可直接更新"
+                    : "\(item.orderId) 校验通过，可以选择忽略五金或生成 Traveler"
+                self.finishOrderStep(
+                    "发现 \(self.orderFactories.count) 个工厂单、\(self.orderFittings.count) 项五金",
+                    self.orderWarnings.isEmpty ? "success" : "warning"
+                )
+            }
             for warning in self.orderWarnings {
                 self.addOrderStep("数据选择提醒", warning, "warning")
             }
@@ -1131,7 +1215,7 @@ final class AppModel: ObservableObject {
     }
 
     func generateSelectedOrder() {
-        guard !selectedOrderPath.isEmpty, orderError.isEmpty, !orderFactories.isEmpty else {
+        guard orderPreviewReady else {
             orderStatus = "请先选择并通过校验"
             addOrderStep("无法生成 Traveler", "请先选择订单并完成全部校验", "failure")
             return
@@ -1317,7 +1401,7 @@ final class AppModel: ObservableObject {
 }
 
 enum AppLayout {
-    static let headerHeight: CGFloat = 86
+    static let headerHeight: CGFloat = 68
     static let sidebarMinWidth: CGFloat = 300
     static let sidebarIdealWidth: CGFloat = 340
     static let sidebarMaxWidth: CGFloat = 380
@@ -1328,8 +1412,30 @@ enum AppLayout {
     static let operationVisibleRows = 3
     static let operationListHeight: CGFloat = operationRowHeight * CGFloat(operationVisibleRows)
     static let operationLogHeight: CGFloat = 242
+    static let todoDeadlineColumnWidth: CGFloat = 270
+    static let todoListMaxHeight: CGFloat = 340
+    static let todoInputMinHeight: CGFloat = 92
+    static let todoTableHeaderFontSize: CGFloat = 17
+    static let todoTableBodyFontSize: CGFloat = 16
+    static let materialNameFontSize: CGFloat = 18
     static let windowMinWidth: CGFloat = 1060
     static let windowMinHeight: CGFloat = 720
+}
+
+enum AppPalette {
+    static let accent = Color.accentColor
+    static let surface = Color(nsColor: .controlBackgroundColor)
+    static let success = Color.green
+    static let warning = Color.orange
+    static let danger = Color.red
+    static let ignored = Color.gray
+}
+
+extension View {
+    func appPageFrame() -> some View {
+        frame(minWidth: AppLayout.windowMinWidth, minHeight: AppLayout.windowMinHeight, alignment: .top)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
 }
 
 struct AppPageHeader<Trailing: View>: View {
@@ -1341,24 +1447,17 @@ struct AppPageHeader<Trailing: View>: View {
     var body: some View {
         HStack(alignment: .center, spacing: 14) {
             Image(systemName: systemImage)
-                .font(.system(size: 30)).foregroundColor(.accentColor)
-                .frame(width: 36, height: 36, alignment: .center)
+                .font(.system(size: 25)).foregroundColor(AppPalette.accent)
+                .frame(width: 32, height: 32, alignment: .center)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.title2).fontWeight(.semibold)
-                Text(subtitle).foregroundColor(.secondary)
+                Text(title).font(.title3).fontWeight(.semibold)
+                Text(subtitle).font(.caption).foregroundColor(.secondary)
             }
             Spacer()
             trailing
         }
-        .padding(.horizontal, 22)
-        .frame(
-            minHeight: AppLayout.headerHeight,
-            idealHeight: AppLayout.headerHeight,
-            maxHeight: AppLayout.headerHeight,
-            alignment: .center
-        )
-        .fixedSize(horizontal: false, vertical: true)
-        .layoutPriority(100)
+        .padding(.horizontal, 20)
+        .frame(height: AppLayout.headerHeight, alignment: .center)
     }
 }
 
@@ -1395,6 +1494,16 @@ struct OrderWorkflowView: View {
             HSplitView {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("服务器订单").font(.headline)
+                    Picker("订单类型", selection: $model.orderSourceKind) {
+                        Text("自有订单").tag("owned")
+                        Text("来料加工").tag("cutToSize")
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    .disabled(model.orderRunning)
+                    .onChange(of: model.orderSourceKind) { _ in
+                        model.loadOrderFolders()
+                    }
                     Text("这里只读取文件夹名称；点击订单后才打开 Excel。")
                         .font(.caption).foregroundColor(.secondary)
                     ScrollView {
@@ -1433,7 +1542,7 @@ struct OrderWorkflowView: View {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack {
                         Circle()
-                            .fill(model.orderError.isEmpty ? (model.orderFactories.isEmpty ? Color.secondary : Color.green) : Color.red)
+                            .fill(model.orderError.isEmpty ? (model.orderPreviewReady ? AppPalette.success : Color.secondary) : AppPalette.danger)
                             .frame(width: 10, height: 10)
                         Text(model.orderStatus).fontWeight(.semibold)
                         Spacer()
@@ -1446,7 +1555,7 @@ struct OrderWorkflowView: View {
                             model.generateSelectedOrder()
                         }
                             .buttonStyle(.borderedProminent)
-                            .disabled(model.orderRunning || !model.orderError.isEmpty || model.orderFactories.isEmpty)
+                            .disabled(model.orderRunning || !model.orderPreviewReady)
                     }
                     .frame(height: AppLayout.statusHeight)
 
@@ -1465,19 +1574,19 @@ struct OrderWorkflowView: View {
                                                 title: "订单号",
                                                 value: model.selectedOrderId,
                                                 detail: URL(fileURLWithPath: model.orderMaterialsFile).lastPathComponent,
-                                                color: .blue
+                                                color: AppPalette.accent
                                             )
                                             summaryCard(
                                                 title: "工厂单",
                                                 value: "\(model.orderFactories.count)",
                                                 detail: "已识别并校验",
-                                                color: .purple
+                                                color: AppPalette.accent
                                             )
                                             summaryCard(
                                                 title: "材料项目",
                                                 value: "\(model.orderMaterials.count + model.orderEdgeBanding.count)",
                                                 detail: "板材与封边",
-                                                color: .teal
+                                                color: AppPalette.accent
                                             )
                                             summaryCard(
                                                 title: "本机 Traveler",
@@ -1485,30 +1594,12 @@ struct OrderWorkflowView: View {
                                                 detail: model.orderExistingTravelerPath.isEmpty
                                                     ? "生成后保存在订单目录"
                                                     : URL(fileURLWithPath: model.orderExistingTravelerPath).lastPathComponent,
-                                                color: model.orderExistingTravelerPath.isEmpty ? .secondary : .green
+                                                color: model.orderExistingTravelerPath.isEmpty ? .secondary : AppPalette.accent
                                             )
                                         }
 
-                                        if !model.orderExistingTravelerPath.isEmpty {
-                                            HStack(spacing: 7) {
-                                                Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
-                                                Text("已找到可更新的 Traveler")
-                                                    .fontWeight(.semibold)
-                                                Text(model.orderExistingTravelerPath)
-                                                    .font(.caption)
-                                                    .foregroundColor(.secondary)
-                                                    .lineLimit(1)
-                                                    .textSelection(.enabled)
-                                                Spacer()
-                                            }
-                                            .padding(.horizontal, 10)
-                                            .padding(.vertical, 8)
-                                            .background(Color.green.opacity(0.07))
-                                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                                        }
-
                                         if !model.orderFactories.isEmpty {
-                                            subsectionTitle("工厂单号与名称", color: .purple)
+                                            subsectionTitle("工厂单号与名称", color: AppPalette.accent)
                                             VStack(spacing: 6) {
                                                 ForEach(model.orderFactories) { factory in
                                                     HStack {
@@ -1521,44 +1612,61 @@ struct OrderWorkflowView: View {
                                                             .frame(maxWidth: .infinity, alignment: .leading)
                                                     }
                                                     .padding(.horizontal, 10).padding(.vertical, 7)
-                                                    .background(Color.purple.opacity(0.06))
+                                                    .background(AppPalette.accent.opacity(0.06))
                                                     .clipShape(RoundedRectangle(cornerRadius: 7))
                                                 }
                                             }
                                         }
 
                                         if !model.orderMaterials.isEmpty {
-                                            subsectionTitle("板材用量", color: .teal)
+                                            let warningColors = panelColorsNeedingThicknessWarning(model.orderMaterials)
+                                            subsectionTitle("板材用量", color: AppPalette.accent)
                                             LazyVGrid(
-                                                columns: [GridItem(.adaptive(minimum: 145, maximum: 190), spacing: 9)],
+                                                columns: [GridItem(.adaptive(minimum: 175, maximum: 240), spacing: 9)],
                                                 alignment: .leading,
                                                 spacing: 9
                                             ) {
                                                 ForEach(model.orderMaterials) { row in
+                                                    let isColoredPanel = row.kind == "panel"
+                                                    let normalizedColor = row.color.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                                                    let warnsAboutThickness = isColoredPanel && warningColors.contains(normalizedColor)
                                                     VStack(alignment: .leading, spacing: 5) {
-                                                        Text(row.kind == "plywood" ? "Plywood" : (row.color.isEmpty ? "Panel" : row.color))
-                                                            .font(.caption).foregroundColor(.secondary).lineLimit(1)
+                                                        HStack(spacing: 6) {
+                                                            Image(systemName: isColoredPanel ? "rectangle.stack.fill" : "square.stack.3d.up.fill")
+                                                                .foregroundColor(AppPalette.accent)
+                                                            Text(orderMaterialDisplayName(row))
+                                                            .font(.system(size: AppLayout.materialNameFontSize))
+                                                            .fontWeight(isColoredPanel ? .bold : .semibold)
+                                                            .foregroundColor(.primary)
+                                                            .lineLimit(2)
+                                                        }
                                                         HStack(alignment: .firstTextBaseline) {
-                                                            Text("\(row.thickness.formatted())mm").fontWeight(.semibold)
+                                                            Text("规格 \(row.thickness.formatted())mm")
+                                                                .font(.caption)
+                                                                .fontWeight(.medium)
+                                                                .foregroundColor(warnsAboutThickness ? AppPalette.danger : .secondary)
                                                             Spacer()
-                                                            Text(row.quantity.formatted())
+                                                            Text("\(row.quantity.formatted()) 张")
                                                                 .font(.title3).fontWeight(.bold)
-                                                                .foregroundColor(.teal)
+                                                                .foregroundColor(AppPalette.accent)
                                                         }
                                                     }
-                                                    .padding(10)
-                                                    .background(Color.teal.opacity(0.07))
+                                                    .padding(11)
+                                                    .background(AppPalette.accent.opacity(isColoredPanel ? 0.12 : 0.06))
                                                     .clipShape(RoundedRectangle(cornerRadius: 9))
                                                     .overlay(
                                                         RoundedRectangle(cornerRadius: 9)
-                                                            .stroke(Color.teal.opacity(0.16), lineWidth: 1)
+                                                            .stroke(
+                                                                AppPalette.accent.opacity(isColoredPanel ? 0.36 : 0.16),
+                                                                lineWidth: isColoredPanel ? 1.5 : 1
+                                                            )
                                                     )
                                                 }
                                             }
                                         }
 
                                         if !model.orderEdgeBanding.isEmpty {
-                                            subsectionTitle("封边用量", color: .orange)
+                                            subsectionTitle("封边用量", color: AppPalette.accent)
                                             LazyVGrid(
                                                 columns: [GridItem(.adaptive(minimum: 180, maximum: 230), spacing: 9)],
                                                 alignment: .leading,
@@ -1567,19 +1675,21 @@ struct OrderWorkflowView: View {
                                                 ForEach(model.orderEdgeBanding.keys.sorted(), id: \.self) { color in
                                                     HStack {
                                                         VStack(alignment: .leading, spacing: 4) {
-                                                            Text(color).fontWeight(.medium).lineLimit(1)
+                                                            Text(color)
+                                                                .font(.system(size: AppLayout.materialNameFontSize, weight: .semibold))
+                                                                .lineLimit(1)
                                                             Text("Edge Banding").font(.caption2).foregroundColor(.secondary)
                                                         }
                                                         Spacer()
                                                         Text("\((model.orderEdgeBanding[color] ?? 0).formatted())m")
-                                                            .font(.title3).fontWeight(.bold).foregroundColor(.orange)
+                                                            .font(.title3).fontWeight(.bold).foregroundColor(AppPalette.accent)
                                                     }
                                                     .padding(10)
-                                                    .background(Color.orange.opacity(0.07))
+                                                    .background(AppPalette.accent.opacity(0.06))
                                                     .clipShape(RoundedRectangle(cornerRadius: 9))
                                                     .overlay(
                                                         RoundedRectangle(cornerRadius: 9)
-                                                            .stroke(Color.orange.opacity(0.18), lineWidth: 1)
+                                                            .stroke(AppPalette.accent.opacity(0.16), lineWidth: 1)
                                                     )
                                                 }
                                             }
@@ -1597,11 +1707,9 @@ struct OrderWorkflowView: View {
                                             let rows = model.orderFittings.filter { $0.factoryOrder == factory.factoryOrder }
                                             VStack(spacing: 0) {
                                                 HStack {
-                                                    VStack(alignment: .leading, spacing: 2) {
-                                                        Text(factory.factoryOrder).fontWeight(.semibold)
-                                                        Text(factory.orderName)
-                                                            .font(.caption).foregroundColor(.secondary)
-                                                    }
+                                                    Text("\(factory.factoryOrder) · \(factory.orderName)")
+                                                        .fontWeight(.semibold)
+                                                        .lineLimit(1)
                                                     Spacer()
                                                     Text("\(rows.count) 项")
                                                         .font(.caption).foregroundColor(.secondary)
@@ -1689,7 +1797,7 @@ struct OrderWorkflowView: View {
                 .frame(minWidth: AppLayout.contentMinWidth)
             }
         }
-        .frame(minWidth: AppLayout.windowMinWidth, minHeight: AppLayout.windowMinHeight)
+        .appPageFrame()
         .onAppear {
             if model.orderFolders.isEmpty { model.loadOrderFolders() }
         }
@@ -1767,7 +1875,7 @@ struct ContentView: View {
                             if let pending = model.pendingOrder {
                                 Divider()
                                 Text("\(pending) 有版本差异，请确认后选择更新方式。")
-                                    .font(.caption).foregroundColor(.orange)
+                                    .font(.caption).foregroundColor(AppPalette.warning)
                                 Button("更新自动字段") { model.execute("update", history: true, query: pending) }
                                     .disabled(model.running)
                                 Button("按模板重新生成") { model.execute("rebuild", history: true, query: pending) }
@@ -1787,7 +1895,7 @@ struct ContentView: View {
 
                 AnyView(VStack(alignment: .leading, spacing: 12) {
                     HStack {
-                        Circle().fill(model.hasError ? Color.red : Color.green).frame(width: 10, height: 10)
+                        Circle().fill(model.hasError ? AppPalette.danger : AppPalette.success).frame(width: 10, height: 10)
                         Text(model.status).fontWeight(.semibold)
                         Spacer()
                         if model.running { ProgressView().controlSize(.small) }
@@ -1813,7 +1921,7 @@ struct ContentView: View {
                 .frame(minWidth: AppLayout.contentMinWidth))
             }
         }
-        .frame(minWidth: AppLayout.windowMinWidth, minHeight: AppLayout.windowMinHeight)
+        .appPageFrame()
     }
 }
 
@@ -1895,11 +2003,11 @@ struct InventoryStepRowView: View {
     private var icon: some View {
         switch step.state {
         case "success":
-            Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+            Image(systemName: "checkmark.circle.fill").foregroundColor(AppPalette.success)
         case "failure":
-            Image(systemName: "xmark.circle.fill").foregroundColor(.red)
+            Image(systemName: "xmark.circle.fill").foregroundColor(AppPalette.danger)
         case "warning":
-            Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+            Image(systemName: "exclamationmark.triangle.fill").foregroundColor(AppPalette.warning)
         default:
             ProgressView().controlSize(.small)
         }
@@ -1914,6 +2022,29 @@ struct InventoryOperationLogView: View {
             steps: model.inventorySteps,
             emptyText: "点击“刷新列表”或左侧 Traveler 后，这里会逐步显示正在做什么。"
         )
+    }
+}
+
+struct OperationLogAutoScroller: NSViewRepresentable {
+    let revision: String
+
+    func makeNSView(context: Context) -> NSView {
+        NSView(frame: .zero)
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        _ = revision
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            guard let scrollView = nsView.enclosingScrollView,
+                  let documentView = scrollView.documentView else { return }
+            documentView.layoutSubtreeIfNeeded()
+            let clipView = scrollView.contentView
+            let targetY = documentView.isFlipped
+                ? max(documentView.bounds.minY, documentView.bounds.maxY - clipView.bounds.height)
+                : documentView.bounds.minY
+            clipView.scroll(to: NSPoint(x: clipView.bounds.minX, y: targetY))
+            scrollView.reflectScrolledClipView(clipView)
+        }
     }
 }
 
@@ -1945,30 +2076,27 @@ struct SelectableOperationLogView: View {
                     .background(Color(nsColor: .controlBackgroundColor))
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             } else {
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        LazyVStack(spacing: 0) {
-                            ForEach(steps) { step in
-                                Button {
-                                    select(step.id)
-                                } label: {
-                                    InventoryStepRowView(step: step)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .contentShape(Rectangle())
-                                }
-                                .buttonStyle(.plain)
-                                .background(
-                                    selectedIDs.contains(step.id)
-                                        ? Color.accentColor.opacity(0.18)
-                                        : Color.clear
-                                )
-                                .overlay(Divider(), alignment: .bottom)
-                                .id(step.id)
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(steps) { step in
+                            Button {
+                                select(step.id)
+                            } label: {
+                                InventoryStepRowView(step: step)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .contentShape(Rectangle())
                             }
+                            .buttonStyle(.plain)
+                            .background(
+                                selectedIDs.contains(step.id)
+                                    ? Color.accentColor.opacity(0.18)
+                                    : Color.clear
+                            )
+                            .overlay(Divider(), alignment: .bottom)
                         }
+                        OperationLogAutoScroller(revision: scrollRevision)
+                            .frame(height: 1)
                     }
-                    .onAppear { scrollToLatest(proxy) }
-                    .onChange(of: steps.map(\.id)) { _ in scrollToLatest(proxy) }
                 }
                 .frame(height: AppLayout.operationListHeight)
                 .background(Color(nsColor: .controlBackgroundColor))
@@ -1984,11 +2112,9 @@ struct SelectableOperationLogView: View {
         }
     }
 
-    private func scrollToLatest(_ proxy: ScrollViewProxy) {
-        guard let id = steps.last?.id else { return }
-        DispatchQueue.main.async {
-            proxy.scrollTo(id, anchor: .bottom)
-        }
+    private var scrollRevision: String {
+        steps.map { "\($0.id.uuidString)|\($0.state)|\($0.title)|\($0.detail)" }
+            .joined(separator: "\n")
     }
 
     private func select(_ id: UUID) {
@@ -2139,9 +2265,7 @@ struct InventoryView: View {
     }
 
     private var groupedTravelers: [(String, [InventoryTraveler])] {
-        Dictionary(grouping: model.inventoryTravelers, by: \.ppFolder)
-            .map { ($0.key, $0.value.sorted { $0.fileName.localizedStandardCompare($1.fileName) == .orderedAscending }) }
-            .sorted { $0.0.localizedStandardCompare($1.0) == .orderedAscending }
+        groupInventoryTravelersByNewest(model.inventoryTravelers)
     }
 
     var body: some View {
@@ -2154,15 +2278,12 @@ struct InventoryView: View {
                 Text(model.inventoryCatalogStatus)
                     .font(.caption).foregroundColor(.secondary)
                 Button("更新商品资料") {
-                    model.inventoryStatus = "商品资料在线更新将在浏览器流程接通后启用"
+                    model.updateInventoryCatalog()
                 }
+                .disabled(model.inventoryRunning)
                 Button("刷新列表") { model.loadInventory() }
                     .buttonStyle(.borderedProminent)
             }
-            // The lower HSplitView changes the visual center of this header on
-            // macOS 12. Offset the complete header content without changing
-            // any shared section height.
-            .offset(y: 4)
             Divider()
 
             HSplitView {
@@ -2242,11 +2363,11 @@ struct InventoryView: View {
                 AnyView(VStack(alignment: .leading, spacing: 12) {
                     HStack {
                         Circle()
-                            .fill(model.inventoryErrors.isEmpty ? Color.green : Color.red)
+                            .fill(model.inventoryErrors.isEmpty ? AppPalette.success : AppPalette.danger)
                             .frame(width: 10, height: 10)
                         Text(model.inventorySuccessMessage.isEmpty ? model.inventoryStatus : model.inventorySuccessMessage)
                             .fontWeight(.semibold)
-                            .foregroundColor(model.inventorySuccessMessage.isEmpty ? .primary : .green)
+                            .foregroundColor(model.inventorySuccessMessage.isEmpty ? .primary : AppPalette.success)
                             .lineLimit(1)
                         Spacer()
                         if model.inventoryRunning { ProgressView().controlSize(.small) }
@@ -2313,7 +2434,7 @@ struct InventoryView: View {
                                                 .frame(width: 58, alignment: .trailing)
                                         }
                                         .padding(.horizontal, 6).padding(.vertical, 7)
-                                        .background(row.status == "未映射" ? Color.orange.opacity(0.16) :
+                                        .background(row.status == "未映射" ? AppPalette.warning.opacity(0.16) :
                                                     row.status == "已忽略" ? Color.gray.opacity(0.10) : Color.clear)
                                         Divider()
                                     }
@@ -2349,7 +2470,7 @@ struct InventoryView: View {
                             Spacer()
                             if model.inventoryPreviewRows.contains(where: { $0.status == "未映射" }) {
                                 Label("未映射材料必须处理后才能出库", systemImage: "exclamationmark.triangle.fill")
-                                    .font(.caption).foregroundColor(.orange)
+                                    .font(.caption).foregroundColor(AppPalette.warning)
                             }
                         }
                         .disabled(model.inventoryRunning || selectedPreviewRows.isEmpty)
@@ -2373,7 +2494,7 @@ struct InventoryView: View {
                 .frame(minWidth: AppLayout.contentMinWidth))
             }
         }
-        .frame(minWidth: AppLayout.windowMinWidth, minHeight: AppLayout.windowMinHeight)
+        .appPageFrame()
         .onAppear { if model.inventoryTravelers.isEmpty { model.loadInventory() } }
         .onChange(of: model.inventoryPreviewRows.map(\.id)) { _ in
             selectedPreviewRows = selectedPreviewRows.intersection(Set(model.inventoryPreviewRows.map(\.id)))
@@ -2397,17 +2518,17 @@ struct InventoryView: View {
 
     private func statusColor(_ status: String) -> Color {
         switch status {
-        case "已出库": return .green
-        case "需要更新": return .orange
-        case "失败", "结果未知", "原单据不可编辑": return .red
+        case "已出库": return AppPalette.success
+        case "需要更新": return AppPalette.warning
+        case "失败", "结果未知", "原单据不可编辑": return AppPalette.danger
         default: return .secondary
         }
     }
 
     private func previewStatusColor(_ status: String) -> Color {
         switch status {
-        case "已映射": return .green
-        case "未映射": return .orange
+        case "已映射": return AppPalette.success
+        case "未映射": return AppPalette.warning
         case "已忽略", "零数量": return .secondary
         default: return .primary
         }
@@ -2426,11 +2547,11 @@ struct InventoryView: View {
     private func stepIcon(_ state: String) -> some View {
         switch state {
         case "success":
-            Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+            Image(systemName: "checkmark.circle.fill").foregroundColor(AppPalette.success)
         case "failure":
-            Image(systemName: "xmark.circle.fill").foregroundColor(.red)
+            Image(systemName: "xmark.circle.fill").foregroundColor(AppPalette.danger)
         case "warning":
-            Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+            Image(systemName: "exclamationmark.triangle.fill").foregroundColor(AppPalette.warning)
         default:
             ProgressView().controlSize(.small)
         }
@@ -2493,14 +2614,12 @@ struct TodoView: View {
                     VStack(spacing: 0) {
                         HStack(spacing: 0) {
                             Text("截止时间")
-                                .frame(width: 230, alignment: .leading)
+                                .frame(width: AppLayout.todoDeadlineColumnWidth, alignment: .center)
                             Divider()
                             Text("任务内容")
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.leading, 16)
+                                .frame(maxWidth: .infinity, alignment: .center)
                         }
-                        .font(.headline)
-                        .padding(.horizontal, 14)
+                        .font(.system(size: AppLayout.todoTableHeaderFontSize, weight: .semibold))
                         .frame(height: 42)
                         .background(Color(nsColor: .controlBackgroundColor))
                         Divider()
@@ -2526,6 +2645,7 @@ struct TodoView: View {
                         }
                     }
                 }
+                .frame(minHeight: 220, idealHeight: 300, maxHeight: AppLayout.todoListMaxHeight)
 
                 HStack(spacing: 10) {
                     Button(selectedItem?.completedAt == nil ? "完成任务" : "恢复任务") {
@@ -2552,16 +2672,11 @@ struct TodoView: View {
 
                 GroupBox(label: Label("添加待办", systemImage: "plus.circle")) {
                     VStack(alignment: .leading, spacing: 12) {
-                        Text("任务内容")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        TextField("输入需要完成的任务", text: $newContent)
-                            .textFieldStyle(.roundedBorder)
-                            .controlSize(.large)
-                            .frame(minHeight: 40)
-                            .onSubmit { addTodo() }
-
                         HStack(spacing: 14) {
+                            Text("任务内容")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
                             Toggle("设置截止时间", isOn: $hasDeadline)
                                 .toggleStyle(.checkbox)
                                 .fixedSize()
@@ -2574,6 +2689,20 @@ struct TodoView: View {
                             .frame(width: 190)
                             .disabled(!hasDeadline)
                             .opacity(hasDeadline ? 1 : 0.45)
+                        }
+
+                        TextEditor(text: $newContent)
+                            .font(.body)
+                            .padding(7)
+                            .frame(minHeight: AppLayout.todoInputMinHeight, idealHeight: 100, maxHeight: 112)
+                            .background(AppPalette.surface)
+                            .clipShape(RoundedRectangle(cornerRadius: 7))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 7)
+                                    .stroke(Color.primary.opacity(0.14), lineWidth: 1)
+                            )
+
+                        HStack {
                             Spacer()
                             Button {
                                 addTodo()
@@ -2591,12 +2720,12 @@ struct TodoView: View {
 
                 if !model.todoStatus.isEmpty {
                     Label(model.todoStatus, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption).foregroundColor(.red)
+                        .font(.caption).foregroundColor(AppPalette.danger)
                 }
             }
             .padding(AppLayout.contentPadding)
         }
-        .frame(minWidth: AppLayout.windowMinWidth, minHeight: AppLayout.windowMinHeight)
+        .appPageFrame()
         .sheet(item: $editingItem) { item in
             TodoEditorSheet(model: model, item: item)
         }
@@ -2624,12 +2753,12 @@ struct TodoView: View {
                 Spacer()
                 if let badge = deadlineBadge(item) {
                     Text(badge)
-                        .font(.caption2).fontWeight(.semibold)
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(deadlineColor(item))
                 }
             }
             .padding(.horizontal, 14)
-            .frame(width: 230, alignment: .leading)
+            .frame(width: AppLayout.todoDeadlineColumnWidth, alignment: .leading)
 
             Divider()
 
@@ -2651,6 +2780,7 @@ struct TodoView: View {
             }
             .padding(.horizontal, 16)
         }
+        .font(.system(size: AppLayout.todoTableBodyFontSize))
         .frame(minHeight: 54)
         .background(selectedID == item.id ? Color.accentColor.opacity(0.14) : Color.clear)
         .contentShape(Rectangle())
@@ -2713,8 +2843,8 @@ struct TodoView: View {
         let today = calendar.startOfDay(for: Date())
         let deadlineDay = calendar.startOfDay(for: deadline)
         let days = calendar.dateComponents([.day], from: today, to: deadlineDay).day ?? 0
-        if days < 0 { return .red }
-        if days <= 1 { return .orange }
+        if days < 0 { return AppPalette.danger }
+        if days <= 1 { return AppPalette.warning }
         return .primary
     }
 }
@@ -2934,7 +3064,7 @@ struct SettingsView: View {
                 .padding(AppLayout.contentPadding)
             }
         }
-        .frame(minWidth: AppLayout.windowMinWidth, minHeight: AppLayout.windowMinHeight)
+        .appPageFrame()
     }
 
     private func fittingRow(_ label: String, text: Binding<String>) -> some View {
@@ -2949,6 +3079,7 @@ struct SettingsView: View {
     }
 }
 
+#if !TESTING
 @main
 struct TravelerAssistantApp: App {
     @StateObject private var model = AppModel()
@@ -2971,3 +3102,4 @@ struct TravelerAssistantApp: App {
             .commands { CommandGroup(replacing: .newItem) {} }
     }
 }
+#endif
