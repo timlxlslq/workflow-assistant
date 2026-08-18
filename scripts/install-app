@@ -2,38 +2,152 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SOURCE_APP="$ROOT/build/工作流程助手.app"
-DEST_APP="/Applications/工作流程助手.app"
-OLD_APP="/Applications/Work Order Traveler Assistant.app"
-BACKUP_DIR="/tmp/traveler-assistant-install-backup"
-LAUNCH_PLIST="$HOME/Library/LaunchAgents/com.pacificpride.traveler-assistant.plist"
-
+BUILD_ROOT="${PP_FLOWHUB_BUILD_ROOT:-/tmp/pp-flowhub-build}"
+SOURCE_APP="$BUILD_ROOT/PP FlowHub.app"
+DEST_APP="/Applications/PP FlowHub.app"
+BACKUP_DIR="/tmp/pp-flowhub-install-backup"
+BUILD_ARCHIVE_DIR="/tmp/pp-flowhub-build-archive"
+EXPECTED_BUNDLE_IDENTIFIER="com.pacificpride.ppflowhub"
+KEYCHAIN_IDENTITIES="$(/usr/bin/security find-identity -v -p codesigning 2>/dev/null || true)"
+SIGNING_IDENTITY="${TRAVELER_CODESIGN_IDENTITY:-}"
+if [[ -z "$SIGNING_IDENTITY" ]]; then
+  SIGNING_IDENTITY="$(printf '%s\n' "$KEYCHAIN_IDENTITIES" \
+    | /usr/bin/awk -F '\"' '/Apple Development:/ {print $2; exit}')"
+fi
+if [[ -z "$SIGNING_IDENTITY" ]]; then
+  echo "No valid Apple Development identity is available in this security session." >&2
+  echo "请从普通 macOS Terminal/Aqua 登录会话运行此命令。" >&2
+  echo "Codex Background Security Session cannot access the login keychain identity." >&2
+  exit 2
+fi
+if [[ "$SIGNING_IDENTITY" == "-" || "$SIGNING_IDENTITY" != Apple\ Development:* ]]; then
+  echo "Only an Apple Development identity is allowed for installation: $SIGNING_IDENTITY" >&2
+  exit 2
+fi
+if ! printf '%s\n' "$KEYCHAIN_IDENTITIES" | /usr/bin/grep -Fq "\"$SIGNING_IDENTITY\""; then
+  echo "The requested Apple Development identity is not valid in this security session: $SIGNING_IDENTITY" >&2
+  echo "请从普通 macOS Terminal/Aqua 登录会话运行此命令。" >&2
+  exit 2
+fi
 if [[ ! -d "$SOURCE_APP" ]]; then
-  echo "App has not been built: $SOURCE_APP" >&2
+  echo "未找到 Codex 已生成的未签名 App：$SOURCE_APP" >&2
+  echo "请先在 Codex 中运行 ./scripts/build-app，再从普通 macOS Terminal/Aqua 会话运行此命令。" >&2
+  exit 2
+fi
+if [[ ! -f "$SOURCE_APP/Contents/Info.plist" || ! -x "$SOURCE_APP/Contents/MacOS/PPFlowHub" ]]; then
+  echo "Codex 构建产物不完整：$SOURCE_APP" >&2
+  echo "请先在 Codex 中重新运行 ./scripts/build-app。" >&2
+  exit 2
+fi
+
+SOURCE_BUNDLE_IDENTIFIER="$(/usr/bin/plutil -extract CFBundleIdentifier raw "$SOURCE_APP/Contents/Info.plist")"
+if [[ "$SOURCE_BUNDLE_IDENTIFIER" != "$EXPECTED_BUNDLE_IDENTIFIER" ]]; then
+  echo "Built App Bundle Identifier is not fixed: $SOURCE_BUNDLE_IDENTIFIER" >&2
   exit 1
 fi
 
 mkdir -p "$BACKUP_DIR"
-OLD_STATE="$HOME/Library/Application Support/Work Order Traveler Assistant"
-NEW_STATE="$HOME/Library/Application Support/工作流程助手"
-if [[ -d "$OLD_STATE" && ! -e "$NEW_STATE" ]]; then
-  mv "$OLD_STATE" "$NEW_STATE"
+INSTALL_STAGING="$(mktemp -d /tmp/workflow-assistant-install.XXXXXX)"
+trap 'rm -rf "$INSTALL_STAGING"' EXIT
+STAGED_DEST="$INSTALL_STAGING/PP FlowHub.app"
+/usr/bin/ditto --noextattr --noqtn "$SOURCE_APP" "$STAGED_DEST"
+/usr/bin/xattr -cr "$STAGED_DEST"
+STAGED_BUNDLE_IDENTIFIER="$(/usr/bin/plutil -extract CFBundleIdentifier raw "$STAGED_DEST/Contents/Info.plist")"
+if [[ "$STAGED_BUNDLE_IDENTIFIER" != "$EXPECTED_BUNDLE_IDENTIFIER" ]]; then
+  echo "Staged install Bundle Identifier is not fixed: $STAGED_BUNDLE_IDENTIFIER" >&2
+  exit 1
 fi
-if [[ -d "$OLD_APP" ]]; then
-  stamp="$(date +%Y%m%d-%H%M%S)"
-  mv "$OLD_APP" "$BACKUP_DIR/Work Order Traveler Assistant-$stamp.app"
+
+SOURCE_HASH="$(shasum -a 256 "$SOURCE_APP/Contents/MacOS/PPFlowHub" | awk '{print $1}')"
+STAGED_HASH="$(shasum -a 256 "$STAGED_DEST/Contents/MacOS/PPFlowHub" | awk '{print $1}')"
+if [[ "$SOURCE_HASH" != "$STAGED_HASH" ]]; then
+  echo "Staged App does not match the tested unsigned build" >&2
+  exit 1
 fi
+
+# `keychain-read` lives in the embedded project resources rather than in one
+# of the bundle locations traversed by `codesign --deep`. Sign it explicitly;
+# otherwise macOS can kill the helper before Security.framework returns a
+# status, which the App would incorrectly report as a missing password.
+KEYCHAIN_READER="$STAGED_DEST/Contents/Resources/project/bin/keychain-read"
+if [[ ! -x "$KEYCHAIN_READER" ]]; then
+  echo "Built App is missing the keychain reader: $KEYCHAIN_READER" >&2
+  exit 1
+fi
+/usr/bin/codesign --force --sign "$SIGNING_IDENTITY" "$KEYCHAIN_READER"
+/usr/bin/codesign --verify --strict --verbose=4 "$KEYCHAIN_READER"
+
+/usr/bin/codesign --force --deep --sign "$SIGNING_IDENTITY" "$STAGED_DEST"
+/usr/bin/codesign --verify --deep --strict --verbose=4 "$STAGED_DEST"
+SIGNATURE_DETAILS="$(/usr/bin/codesign -dv --verbose=4 "$STAGED_DEST" 2>&1)"
+printf '%s\n' "$SIGNATURE_DETAILS"
+if ! printf '%s\n' "$SIGNATURE_DETAILS" | /usr/bin/grep -Fq 'Authority=Apple Development:'; then
+  echo "Temporary App is not signed by an Apple Development certificate." >&2
+  exit 1
+fi
+SIGNED_BUNDLE_IDENTIFIER="$(printf '%s\n' "$SIGNATURE_DETAILS" | /usr/bin/sed -n 's/^Identifier=//p' | head -1)"
+TEAM_IDENTIFIER="$(printf '%s\n' "$SIGNATURE_DETAILS" | /usr/bin/sed -n 's/^TeamIdentifier=//p' | head -1)"
+if [[ "$SIGNED_BUNDLE_IDENTIFIER" != "$EXPECTED_BUNDLE_IDENTIFIER" ]]; then
+  echo "Signed App Bundle Identifier is not fixed: ${SIGNED_BUNDLE_IDENTIFIER:-<missing>}" >&2
+  exit 1
+fi
+if [[ -z "$TEAM_IDENTIFIER" ]]; then
+  echo "Signed App TeamIdentifier is missing." >&2
+  exit 1
+fi
+
+# The value in parentheses in `security find-identity` is a certificate
+# identifier, not the signing TeamIdentifier. Compare the actual signed
+# metadata with the currently installed App instead of guessing it.
+if [[ -d "$DEST_APP" ]]; then
+  EXISTING_SIGNATURE_DETAILS="$(/usr/bin/codesign -dv --verbose=4 "$DEST_APP" 2>&1 || true)"
+  EXISTING_TEAM_IDENTIFIER="$(printf '%s\n' "$EXISTING_SIGNATURE_DETAILS" | /usr/bin/sed -n 's/^TeamIdentifier=//p' | head -1)"
+  if [[ -n "$EXISTING_TEAM_IDENTIFIER" && "$TEAM_IDENTIFIER" != "$EXISTING_TEAM_IDENTIFIER" ]]; then
+    echo "Signed App TeamIdentifier would change: existing $EXISTING_TEAM_IDENTIFIER, new $TEAM_IDENTIFIER" >&2
+    exit 1
+  fi
+fi
+DESIGNATED_REQUIREMENT="$(/usr/bin/codesign -d --requirements - "$STAGED_DEST" 2>&1)"
+if ! printf '%s\n' "$DESIGNATED_REQUIREMENT" | /usr/bin/grep -Fq "identifier \"$EXPECTED_BUNDLE_IDENTIFIER\""; then
+  echo "Signed App Designated Requirement does not contain the fixed Bundle Identifier." >&2
+  exit 1
+fi
+SIGNED_HASH="$(shasum -a 256 "$STAGED_DEST/Contents/MacOS/PPFlowHub" | awk '{print $1}')"
+
 if [[ -d "$DEST_APP" ]]; then
   stamp="$(date +%Y%m%d-%H%M%S)"
-  mv "$DEST_APP" "$BACKUP_DIR/工作流程助手-$stamp.app"
+  mv "$DEST_APP" "$BACKUP_DIR/PP FlowHub-$stamp.app"
 fi
-/usr/bin/ditto "$SOURCE_APP" "$DEST_APP"
+mv "$STAGED_DEST" "$DEST_APP"
+/usr/bin/xattr -cr "$DEST_APP"
+/usr/bin/codesign --verify --deep --strict --verbose=4 "$DEST_APP"
+/usr/bin/codesign -dv --verbose=4 "$DEST_APP" 2>&1
+INSTALLED_KEYCHAIN_READER="$DEST_APP/Contents/Resources/project/bin/keychain-read"
+/usr/bin/codesign --verify --strict --verbose=4 "$INSTALLED_KEYCHAIN_READER"
+# Probe a guaranteed-missing account without printing or reading any password.
+# A signed helper must reach Security.framework and return errSecItemNotFound
+# through the helper's stable exit code 3; an unsigned helper is killed with
+# SIGKILL (137) before it can return a useful status.
+PROBE_ACCOUNT="__workflow_assistant_keychain_probe__"
+set +e
+"$INSTALLED_KEYCHAIN_READER" "$PROBE_ACCOUNT" >/dev/null 2>/dev/null
+READER_STATUS=$?
+set -e
+if [[ "$READER_STATUS" -ne 3 ]]; then
+  echo "Installed keychain reader probe failed with exit code $READER_STATUS" >&2
+  exit 1
+fi
+DEST_HASH="$(shasum -a 256 "$DEST_APP/Contents/MacOS/PPFlowHub" | awk '{print $1}')"
+if [[ "$SIGNED_HASH" != "$DEST_HASH" ]]; then
+  echo "Installed App does not match the verified signed temporary App" >&2
+  exit 1
+fi
 
-/bin/launchctl bootout "gui/$(id -u)/com.pacificpride.traveler-assistant" >/dev/null 2>&1 || true
-if [[ -f "$LAUNCH_PLIST" ]]; then
-  stamp="$(date +%Y%m%d-%H%M%S)"
-  mv "$LAUNCH_PLIST" "$BACKUP_DIR/com.pacificpride.traveler-assistant-$stamp.plist"
-fi
+# The build is only an installation input. Keep it recoverable outside the
+# project so Finder does not present it as a second app alongside /Applications.
+mkdir -p "$BUILD_ARCHIVE_DIR"
+BUILD_STAMP="$(date +%Y%m%d-%H%M%S)"
+mv "$SOURCE_APP" "$BUILD_ARCHIVE_DIR/PP FlowHub-$BUILD_STAMP.app"
 
 echo "$DEST_APP"
-echo "Automatic scheduling disabled; run the app manually."
+echo "App signed, verified, and installed: $DEST_APP"

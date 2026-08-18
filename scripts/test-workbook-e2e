@@ -1,0 +1,95 @@
+#!/bin/bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TEST_ROOT="$(mktemp -d /tmp/workflow-workbook-e2e.XXXXXX)"
+trap 'rm -rf "$TEST_ROOT"' EXIT
+
+SOURCE="$ROOT/data/local-source/Optimized Orders/PP0067"
+ORDER="$TEST_ROOT/PP0067"
+TRAVELER="$TEST_ROOT/orders/PP0067/Work Order Traveler(PP0067).xlsx"
+VERIFY_DIR="$TEST_ROOT/verify"
+MATERIAL_VERIFY_DIR="$TEST_ROOT/material-verify"
+
+if command -v rg >/dev/null 2>&1; then
+  search_text() { rg -q "$1" "$2"; }
+else
+  search_text() { /usr/bin/grep -Eq "$1" "$2"; }
+fi
+
+NODE_BIN="${TRAVELER_NODE:-}"
+if [[ -z "$NODE_BIN" ]] && command -v node >/dev/null 2>&1; then
+  NODE_BIN="$(command -v node)"
+fi
+if [[ -z "$NODE_BIN" && -L "$ROOT/node_modules" ]]; then
+  NODE_MODULES_TARGET="$(readlink "$ROOT/node_modules")"
+  NODE_CANDIDATE="$(dirname "$NODE_MODULES_TARGET")/bin/node"
+  if [[ -x "$NODE_CANDIDATE" ]]; then NODE_BIN="$NODE_CANDIDATE"; fi
+fi
+if [[ -z "$NODE_BIN" || ! -x "$NODE_BIN" ]]; then
+  echo "Node.js not found for independent workbook verification" >&2
+  exit 2
+fi
+
+cp -R "$SOURCE" "$ORDER"
+if [[ -f "$ORDER/PP0067 materials.xlsx" ]]; then
+  mv "$ORDER/PP0067 materials.xlsx" "$TEST_ROOT/previous-material.xlsx"
+fi
+
+"$ROOT/.venv/bin/python" -m traveler_assistant.order_workflow generate-material \
+  --folder "$ORDER" --order-id PP0067 \
+  --source-root "$TEST_ROOT" --order-root "$TEST_ROOT/orders" \
+  --template "$ROOT/resources/templates/Work Order Traveler.xlsx" \
+  --backup-root "$TEST_ROOT/backups" --state-dir "$TEST_ROOT/state" >/dev/null
+
+"$ROOT/.venv/bin/python" -m traveler_assistant.order_workflow update-related \
+  --folder "$ORDER" --source-root "$TEST_ROOT" --order-root "$TEST_ROOT/orders" \
+  --template "$ROOT/resources/templates/Work Order Traveler.xlsx" \
+  --backup-root "$TEST_ROOT/backups" --state-dir "$TEST_ROOT/state" >/dev/null
+
+unzip -t "$TRAVELER" >/dev/null
+TRAVELER_USAGE_XML="$TEST_ROOT/traveler-usage-list.xml"
+unzip -p "$TRAVELER" xl/worksheets/sheet2.xml > "$TRAVELER_USAGE_XML"
+if search_text 'UNIQUE|FILTER' "$TRAVELER_USAGE_XML"; then
+  echo "Traveler Usage List still contains unsafe dynamic-array formulas" >&2
+  exit 1
+fi
+search_text 'SUMIF' "$TRAVELER_USAGE_XML"
+
+mkdir -p "$VERIFY_DIR"
+"$NODE_BIN" "$ROOT/tools/verify_workbook.mjs" "$TRAVELER" "$VERIFY_DIR" >/dev/null
+test -s "$VERIFY_DIR/Usage-List.png"
+
+MATERIAL="$ORDER/PP0067 materials.xlsx"
+unzip -t "$MATERIAL" >/dev/null
+MATERIAL_XML="$TEST_ROOT/material-sheet.xml"
+unzip -p "$MATERIAL" xl/worksheets/sheet1.xml > "$MATERIAL_XML"
+if search_text 'UNIQUE|FILTER' "$MATERIAL_XML"; then
+  echo "Generated material still contains unsafe dynamic-array formulas" >&2
+  exit 1
+fi
+search_text 'SUMIF' "$MATERIAL_XML"
+mkdir -p "$MATERIAL_VERIFY_DIR"
+"$NODE_BIN" "$ROOT/tools/verify_workbook.mjs" "$MATERIAL" "$MATERIAL_VERIFY_DIR" >/dev/null
+test -s "$MATERIAL_VERIFY_DIR/Sheet1.png"
+
+"$ROOT/.venv/bin/python" -c '
+from pathlib import Path
+import sys
+from openpyxl import load_workbook
+from traveler_assistant.order_workflow import parse_order_materials
+root = Path(sys.argv[1])
+material = root / "PP0067" / "PP0067 materials.xlsx"
+ws = load_workbook(material, data_only=False).active
+assert ws["A14"].value == "Total Qty:"
+assert ws["C16"].value == "Woodline 4"
+assert ws["C14"].value == "=SUM(C3:C13)"
+assert "SUMIF($I$3:$I$13,C$16,$F$3:$F$13)" in ws["C17"].value
+assert "SUMIF($I$3:$I$13,C$16,$G$3:$G$13)" in ws["C18"].value
+assert "SUMIF($I$3:$I$13,C$16,$H$3:$H$13)" in ws["C19"].value
+_, materials, edges = parse_order_materials("PP0067", material)
+assert next(item.quantity for item in materials if item.kind == "panel" and item.color == "Woodline 4") == 1
+assert abs(edges["Woodline 4"] - 18.27) < 1e-9
+' "$TEST_ROOT"
+
+echo "PP0067 workbook end-to-end test passed"

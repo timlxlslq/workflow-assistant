@@ -3,6 +3,8 @@ __pycache__/
 *.py[cod]
 node_modules
 build/
+.build/
+bin/
 .last-scheduled-run.json
 .last-scheduled-error.log
 
@@ -10,12 +12,13 @@ build/
 .env
 .env.*
 !.env.example
+.venv*/
 *.key
 *.pem
 *.p12
 settings.json
 secrets.json
 credentials.json
-data/todo-items.json
+data/
 # Real inventory exports contain company product, stock, and purchasing data.
 resources/inventory/*.xlsx

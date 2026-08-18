@@ -1,158 +1,166 @@
+import json
 import tempfile
 import unittest
-import json
-from unittest.mock import patch
 from pathlib import Path
-
-from openpyxl import load_workbook
+from unittest.mock import patch
 
 from traveler_assistant.core import (
+    AIMES_BULK_FETCH_LIMIT,
     Config,
-    BUSINESS_RULES,
-    Candidate,
-    PanelItem,
-    ReportData,
-    _include_full_sheet,
-    _normalize_name,
-    generate_traveler,
-    build_reports,
-    lookup_aimes_names,
-    map_fittings,
-    parse_board,
-    parse_fittings,
-    parse_fittings_groups,
-    parse_materials,
     RuleError,
+    _normalize_name,
+    lookup_aimes_names,
+    lookup_aimes_recent_orders,
+    refresh_aimes_recent_orders_and_verify,
+    verify_aimes_factory_orders,
 )
-
-
-SAMPLE_LOCATIONS = (
-    Path("/Volumes/server/Optimized Orders/pp0047/pp0047kitchen/Report"),
-    Path.home() / "Library/Mobile Documents/com~apple~CloudDocs/PacificPride/Other/pp0047/pp0047kitchen/Report",
-)
-SAMPLE = next((path for path in SAMPLE_LOCATIONS if path.is_dir()), SAMPLE_LOCATIONS[0])
 
 
 class CoreTests(unittest.TestCase):
-    def test_structured_business_rules_are_loaded(self):
-        self.assertEqual(BUSINESS_RULES["sheet_materials"]["plywood"]["standard_size_mm"], [2440, 1220])
-        self.assertEqual(BUSINESS_RULES["sheet_materials"]["thickness_aliases"]["5"], 5.4)
-        self.assertEqual(BUSINESS_RULES["fittings"]["direct_codes"]["WJ-CBT"], "Shelf Holder")
+    def test_aimes_bulk_defaults_to_50_but_exact_lookup_has_no_bulk_limit(self):
+        config = Config()
+        with patch(
+            "traveler_assistant.core._run_aimes_lookup",
+            return_value={"rows": []},
+        ) as lookup:
+            lookup_aimes_recent_orders(config)
+            self.assertEqual(lookup.call_args.kwargs["recent_limit"], AIMES_BULK_FETCH_LIMIT)
+
+        with patch(
+            "traveler_assistant.core._run_aimes_lookup",
+            return_value={"F100": "PP0035-KITCHEN"},
+        ) as lookup:
+            self.assertEqual(lookup_aimes_names(config, ["F100"]), {"F100": "PP0035-KITCHEN"})
+            self.assertEqual(lookup.call_args.kwargs["recent_limit"], 0)
 
     def test_name_normalization(self):
         self.assertEqual(_normalize_name("pp0047-kitchen"), "PP0047KITCHEN")
         self.assertEqual(_normalize_name("PP0047 kitchen"), "PP0047KITCHEN")
 
-    def test_sheet_size_rules(self):
-        self.assertTrue(_include_full_sheet("2440*1220*18", (2440, 1220), 100))
-        self.assertFalse(_include_full_sheet("2200*1100*18", (2440, 1220), 100))
+    def test_exact_aimes_verification_preserves_missing_rows_as_a_distinct_result(self):
+        config = Config()
+        with patch(
+            "traveler_assistant.core._run_aimes_lookup",
+            return_value={
+                "rows": [{
+                    "factory_order": "F100",
+                    "factory_name": "PP0035-KITCHEN",
+                    "sales_order_name": "PP0035",
+                    "split_time": "2026-08-16 10:00:00",
+                }],
+                "missing": ["F101"],
+            },
+        ) as lookup:
+            result = verify_aimes_factory_orders(config, ["F100", "F101"])
+        self.assertEqual(result["rows"][0]["factory_order"], "F100")
+        self.assertEqual(result["missing"], ["F101"])
+        self.assertTrue(lookup.call_args.kwargs["verify_factory_orders"])
 
-    def test_settings_load_initial_date_and_paths(self):
+    def test_recent_fetch_and_exact_verification_share_one_lookup_session(self):
+        config = Config()
+        with patch(
+            "traveler_assistant.core._run_aimes_lookup",
+            return_value={
+                "rows": [{
+                    "factory_order": "F100",
+                    "factory_name": "PP0035-KITCHEN",
+                    "sales_order_name": "PP0035",
+                    "split_time": "2026-08-16 10:00:00",
+                }],
+                "verify_rows": [{
+                    "factory_order": "F099",
+                    "factory_name": "PP0034-KITCHEN",
+                    "sales_order_name": "PP0034",
+                    "split_time": "",
+                }],
+                "missing": ["F101"],
+                "_aimes_timings": [{"label": "获取 AIMES 数据成功，总计用时", "duration_seconds": 1.2}],
+            },
+        ) as lookup:
+            timings = []
+            rows, verification = refresh_aimes_recent_orders_and_verify(
+                config,
+                50,
+                ["F099", "F101"],
+                timing_sink=timings,
+            )
+        self.assertEqual(rows[0]["factory_order"], "F100")
+        self.assertEqual(verification["rows"][0]["factory_order"], "F099")
+        self.assertEqual(verification["missing"], ["F101"])
+        self.assertEqual(timings[0]["label"], "获取 AIMES 数据成功，总计用时")
+        self.assertEqual(lookup.call_args.kwargs["recent_limit"], 50)
+        self.assertTrue(lookup.call_args.kwargs["verify_factory_orders"])
+
+    def test_settings_load_only_runtime_paths_and_cutoff(self):
         with tempfile.TemporaryDirectory() as temp:
             state = Path(temp)
             (state / "settings.json").write_text(json.dumps({
                 "initial_date": "2026-07-22",
-                "company_wifi": "Test WiFi",
                 "source_root": "/tmp/orders",
-                "leftover_threshold_mm": 80,
+                "template": "/tmp/old-template.xlsx",
+                "obsolete_setting": "ignored",
             }))
             config = Config(state_dir=state)
+            bundled_template = config.template
             config.load_settings()
             self.assertEqual(config.initial_date, "2026-07-22")
-            self.assertEqual(config.company_wifi, "Test WiFi")
             self.assertEqual(config.source_root, Path("/tmp/orders"))
-            self.assertEqual(config.leftover_threshold_mm, 80)
+            self.assertEqual(config.template, bundled_template)
 
-    def test_aimes_lookup_requires_machine_local_username(self):
-        with self.assertRaises(RuleError) as raised:
-            lookup_aimes_names(Config(aimes_username=""), ["F999"])
-        self.assertEqual(raised.exception.code, "aimes_credentials")
-
-    @unittest.skipUnless(SAMPLE.is_dir(), "PP0047 server or iCloud sample is not available")
-    def test_parse_kitchen_samples(self):
-        board = SAMPLE / "pp-板材清单-newPC124429962607020002.xlsx"
-        fittings = SAMPLE / "FittingslistPC124429962607020002.xlsx"
-        factory, order, panels, edge = parse_board(board, 100)
-        ff, items = parse_fittings(fittings)
-        mapped, ignored = map_fittings(items)
-        self.assertEqual(factory, ff)
-        self.assertEqual(order, "PP0047-KITCHEN")
-        self.assertEqual(mapped["Hinge"], 36)
-        self.assertEqual(mapped["Shelf Holder"], 36)
-        self.assertEqual(mapped["H-Rail"], 12)
-        self.assertEqual(mapped["L-Rail"], 7)
-        self.assertTrue(edge)
-        self.assertTrue(ignored)
-
-    def test_dynamic_panel_and_edge_rows(self):
+    def test_invalid_cutoff_date_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            config = Config(order_root=root / "orders")
-            report = ReportData(
-                "F999",
-                "PP9999-TEST",
-                "PP9999",
-                root,
-                root / "board.xlsx",
-                root / "fittings.xlsx",
-                [
-                    PanelItem(18, "", "2440*1220", 2, "plywood"),
-                    PanelItem(19.1, "Woodline 4", "2745*1220", 3, "panel"),
-                    PanelItem(9, "Ivory Oak", "2745*1220", 1, "panel"),
-                ],
-                {"Ivory Oak": 12.34, "Woodline 4": 56.78},
-                {"Hinge": 4, "Shelf Holder": 8, "H-Rail": 2, "L-Rail": 1},
-                [],
-            )
-            output = root / "out.xlsx"
-            generate_traveler(config, report, output)
-            wb = load_workbook(output, data_only=True)
-            self.assertEqual(wb["WorkOrderTraveler"]["B10"].value, "9mm--Ivory Oak")
-            self.assertEqual(wb["Pickinglist"]["C12"].value, "Edge banding--Woodline 4")
-            self.assertEqual(wb["Pickinglist"]["C16"].value, "Shelf Holder")
+            state = Path(temp)
+            (state / "settings.json").write_text('{"initial_date":"07/22/2026"}')
+            with self.assertRaises(RuleError) as raised:
+                Config(state_dir=state).load_settings()
+            self.assertEqual(raised.exception.code, "settings_invalid")
 
-    @unittest.skipUnless(
-        Path("/Volumes/server/Optimized Orders/pp0046").is_dir(),
-        "PP0046 server sample is not available",
-    )
-    def test_pp0046_multi_factory_and_materials(self):
-        root = Path("/Volumes/server/Optimized Orders/pp0046")
-        report = root / "pp0046 1st_2nd_master autolabel/Report"
-        groups = parse_fittings_groups(report / "FittingslistPC124429962607230001.xlsx")
-        self.assertEqual([group[0] for group in groups], ["F2607220204", "F2607220203", "F2607220205"])
-        mapped, _ = map_fittings([item for _, items in groups for item in items])
-        self.assertEqual(mapped["Hinge"], 16)
-        self.assertEqual(mapped["H-Rail"], 10)
-        self.assertEqual(mapped["L-Rail"], 1)
-        materials = parse_materials(root / "pp0046 materials.xlsx")
-        quantities = {(item.kind, item.thickness, item.color): item.quantity for item in materials.panels}
-        self.assertEqual(quantities[("plywood", 18, "")], 6)
-        self.assertEqual(quantities[("plywood", 5.4, "")], 2)
-        self.assertEqual(quantities[("panel", 19.1, "Antracita SM")], 1)
-        self.assertEqual(quantities[("panel", 19.1, "Woodline 3")], 2)
+    def test_server_profile_uses_production_paths_when_active_source_is_local(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            (state / "settings.json").write_text(json.dumps({
+                "source_root": "/tmp/test/Optimized Orders",
+                "order_root": "/tmp/test/Generated Travelers",
+                "backup_root": "/tmp/test/Backups",
+                "server_source_root": "/Volumes/server/Optimized Orders",
+                "production_order_root": "/tmp/production/Order",
+                "production_backup_root": "/tmp/production/Backups",
+            }))
+            config = Config(state_dir=state)
+            config.load_settings(source_profile="server")
+            self.assertEqual(config.source_root, Path("/Volumes/server/Optimized Orders"))
+            self.assertEqual(config.order_root, Path("/tmp/production/Order"))
+            self.assertEqual(config.backup_root, Path("/tmp/production/Backups"))
 
-    @unittest.skipUnless(
-        Path("/Volumes/server/Optimized Orders/pp0046").is_dir(),
-        "PP0046 server sample is not available",
-    )
-    def test_pp0046_builds_one_merged_report(self):
-        root = Path("/Volumes/server/Optimized Orders/pp0046")
-        report_dir = root / "pp0046 1st_2nd_master autolabel/Report"
-        candidates = [
-            Candidate("board", report_dir / "pp-板材清单-newPC124429962607230001.xlsx", "", mtime=1),
-            Candidate("fittings", report_dir / "FittingslistPC124429962607230001.xlsx", "", mtime=1),
-        ]
-        names = {"F2607220204": "PP0046-MASTER", "F2607220203": "PP0046-2ND", "F2607220205": "PP0046-1ST"}
-        with patch("traveler_assistant.core.lookup_aimes_names", return_value=names):
-            reports, errors = build_reports(Config(source_root=root), candidates)
-        self.assertEqual(errors, [])
-        self.assertEqual(len(reports), 1)
-        self.assertEqual(reports[0].order_name, "PP0046-MASTER/PP0046-2ND/PP0046-1ST")
-        self.assertEqual(reports[0].traveler_file_name, "pp0046 1st_2nd_master autolabel")
-        self.assertEqual(reports[0].fittings["Hinge"], 16)
-        self.assertEqual(reports[0].materials_path, root / "pp0046 materials.xlsx")
-        self.assertTrue(any("materials 与原报表汇总不一致" in warning for warning in reports[0].warnings))
-        self.assertEqual(reports[0].edge_banding["Antracita SM"], 29.09)
+    def test_aimes_username_is_loaded_without_loading_a_password(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            (state / "settings.json").write_text(json.dumps({"aimes_username": "factory-user"}))
+            config = Config(state_dir=state)
+            config.load_settings()
+            self.assertEqual(config.aimes_username, "factory-user")
+            self.assertFalse(hasattr(config, "aimes_password"))
+
+    def test_local_profile_derives_all_isolated_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            local = state / "test-source"
+            (state / "settings.json").write_text(json.dumps({"local_test_root": str(local)}))
+            config = Config(state_dir=state)
+            config.load_settings(source_profile="local")
+            self.assertEqual(config.source_root, local / "Optimized Orders")
+            self.assertEqual(config.order_root, local / "Generated Travelers")
+            self.assertEqual(config.backup_root, local / "Backups")
+
+    def test_operation_log_setting_is_loaded_and_defaults_to_enabled(self):
+        with tempfile.TemporaryDirectory() as temp:
+            state = Path(temp)
+            self.assertTrue(Config(state_dir=state).operation_log_enabled)
+            (state / "settings.json").write_text(json.dumps({"operation_log_enabled": False}))
+            config = Config(state_dir=state)
+            config.load_settings()
+            self.assertFalse(config.operation_log_enabled)
+            self.assertEqual(config.operation_log_file, state / "operation-log.jsonl")
 
 
 if __name__ == "__main__":

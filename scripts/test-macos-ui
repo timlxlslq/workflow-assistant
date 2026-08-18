@@ -2,18 +2,29 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CACHE="/tmp/traveler-assistant-ui-test-module-cache"
-BINARY="/tmp/traveler-assistant-ui-tests"
+CACHE="/tmp/pp-flowhub-ui-test-module-cache"
+BINARY="/tmp/pp-flowhub-ui-tests"
+TEST_STATE_DIR="$(mktemp -d /tmp/pp-flowhub-ui-state.XXXXXX)"
+trap 'rm -rf "$TEST_STATE_DIR"' EXIT
+export PP_FLOWHUB_STATE_DIR="$TEST_STATE_DIR"
+DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+TARGET_ARCH="${TRAVELER_ARCH:-$(uname -m)}"
 mkdir -p "$CACHE"
 /usr/bin/xcrun --sdk macosx swiftc \
+  -target "$TARGET_ARCH-apple-macosx$DEPLOYMENT_TARGET" \
   -DTESTING \
   -module-cache-path "$CACHE" \
   -Xcc -fmodules-cache-path="$CACHE" \
   -parse-as-library \
+  "$ROOT/macos/OperationLog.swift" \
   "$ROOT/macos/TravelerAssistant.swift" \
+  "$ROOT/macos/AssistantView.swift" \
+  "$ROOT/macos/OrderDashboardView.swift" \
   "$ROOT/tests/test_macos_ui.swift" \
   -o "$BINARY" \
   -framework SwiftUI \
   -framework AppKit \
-  -framework UserNotifications
+  -framework AVFoundation \
+  -framework Speech \
+  -framework Security
 "$BINARY"

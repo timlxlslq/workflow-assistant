@@ -1,0 +1,4 @@
+interface:
+  display_name: "Traveler Management"
+  short_description: "Create and update production Travelers safely"
+  default_prompt: "Use $traveler-management to preview or update a production Traveler."

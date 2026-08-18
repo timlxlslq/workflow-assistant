@@ -1,0 +1,4 @@
+interface:
+  display_name: "Inventory Management"
+  short_description: "Check stock and prepare approved outbound work"
+  default_prompt: "Use $inventory-management to check stock or preview inventory outbound work."

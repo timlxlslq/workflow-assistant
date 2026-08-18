@@ -1,4 +1,7 @@
 import json
+import os
+import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,12 +14,44 @@ from traveler_assistant.core import Config, RuleError
 from traveler_assistant.inventory import (
     InventoryMappings,
     InventorySyncStore,
+    Product,
+    ProductDatabase,
     ProductCatalog,
+    _catalog_change_summary,
+    close_inventory_chrome,
+    _keychain_password,
     _jdy_error_detail,
+    _find_existing_inventory_page,
+    _resolve_jdy_runtime,
+    _is_inventory_authenticated_url,
+    _is_inventory_domain_url,
+    _is_inventory_service_workbench_url,
+    build_database_preview,
     build_preview,
+    check_stock,
+    import_catalog,
+    list_traveler_names,
+    open_inventory_chrome,
+    order_stock_requirements,
     parse_traveler,
+    list_inventory_mappings,
+    remove_manual_mapping,
     reconcile_folder_status,
+    run_jdy,
+    resolve_inventory_items,
+    set_ignored_mapping,
+    save_manual_mapping,
+    set_outbound_scope,
+    stock_requirements,
+    bootstrap_product_database,
+    TravelerItem,
     update_catalog_online,
+    update_manual_mapping,
+)
+from traveler_assistant.order_index import (
+    OrderIndexStore,
+    _refresh_outbound_status,
+    assert_factory_orders_outbound_allowed,
 )
 
 
@@ -27,44 +62,47 @@ def make_traveler(path: Path, items):
     main.append(["Name/工厂单名称", "PP0099"])
     usage = workbook.create_sheet("Usage List")
     usage.append(["Job:", "PP0099"])
-    usage.append(["", "", "3/4 Plywood", "5/8 Plywood", "1/4 Plywood"])
-    usage.append([])
-    usage.append([])
-    usage.append(["Total Qty:", "", 0, 0, 0])
-    usage.append([])
-    usage.append(["Color Table"])
-    colors = []
-    material_quantities = {}
+    usage.append([
+        "Room/section", "", "3/4 Plywood", "5/8 Plywood", "1/4 Plywood",
+        "3/4 Finish Panel", "1/4 Finish Panel", "Edge Banding (m)", "Color",
+    ])
+    plywood = {"18mm--Plywood": 0, "14.5mm--Plywood": 0, "5.4mm--Plywood": 0}
+    colored_materials = {}
     hardware = []
     for name, quantity in items:
-        if name == "18mm--Plywood":
-            usage.cell(5, 3, quantity)
-        elif name == "14.5mm--Plywood":
-            usage.cell(5, 4, quantity)
-        elif name == "5.4mm--Plywood":
-            usage.cell(5, 5, quantity)
+        if name in plywood:
+            plywood[name] = quantity
         elif "--" in name and (
             name.lower().startswith(("8mm--", "9mm--", "19.1mm--", "edge banding--"))
         ):
             color = name.split("--", 1)[1]
-            if color not in colors:
-                colors.append(color)
-            material_quantities[name] = quantity
+            values = colored_materials.setdefault(color, {"panel": 0, "back": 0, "edge": 0})
+            if name.lower().startswith("19.1mm--"):
+                values["panel"] = quantity
+            elif name.lower().startswith(("8mm--", "9mm--")):
+                values["back"] = quantity
+            else:
+                values["edge"] = quantity
         else:
             hardware.append((name, quantity))
-    colors = colors or ["TEST COLOR"]
-    usage.append(["Color:"] + colors)
-    usage.append(["Sheets (3/4):"] + [
-        material_quantities.get(f"19.1mm--{color}", 0) for color in colors
-    ])
-    usage.append(["Sheets (1/4):"] + [
-        material_quantities.get(f"8mm--{color}", material_quantities.get(f"9mm--{color}", 0))
-        for color in colors
-    ])
-    usage.append(["Edge Banding (m):"] + [
-        material_quantities.get(f"Edge banding--{color}", 0) for color in colors
-    ])
-    picking = workbook.create_sheet("Pickinglist")
+    colors = list(colored_materials) or ["TEST COLOR"]
+    for index, color in enumerate(colors):
+        values = colored_materials.get(color, {"panel": 0, "back": 0, "edge": 0})
+        usage.append([
+            "Test" if index == 0 else "", "",
+            plywood["18mm--Plywood"] if index == 0 else 0,
+            plywood["14.5mm--Plywood"] if index == 0 else 0,
+            plywood["5.4mm--Plywood"] if index == 0 else 0,
+            values["panel"], values["back"], values["edge"], color,
+        ])
+    usage.cell(13, 1).value = None
+    usage.append(["Total Qty:"])
+    usage.append(["Color Table"])
+    usage.append(["Color:"])
+    usage.append(["Sheets (3/4):"])
+    usage.append(["Sheets (1/4):"])
+    usage.append(["Edge Banding (m):"])
+    picking = workbook.create_sheet("Picking List")
     picking.append(["Picking List领料单"])
     picking.append(["Name/工厂单名称", "PP0099-KITCHEN"])
     picking.append(["Panel板材"])
@@ -75,22 +113,463 @@ def make_traveler(path: Path, items):
 
 
 def make_catalog(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
     sheet = workbook.active
-    sheet.append(["商品类别", "*商品编号", "商品名称", "规格型号", "状态"])
+    sheet.append(["商品类别", "*商品编号", "商品名称", "规格型号", "状态", "计量单位"])
     rows = [
-        ("Plywood", "M0004", "3/4 Finished UV2S", "18mm", "启用"),
-        ("Hardware", "M1001", "Unihopper Hinge", "", "启用"),
-        ("Hardware", "M1068", "Push Open A", "", "启用"),
-        ("Hardware", "M1069", "Push Open B", "", "启用"),
-        ("Edge band", "M0020", "Woodline 4 Edge Banding", "22mm", "启用"),
+        ("Plywood", "M0004", "3/4 Finished UV2S", "18mm", "启用", "张"),
+        ("Hardware", "M1001", "Unihopper Hinge", "", "启用", "件"),
+        ("Hardware", "M1068", "Push Open A", "", "启用", "件"),
+        ("Hardware", "M1069", "Push Open B", "", "启用", "件"),
+        ("Edge band", "M0020", "Woodline 4 Edge Banding", "22mm", "启用", "m"),
     ]
     for row in rows:
         sheet.append(row)
     workbook.save(path)
 
 
+def make_priced_catalog(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["商品类别", "*商品编号", "商品名称", "规格型号", "状态", "计量单位", "预计采购价"])
+    sheet.append(["Plywood", "M0004", "3/4 Finished UV2S", "18mm", "启用", "张", 31.76])
+    sheet.append(["Panel", "M0005", "No price panel", "19.1mm", "启用", "张", None])
+    workbook.save(path)
+
+
 class InventoryTests(unittest.TestCase):
+    def test_cut_to_size_customer_supplied_material_stays_fact_but_is_not_outbound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = Config(state_dir=root / "state", order_root=root / "generated")
+            config.prepare_storage()
+            (config.state_dir / "inventory").mkdir(parents=True, exist_ok=True)
+            make_catalog(config.state_dir / "inventory" / "current-products.xlsx")
+            store = OrderIndexStore(config.workflow_database)
+            store.connection.execute(
+                "insert into orders(order_id, order_type, source_folder, updated_at) values(?,?,?,?)",
+                ("CS002", "cutToSize", str(root / "source" / "CS002"), "now"),
+            )
+            store.connection.execute(
+                "insert into factory_orders(factory_order, order_id, factory_name, optimized, outbound_status, updated_at) values(?,?,?,?,?,?)",
+                ("F2002", "CS002", "CS002-Hardware", 1, "未出库", "now"),
+            )
+            store.connection.execute(
+                "insert into material_items(order_id, material_type, color, thickness, quantity, unit, source_type, updated_at) values(?,?,?,?,?,?,?,?)",
+                ("CS002", "plywood", "", "18", 5, "pcs", "aihouse", "now"),
+            )
+            store.connection.execute(
+                "insert into material_items(order_id, material_type, color, thickness, quantity, unit, edge, source_type, updated_at) values(?,?,?,?,?,?,?,?,?)",
+                ("CS002", "edge", "Woodline 4", "", 100, "m", "Woodline 4", "aihouse", "now"),
+            )
+            store.connection.execute(
+                "insert into hardware_items(order_id, factory_order, scope, product_code, name, quantity, unit, source_type, updated_at) values(?,?,?,?,?,?,?,?,?)",
+                ("CS002", "F2002", "factory_order", "M1001", "Unihopper Hinge", 2, "件", "aicnc", "now"),
+            )
+            store.commit()
+            store.close()
+            set_outbound_scope(config, "CS002", "material", "customer_supplied", reason="客户提供板材和封边")
+            with patch("traveler_assistant.inventory.bootstrap_product_database", return_value=config.state_dir / "inventory" / "current-products.xlsx"):
+                preview = build_database_preview(config, "CS002", ["F2002"])
+            self.assertTrue(preview.ready)
+            self.assertEqual({item.product_code for item in preview.outbound_items}, {"M1001"})
+            self.assertEqual(preview.outbound_items[0].document_remark, "CS002-Hardware")
+            self.assertEqual(preview.scope_decisions[0]["requirement"], "customer_supplied")
+            facts = sqlite3.connect(config.workflow_database).execute(
+                "select quantity from material_items where order_id='CS002' order by material_type"
+            ).fetchall()
+            self.assertEqual([row[0] for row in facts], [100.0, 5.0])
+
+    def test_customer_supplied_scope_is_rejected_for_owned_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(state_dir=Path(directory) / "state")
+            config.prepare_storage()
+            store = OrderIndexStore(config.workflow_database)
+            store.connection.execute(
+                "insert into orders(order_id, order_type, updated_at) values(?,?,?)",
+                ("PP9999", "owned", "now"),
+            )
+            store.commit()
+            store.close()
+            with self.assertRaisesRegex(RuleError, "只有来料加工"):
+                set_outbound_scope(config, "PP9999", "material", "customer_supplied", reason="误操作")
+
+    def test_remainder_decision_allows_empty_order_without_opening_browser(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(state_dir=Path(directory) / "state")
+            config.prepare_storage()
+            store = OrderIndexStore(config.workflow_database)
+            store.connection.execute(
+                "insert into orders(order_id, order_type, updated_at) values(?,?,?)",
+                ("CS002", "cutToSize", "now"),
+            )
+            store.commit()
+            store.close()
+            set_outbound_scope(config, "CS002", "material", "remainder", reason="本单只用余料生产")
+            preview = build_database_preview(config, "CS002", [])
+            self.assertTrue(preview.ready)
+            self.assertTrue(preview.no_outbound_required)
+            self.assertEqual(preview.outbound_items, [])
+
+    def test_database_order_outbound_preview_maps_without_traveler_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            config = Config(state_dir=state, order_root=root / "generated")
+            config.prepare_storage()
+            (state / "inventory").mkdir(parents=True, exist_ok=True)
+            make_catalog(state / "inventory" / "current-products.xlsx")
+            (state / "inventory" / "mappings.json").write_text(
+                '{"manual": {}, "ignored": {}}', encoding="utf-8"
+            )
+            store = OrderIndexStore(config.workflow_database)
+            store.connection.execute(
+                "insert into orders(order_id, order_type, source_folder, updated_at) values(?,?,?,?)",
+                ("PP9999", "owned", str(root / "source" / "PP9999"), "2026-08-15T10:00:00"),
+            )
+            store.connection.execute(
+                "insert into factory_orders(factory_order, order_id, factory_name, optimized, outbound_status, updated_at) values(?,?,?,?,?,?)",
+                ("F9999", "PP9999", "PP9999-KITCHEN", 1, "未出库", "2026-08-15T10:00:00"),
+            )
+            store.connection.execute(
+                "insert into material_items(order_id, material_type, color, thickness, quantity, unit, source_type, updated_at) values(?,?,?,?,?,?,?,?)",
+                ("PP9999", "plywood", "", "18", 2, "pcs", "database", "2026-08-15T10:00:00"),
+            )
+            store.connection.execute(
+                "insert into material_items(order_id, material_type, color, thickness, quantity, unit, edge, source_type, updated_at) values(?,?,?,?,?,?,?,?,?)",
+                ("PP9999", "edge", "Woodline 4", "", 12.5, "m", "Woodline 4", "database", "2026-08-15T10:00:00"),
+            )
+            store.connection.execute(
+                "insert into hardware_items(order_id, factory_order, scope, product_code, name, spec, quantity, unit, source_type, updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+                ("PP9999", "F9999", "factory_order", "M1001", "Unihopper Hinge", "", 3, "件", "database", "2026-08-15T10:00:00"),
+            )
+            store.connection.commit()
+            store.close()
+
+            with patch(
+                "traveler_assistant.inventory.bootstrap_product_database",
+                return_value=state / "inventory" / "current-products.xlsx",
+            ):
+                preview = build_database_preview(config, "PP9999", ["F9999"])
+
+            self.assertTrue(preview.ready)
+            self.assertEqual(
+                {(item.document_remark, item.product_code) for item in preview.outbound_items},
+                {("PP9999", "M0004"), ("PP9999", "M0020"), ("PP9999-KITCHEN", "M1001")},
+            )
+            self.assertEqual(preview.traveler.path, config.workflow_database.resolve())
+            self.assertFalse((config.order_root / "PP9999" / "Work Order Traveler(PP9999).xlsx").exists())
+
+    def test_order_context_source_no_longer_requires_traveler_gate(self):
+        root = Path(__file__).resolve().parents[1]
+        dashboard = (root / "macos" / "OrderDashboardView.swift").read_text(encoding="utf-8")
+        swift = (root / "macos" / "TravelerAssistant.swift").read_text(encoding="utf-8")
+        self.assertNotIn("model.orderExistingTravelerPath.isEmpty", dashboard)
+        self.assertIn('"order-preview", "--order-id"', swift)
+        self.assertIn('var arguments = ["outbound"]', swift)
+        self.assertIn('arguments += ["--order-id", orderID]', swift)
+        detail = dashboard.split("struct OrderDashboardDetailPage", 1)[1].split(
+            "struct OrderDashboardDetailCard", 1
+        )[0]
+        self.assertNotIn('Text("订单详情")', detail)
+        self.assertIn("VStack(alignment: .leading, spacing: 14)", detail)
+        self.assertIn("min(max(0, geometry.size.width - AppLayout.contentPadding * 2), 1120)", detail)
+        self.assertIn("ScrollView(.vertical)", detail)
+        self.assertEqual(detail.count("ScrollView(.vertical)"), 1)
+        self.assertIn("ScrollView(.vertical) {\n                    hardwareSection", detail)
+        self.assertIn("HStack(alignment: .center", detail)
+        self.assertIn('Text("订单 (\\(order.orderId))")', detail)
+        self.assertNotIn("order.orderType", detail)
+        self.assertIn('Button("生成 Traveler")', detail)
+        self.assertIn('Button("关闭")', detail)
+        self.assertIn(".font(.title2.weight(.semibold))", detail)
+        self.assertIn("orderDetailCardMinHeight", detail)
+        self.assertIn("value: row.quantity.formatted()", detail)
+        self.assertNotIn("model.loadOrderDetailFromDatabase(order)", detail)
+        self.assertNotIn("if model.selectedOrderId.caseInsensitiveCompare(order.orderId)", detail)
+        self.assertIn('Text(isOrderContext ? "订单材料" : "Traveler 材料")', swift)
+        self.assertIn("orderDetailGridColumnCount", detail)
+        self.assertIn("inventoryIgnoredMappings", swift)
+        self.assertIn("inventoryManualMappings", swift)
+        self.assertIn("五金全局忽略列表", swift)
+        self.assertIn("struct InventoryManualMappingsSheet", swift)
+        self.assertIn("saveInventoryIgnoredMapping", swift)
+        self.assertIn("updateInventoryIgnoredMapping", swift)
+        self.assertIn("removeInventoryIgnoredMapping", swift)
+        self.assertIn("saveSettingsManualMapping", swift)
+        self.assertIn("updateSettingsManualMapping", swift)
+        self.assertIn("removeSettingsManualMapping", swift)
+        settings = swift.split("struct SettingsView", 1)[1].split(
+            "struct OperationLogViewerView", 1
+        )[0]
+        self.assertNotIn("Traveler 材料名称", settings)
+        self.assertNotIn("设置材料映射", settings)
+        self.assertIn("库存商品资料与全局忽略", settings)
+        self.assertIn('Button("查看") { showIgnoredHardwareList = true }', settings)
+        self.assertIn("struct InventoryIgnoredMappingsSheet", swift)
+
+    def test_database_outbound_status_changes_when_persisted_order_data_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            config = Config(state_dir=state, order_root=root / "generated")
+            config.prepare_storage()
+            (state / "inventory").mkdir(parents=True, exist_ok=True)
+            make_catalog(state / "inventory" / "current-products.xlsx")
+            (state / "inventory" / "mappings.json").write_text(
+                '{"manual": {}, "ignored": {}}', encoding="utf-8"
+            )
+            store = OrderIndexStore(config.workflow_database)
+            store.connection.execute(
+                "insert into orders(order_id, order_type, source_folder, updated_at) values(?,?,?,?)",
+                ("PP9999", "owned", str(root / "source" / "PP9999"), "2026-08-15T10:00:00"),
+            )
+            store.connection.execute(
+                "insert into factory_orders(factory_order, order_id, factory_name, optimized, outbound_status, updated_at) values(?,?,?,?,?,?)",
+                ("F9999", "PP9999", "PP9999-KITCHEN", 1, "已出库", "2026-08-15T10:00:00"),
+            )
+            store.connection.execute(
+                "insert into material_items(order_id, material_type, color, thickness, quantity, unit, source_type, updated_at) values(?,?,?,?,?,?,?,?)",
+                ("PP9999", "plywood", "", "18", 2, "pcs", "database", "2026-08-15T10:00:00"),
+            )
+            store.connection.execute(
+                "insert into hardware_items(order_id, factory_order, scope, product_code, name, spec, quantity, unit, source_type, updated_at) values(?,?,?,?,?,?,?,?,?,?)",
+                ("PP9999", "F9999", "factory_order", "M1001", "Unihopper Hinge", "", 3, "件", "database", "2026-08-15T10:00:00"),
+            )
+            store.commit()
+            store.close()
+
+            with patch(
+                "traveler_assistant.inventory.bootstrap_product_database",
+                return_value=state / "inventory" / "current-products.xlsx",
+            ):
+                preview = build_database_preview(config, "PP9999", ["F9999"])
+
+            factory = {
+                "order_id": "PP9999",
+                "factory_order": "F9999",
+                "factory_name": "PP9999-KITCHEN",
+            }
+            record = {
+                "order_id": "PP9999",
+                "remark": "PP9999-KITCHEN",
+                "status": "已出库",
+                "document_number": "QTCK-1",
+                "traveler_path": str(config.workflow_database),
+                "raw_fingerprint": InventorySyncStore.raw_document_fingerprint(
+                    preview.traveler.documents["PP9999-KITCHEN"]
+                ),
+            }
+            self.assertEqual(_refresh_outbound_status(config, factory, [record]), ("已出库", "QTCK-1"))
+
+            connection = sqlite3.connect(config.workflow_database)
+            connection.execute(
+                "update hardware_items set quantity=4 where order_id=? and factory_order=?",
+                ("PP9999", "F9999"),
+            )
+            connection.commit()
+            connection.close()
+            self.assertEqual(_refresh_outbound_status(config, factory, [record]), ("需要更新", "QTCK-1"))
+
+    def test_inventory_page_detection_accepts_tenant_workbench_subdomain(self):
+        url = "https://vip2-hz.jdy.com/default-new.jsp?dbid=7937191793066#/beginner-guide"
+
+        self.assertTrue(_is_inventory_domain_url(url))
+        self.assertTrue(_is_inventory_authenticated_url(url))
+        with patch(
+            "traveler_assistant.inventory._inventory_cdp_pages",
+            return_value=[{"type": "page", "url": url}],
+        ):
+            self.assertEqual(_find_existing_inventory_page("http://127.0.0.1:9222"), {"type": "page", "url": url})
+
+    def test_inventory_service_workbench_is_an_entry_page(self):
+        service_url = "https://service.jdy.com/workbench/web/index.html"
+
+        self.assertTrue(_is_inventory_authenticated_url(service_url))
+        self.assertTrue(_is_inventory_service_workbench_url(service_url))
+
+    def test_inventory_page_detection_still_rejects_login_and_non_inventory_urls(self):
+        self.assertFalse(_is_inventory_authenticated_url("https://www.jdy.com/login/"))
+        self.assertFalse(_is_inventory_authenticated_url("https://www.jdy.com/global/?logout=true"))
+        self.assertFalse(_is_inventory_domain_url("https://example.com/default-new.jsp"))
+
+    def test_jdy_cdp_cleanup_uses_playwright_browser_close(self):
+        source = (Path(__file__).resolve().parents[1] / "tools" / "jdy_inventory.mjs").read_text(encoding="utf-8")
+
+        self.assertIn("await browser.close()", source)
+        self.assertIn("await remoteBrowser.close()", source)
+        self.assertIn('request.action === "closeChrome"', source)
+        self.assertIn('session.send("Browser.close")', source)
+        self.assertNotIn("browser.disconnect()", source)
+        self.assertNotIn("remoteBrowser.disconnect()", source)
+
+    def test_outbound_navigation_reuses_existing_list_and_opens_visible_menu_item(self):
+        source = (Path(__file__).resolve().parents[1] / "tools" / "jdy_inventory.mjs").read_text(encoding="utf-8")
+
+        self.assertIn("const currentOtherOutboundListFrame", source)
+        self.assertIn("const isOtherOutboundListFrame", source)
+        self.assertIn("const isOtherOutboundListURL", source)
+        self.assertIn("action=initOiList", source)
+        self.assertIn("const currentOtherOutboundFormFrame", source)
+        self.assertIn("const isServiceWorkbenchURL", source)
+        self.assertIn("const ensureInventoryBusinessWorkbench", source)
+        self.assertIn("const waitForInventoryActionShell", source)
+        self.assertIn("点击服务工作台“进入使用”", source)
+        self.assertIn("const waitForVisibleLeftNavigationItem", source)
+        self.assertIn("const waitForOtherOutboundListFrame", source)
+        self.assertIn("const waitForOtherOutboundFormFrame", source)
+        self.assertIn("const clickOtherOutboundHistory", source)
+        self.assertIn("其他出库单中的历史单据", source)
+        self.assertIn("准备点击“历史单据”进入记录列表", source)
+        self.assertIn("const assertOutboundFormMatchesRequest", source)
+        self.assertIn("const outboundMaterialRows", source)
+        self.assertIn('td[aria-describedby="grid_invNumber"]', source)
+        self.assertIn("snapshot.productCode === item.productCode", source)
+        self.assertNotIn("const meaningfulCells = cells.filter", source)
+        self.assertIn("await waitForOtherOutboundListFrame(page)", source)
+        self.assertNotIn('log("已复用当前页面中的空白其他出库单表单")', source)
+        self.assertIn(".quick-datepicker-start:visible", source)
+        self.assertIn("Prefer the tab that already contains the outbound list", source)
+        self.assertIn('log("已复用当前页面中的其他出库单记录列表")', source)
+        self.assertIn('const openOtherOutboundMenuItem', source)
+        self.assertIn('visibleTextLocatorsAcrossFrames(page, label)', source)
+        self.assertIn("warehouse.hover({ force: true })", source)
+        self.assertIn("本机已有出库单", source)
+        self.assertIn("已停止，不新建重复出库单", source)
+
+    def test_jdy_error_detail_explains_reused_page_menu_timeout(self):
+        detail = _jdy_error_detail(
+            "库存系统自动操作失败：左侧菜单中等待可见“仓库”超过 30 秒；当前页面："
+            "https://vip2-hz.jdy.com/default-new.jsp"
+        )
+        self.assertIn("左侧“仓库”菜单", detail)
+
+    def test_outbound_preview_hides_bottom_write_note(self):
+        source = (Path(__file__).resolve().parents[1] / "macos" / "TravelerAssistant.swift").read_text(encoding="utf-8")
+        self.assertNotIn("真实写入会创建库存出库单，并保存本机同步记录。", source)
+
+    def test_outbound_preview_rows_are_full_row_clickable_and_scroll_independently(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "macos" / "TravelerAssistant.swift").read_text(encoding="utf-8")
+        dashboard_source = (root / "macos" / "OrderDashboardView.swift").read_text(encoding="utf-8")
+        self.assertIn("private func togglePreviewRow(_ id: UUID)", source)
+        self.assertIn("togglePreviewRow(row.id)", source)
+        self.assertIn("ScrollView(.vertical)", source)
+        self.assertIn("inventoryContentContainer", source)
+        self.assertIn("inventoryWriteBlocked", source)
+        self.assertIn("inventoryWriteCompleted", source)
+        self.assertIn('text: model.inventoryWriteCompleted', source)
+        self.assertIn('active: confirmRealSave || model.inventoryWriteCompleted', source)
+        self.assertIn('self.inventoryWriteCompleted = true', source)
+        self.assertIn('finishRunningInventoryStep(', source)
+        self.assertIn('.contentShape(Rectangle())', source)
+        self.assertNotIn('Text(model.inventorySuccessMessage.isEmpty ? model.inventoryStatus : model.inventorySuccessMessage)', source)
+        self.assertNotIn('· 已选 \\(selectedPreviewRows.count)', source)
+        self.assertNotIn('已选工厂单：', source)
+        self.assertNotIn('Text("\\(model.inventoryPreviewRows.count) 行")', source)
+        self.assertIn('if model.inventoryChromeStatus.hasPrefix("❌")', source)
+        self.assertNotIn('Text("已选 \\(selectedFactoryIDs.count) 个工厂单")', dashboard_source)
+
+    def test_inventory_chrome_success_result_has_no_hidden_login_prompt(self):
+        source = (Path(__file__).resolve().parents[1] / "traveler_assistant" / "inventory.py").read_text(encoding="utf-8")
+        swift_source = (Path(__file__).resolve().parents[1] / "macos" / "TravelerAssistant.swift").read_text(encoding="utf-8")
+        self.assertNotIn("库存专用 Chrome 已打开，请手工登录并完成验证码后再操作", source)
+        self.assertNotIn('object["message"] as? String', swift_source)
+
+    def test_order_preview_materials_can_be_mapped_for_stock_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            catalog = state / "inventory" / "current-products.xlsx"
+            mappings = state / "inventory" / "mappings.json"
+            catalog.parent.mkdir(parents=True)
+            make_catalog(catalog)
+            mappings.write_text('{"manual": {}, "ignored": {}}', encoding="utf-8")
+            preview = SimpleNamespace(
+                order_id="PP0068",
+                materials=[SimpleNamespace(kind="plywood", thickness=18.0, color="", quantity=2)],
+                edge_banding={"Woodline 4": 12.5},
+            )
+            with patch("traveler_assistant.order_workflow.preview_order", return_value=preview):
+                order_id, rows = order_stock_requirements(Config(state_dir=state), Path(directory) / "PP0068")
+            self.assertEqual(order_id, "PP0068")
+            self.assertEqual([row["productCode"] for row in rows], ["M0004", "M0020"])
+            self.assertEqual([row["requiredQuantity"] for row in rows], [2, 13])
+            self.assertEqual([row["unit"] for row in rows], ["张", "m"])
+
+    def test_jdy_runtime_uses_portable_overrides_and_rejects_missing_dependencies(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            node = root / "runtime" / "node"
+            node.parent.mkdir(parents=True)
+            node.touch()
+            node.chmod(0o755)
+            modules = root / "runtime" / "node_modules"
+            (modules / "playwright").mkdir(parents=True)
+            (modules / "playwright-core").mkdir()
+            with patch.dict(
+                "os.environ",
+                {"TRAVELER_NODE": str(node), "TRAVELER_NODE_MODULES": str(modules)},
+            ):
+                self.assertEqual(_resolve_jdy_runtime(root), (node, modules))
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "TRAVELER_NODE": str(root / "missing-node"),
+                    "TRAVELER_NODE_MODULES": str(modules),
+                },
+            ):
+                with self.assertRaises(RuleError) as raised:
+                    _resolve_jdy_runtime(root)
+                self.assertEqual(raised.exception.code, "inventory_runtime")
+
+    def test_stock_requirements_default_to_materials_and_can_include_hardware(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            traveler = root / "Work Order Traveler(PP0099-KITCHEN).xlsx"
+            catalog = root / "products.xlsx"
+            mappings = root / "mappings.json"
+            make_traveler(traveler, [("18mm--Plywood", 2), ("Hinge", 3)])
+            make_catalog(catalog)
+            mappings.write_text('{"manual": {"Hinge": "M1001"}, "ignored": {}}', encoding="utf-8")
+            preview = build_preview(traveler, catalog, mappings)
+
+            materials = stock_requirements(preview)
+            all_items = stock_requirements(preview, include_hardware=True)
+
+            self.assertEqual([item["productCode"] for item in materials], ["M0004"])
+            self.assertEqual([item["productCode"] for item in all_items], ["M0004", "M1001"])
+
+    def test_stock_check_compares_required_and_available_quantities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            traveler = root / "Work Order Traveler(PP0099-KITCHEN).xlsx"
+            state = root / "state"
+            catalog = state / "inventory" / "current-products.xlsx"
+            mappings = state / "inventory" / "mappings.json"
+            catalog.parent.mkdir(parents=True)
+            make_traveler(traveler, [("18mm--Plywood", 2), ("Hinge", 3)])
+            make_catalog(catalog)
+            mappings.write_text('{"manual": {"Hinge": "M1001"}, "ignored": {}}', encoding="utf-8")
+            config = Config(state_dir=state)
+            browser_result = {
+                "ok": True,
+                "results": [{
+                    "productCode": "M0004",
+                    "productName": "3/4 Finished UV2S",
+                    "availableQuantity": 1,
+                }],
+            }
+            with patch("traveler_assistant.inventory.run_jdy", return_value=browser_result) as run:
+                result = check_stock(config, traveler)
+
+            run.assert_called_once()
+            self.assertTrue(result["hasShortage"])
+            self.assertEqual(result["rows"][0]["shortageQuantity"], 1)
+            self.assertFalse(result["rows"][0]["sufficient"])
+
     def test_cut_to_size_folder_status_can_be_reconciled(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -125,9 +604,127 @@ class InventoryTests(unittest.TestCase):
                 result = update_catalog_online(config)
 
             installed = root / "state" / "inventory" / "current-products.xlsx"
+            database = root / "state" / "workflow.sqlite3"
             self.assertTrue(result["ok"])
             self.assertEqual(result["count"], len(ProductCatalog(installed).products))
+            loaded = ProductDatabase(database)
+            self.assertEqual(result["count"], loaded.count())
+            self.assertEqual(loaded.require_code("M0004").name, "3/4 Finished UV2S")
+            loaded.close()
             self.assertFalse(any(installed.parent.glob(".products-download-*.xlsx")))
+
+    def test_catalog_import_persists_cost_price_and_keeps_missing_price_null(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            source = root / "priced-products.xlsx"
+            make_priced_catalog(source)
+
+            parsed = {product.code: product for product in ProductCatalog(source).products}
+            self.assertAlmostEqual(parsed["M0004"].cost_price, 31.76)
+            self.assertIsNone(parsed["M0005"].cost_price)
+
+            import_catalog(Config(state_dir=state), source)
+            database = state / "workflow.sqlite3"
+            connection = sqlite3.connect(database)
+            columns = {row[1] for row in connection.execute("pragma table_info(products)")}
+            connection.close()
+            self.assertIn("cost_price", columns)
+            self.assertFalse((state / "inventory" / "inventory.sqlite3").exists())
+            loaded = ProductDatabase(database)
+            self.assertAlmostEqual(loaded.require_code("M0004").cost_price, 31.76)
+            self.assertIsNone(loaded.require_code("M0005").cost_price)
+            loaded.close()
+
+    def test_catalog_change_summary_reports_added_updated_and_removed_products(self):
+        previous = [
+            Product("A", "M001", "Old name", "", "启用"),
+            Product("B", "M002", "Removed", "", "启用"),
+        ]
+        current = [
+            Product("A", "M001", "New name", "", "启用"),
+            Product("C", "M003", "Added", "", "启用"),
+        ]
+
+        self.assertEqual(
+            _catalog_change_summary(previous, current),
+            {"added_count": 1, "updated_count": 1, "removed_count": 1},
+        )
+
+    def test_catalog_change_summary_detects_cost_price_change(self):
+        previous = [Product("Plywood", "M001", "Panel", "18mm", "启用", cost_price=10.0)]
+        current = [Product("Plywood", "M001", "Panel", "18mm", "启用", cost_price=12.5)]
+
+        self.assertEqual(
+            _catalog_change_summary(previous, current),
+            {"added_count": 0, "updated_count": 1, "removed_count": 0},
+        )
+
+    def test_close_inventory_chrome_uses_dedicated_cdp_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(state_dir=Path(directory) / "state")
+            browser_result = SimpleNamespace(
+                returncode=0,
+                stdout='{"ok": true, "closed": true}',
+                stderr="",
+            )
+            with patch("traveler_assistant.inventory._resolve_jdy_runtime", return_value=(Path("/node"), Path("/modules"))), \
+                 patch("traveler_assistant.inventory.subprocess.run", return_value=browser_result) as run:
+                result = close_inventory_chrome(config)
+
+            request = json.loads(run.call_args.kwargs["input"])
+            self.assertTrue(result["closed"])
+            self.assertEqual(request["action"], "closeChrome")
+            self.assertEqual(request["cdpEndpoint"], "http://127.0.0.1:9222")
+            self.assertEqual(run.call_args.kwargs["timeout"], 5)
+
+    def test_lazy_traveler_listing_reports_existing_catalog_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            source = root / "products.xlsx"
+            make_catalog(source)
+            config = Config(state_dir=state, order_root=root / "orders")
+            import_catalog(config, source)
+
+            result = list_traveler_names(config)
+
+            installed = state / "inventory" / "current-products.xlsx"
+            self.assertEqual(result["catalog"]["count"], len(ProductCatalog(installed).products))
+            self.assertFalse(result["catalog"]["stale"])
+
+    def test_catalog_refresh_keeps_only_latest_xlsx_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            inventory_dir = state / "inventory"
+            inventory_dir.mkdir(parents=True)
+            old_backup = inventory_dir / "current-products-2026-08-10.xlsx"
+            old_backup.write_bytes(b"old")
+            source = root / "export.xlsx"
+            make_catalog(source)
+
+            result = import_catalog(Config(state_dir=state), source)
+
+            self.assertEqual(result["count"], 5)
+            self.assertTrue((inventory_dir / "current-products.xlsx").is_file())
+            self.assertFalse(old_backup.exists())
+            self.assertTrue((state / "workflow.sqlite3").is_file())
+            self.assertFalse((inventory_dir / "inventory.sqlite3").exists())
+
+    def test_runtime_product_search_uses_database_after_xlsx_is_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            catalog = state / "inventory" / "current-products.xlsx"
+            catalog.parent.mkdir(parents=True)
+            make_catalog(catalog)
+            database = bootstrap_product_database(Config(state_dir=state))
+            catalog.unlink()
+
+            loaded = ProductDatabase(database)
+            self.assertEqual([item.code for item in loaded.find(contains="Unihopper")], ["M1001"])
+            loaded.close()
 
     def test_browser_error_preserves_specific_reason(self):
         stderr = (
@@ -143,6 +740,222 @@ class InventoryTests(unittest.TestCase):
             "；当前页面：https://example.invalid/\n"
         )
         self.assertEqual(_jdy_error_detail(stderr), "locator.hover: Timeout 30000ms exceeded.")
+
+    def test_login_failure_hides_full_page_dump_and_explains_retry(self):
+        stderr = (
+            "库存系统自动操作失败：库存系统登录未成功，请检查账号密码、验证码或登录限制后重试"
+            "；当前页面：https://www.jdy.com/login/；页面提示：很长的整页内容\n"
+        )
+        detail = _jdy_error_detail(stderr)
+        self.assertIn("库存系统登录未成功", detail)
+        self.assertIn("再次查询", detail)
+        self.assertNotIn("当前页面", detail)
+        self.assertNotIn("整页内容", detail)
+
+    def test_security_challenge_error_explains_visible_login_recovery(self):
+        stderr = (
+            "库存系统自动操作失败：库存系统要求完成验证码或安全验证；请先使用可见浏览器完成登录验证，再重试\n"
+        )
+        self.assertEqual(
+            _jdy_error_detail(stderr),
+            "库存系统要求完成验证码或安全验证；请先使用可见浏览器完成登录验证，再重试",
+        )
+
+    def test_profile_lock_failure_is_reported_as_retryable(self):
+        stderr = (
+            "库存系统自动操作失败：browserType.launchPersistentContext: "
+            "Failed to create a ProcessSingleton for your profile directory.\n"
+        )
+        self.assertEqual(
+            _jdy_error_detail(stderr),
+            "上一次库存查询浏览器尚未完全退出，请稍候后再次点击查询",
+        )
+
+    def test_browser_runtime_noise_does_not_hide_specific_export_timeout(self):
+        stderr = (
+            "库存系统自动操作失败：点击导出后 60 秒内没有检测到文件下载事件\n"
+            "Node.js v24.19.0\n"
+            "    at processTicksAndRejections (node:internal/process/task_queues:95:5)\n"
+        )
+        self.assertEqual(
+            _jdy_error_detail(stderr),
+            "点击导出后 60 秒内没有检测到文件下载事件",
+        )
+
+    def test_run_jdy_passes_attachable_chrome_endpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(state_dir=Path(directory) / "state")
+            browser_result = SimpleNamespace(
+                returncode=0,
+                stdout='{"ok": true, "url": "https://service.jdy.com/workbench"}',
+                stderr="",
+            )
+            with patch.dict(os.environ, {"TRAVELER_CHROME_CDP_ENDPOINT": "http://127.0.0.1:9333"}), \
+                 patch("traveler_assistant.inventory._local_setting", return_value="18108100188"), \
+                 patch("traveler_assistant.inventory._keychain_password", return_value="secret"), \
+                 patch("traveler_assistant.inventory._resolve_jdy_runtime", return_value=(Path("/node"), Path("/modules"))), \
+                 patch("traveler_assistant.inventory.subprocess.run", return_value=browser_result) as run:
+                result = run_jdy(config, "preflight")
+
+            request = json.loads(run.call_args.kwargs["input"])
+            self.assertTrue(result["ok"])
+            self.assertEqual(request["cdpEndpoint"], "http://127.0.0.1:9333")
+            self.assertFalse(request["keepBrowserOpen"])
+            self.assertEqual(run.call_args.kwargs["timeout"], 90)
+
+    def test_run_jdy_reuses_existing_inventory_page_without_reading_keychain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(state_dir=Path(directory) / "state")
+            browser_result = SimpleNamespace(
+                returncode=0,
+                stdout='{"ok": true, "url": "https://www.jdy.com/workbench/web/index.html"}',
+                stderr="",
+            )
+            with patch("traveler_assistant.inventory._local_setting", return_value="18108100188"), \
+                 patch(
+                     "traveler_assistant.inventory._find_existing_inventory_page",
+                     return_value={"url": "https://www.jdy.com/workbench/web/index.html"},
+                 ), \
+                 patch(
+                     "traveler_assistant.inventory._keychain_password",
+                     side_effect=AssertionError("已登录页面不应读取钥匙串"),
+                 ), \
+                 patch("traveler_assistant.inventory._resolve_jdy_runtime", return_value=(Path("/node"), Path("/modules"))), \
+                 patch("traveler_assistant.inventory.subprocess.run", return_value=browser_result) as run:
+                result = run_jdy(config, "preflight")
+
+            request = json.loads(run.call_args.kwargs["input"])
+            self.assertTrue(result["ok"])
+            self.assertNotIn("password", request)
+            self.assertEqual(request["cdpEndpoint"], "http://127.0.0.1:9222")
+
+    def test_open_inventory_chrome_launches_dedicated_profile_and_debug_port(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(state_dir=Path(directory) / "state")
+            executable = Path(directory) / "Google Chrome"
+            executable.touch()
+            with patch("traveler_assistant.inventory._inventory_cdp_pages", return_value=[]), \
+                 patch("traveler_assistant.inventory._inventory_chrome_executable", return_value=executable), \
+                 patch.dict(os.environ, {"TRAVELER_CHROME_CDP_ENDPOINT": "http://127.0.0.1:9333"}), \
+                 patch("traveler_assistant.inventory.subprocess.Popen") as popen:
+                result = open_inventory_chrome(config)
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["launched"])
+            arguments = popen.call_args.args[0]
+            self.assertIn("--remote-debugging-port=9333", arguments)
+            self.assertIn("--user-data-dir=" + result["profileDir"], arguments)
+            self.assertEqual(arguments[-1], "https://www.jdy.com/login/")
+
+    def test_open_inventory_chrome_does_not_launch_second_browser_on_login_page(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(state_dir=Path(directory) / "state")
+            with patch(
+                "traveler_assistant.inventory._inventory_cdp_pages",
+                return_value=[{"type": "page", "url": "https://www.jdy.com/login/"}],
+            ), patch("traveler_assistant.inventory.subprocess.Popen") as popen:
+                result = open_inventory_chrome(config)
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["waitingForLogin"])
+            popen.assert_not_called()
+
+    def test_outbound_stops_before_browser_when_material_mapping_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = Config(state_dir=root / "state", order_root=root / "orders")
+            traveler = root / "orders" / "Work Order Traveler(PP0099).xlsx"
+            traveler.parent.mkdir(parents=True)
+            make_traveler(traveler, [("Unmapped Hardware", 2)])
+            with patch("traveler_assistant.inventory._local_setting", return_value="18108100188"), \
+                 patch("traveler_assistant.inventory._keychain_password", return_value="secret"), \
+                 patch("traveler_assistant.inventory.subprocess.run") as run:
+                with self.assertRaisesRegex(RuleError, "未映射材料：Unmapped Hardware") as raised:
+                    run_jdy(config, "outbound", traveler, confirm_save=True)
+
+            self.assertEqual(raised.exception.code, "inventory_mapping_required")
+            run.assert_not_called()
+
+    def test_database_shipped_factory_is_hard_blocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = Config(state_dir=root / "state", order_root=root / "orders")
+            store = OrderIndexStore(config.state_dir / "order-index.sqlite3")
+            store.upsert_order("CS005", validation_status="正常")
+            store.upsert_factory(
+                "F2608120222",
+                order_id="CS005",
+                factory_name="CS005-KITCHEN",
+                sales_order_name="CS005",
+                name_source="AIMES",
+                ownership_status="已确认",
+                optimized=True,
+                outbound_status="已出库",
+                outbound_document="QTCK20260815001",
+            )
+            store.commit()
+            store.close()
+
+            with self.assertRaisesRegex(RuleError, "已出库") as raised:
+                assert_factory_orders_outbound_allowed(config, "CS005", ["F2608120222"])
+            self.assertEqual(raised.exception.code, "inventory_already_outbound")
+
+    def test_database_shipped_factory_with_changed_data_can_be_updated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = Config(state_dir=root / "state", order_root=root / "orders")
+            store = OrderIndexStore(config.workflow_database)
+            store.upsert_order("CS005", validation_status="正常")
+            store.upsert_factory(
+                "F2608120222",
+                order_id="CS005",
+                factory_name="CS005-KITCHEN",
+                sales_order_name="CS005",
+                name_source="AIMES",
+                ownership_status="已确认",
+                optimized=True,
+                outbound_status="已出库",
+                outbound_document="QTCK20260815001",
+            )
+            store.commit()
+            store.close()
+
+            with patch("traveler_assistant.order_index.reconcile_outbound_statuses", return_value=0):
+                assert_factory_orders_outbound_allowed(
+                    config,
+                    "CS005",
+                    ["F2608120222"],
+                    changed_factory_orders=["F2608120222"],
+                )
+
+    def test_run_jdy_converts_browser_timeout_to_actionable_rule_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(state_dir=Path(directory) / "state")
+            timeout = subprocess.TimeoutExpired(["node", "jdy_inventory.mjs"], 90, stderr="页面未响应")
+            with patch("traveler_assistant.inventory._local_setting", return_value="18108100188"), \
+                 patch("traveler_assistant.inventory._keychain_password", return_value="secret"), \
+                 patch("traveler_assistant.inventory._resolve_jdy_runtime", return_value=(Path("/node"), Path("/modules"))), \
+                 patch("traveler_assistant.inventory.subprocess.run", side_effect=timeout):
+                with self.assertRaises(RuleError) as raised:
+                    run_jdy(config, "preflight")
+
+            self.assertEqual(raised.exception.code, "jdy_timeout")
+            self.assertIn("超过 90 秒", str(raised.exception))
+
+    def test_keychain_timeout_is_reported_as_credentials_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            helper = Path(directory) / "keychain-read"
+            helper.write_text("placeholder")
+            config = Config(state_dir=Path(directory) / "state")
+            with patch("traveler_assistant.inventory.subprocess.run", side_effect=subprocess.TimeoutExpired([str(helper), "account"], 10)), \
+                 patch("traveler_assistant.inventory.Path.is_file", return_value=True):
+                with self.assertRaises(RuleError) as raised:
+                    # The patched helper path is resolved through the module's
+                    # normal location; only the subprocess call is relevant.
+                    _keychain_password("account")
+
+            self.assertEqual(raised.exception.code, "jdy_credentials")
+            self.assertIn("超过 10 秒", str(raised.exception))
 
     def test_parse_dynamic_regions_and_zero(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -173,6 +986,48 @@ class InventoryTests(unittest.TestCase):
             self.assertTrue(preview.ready)
             self.assertEqual([item.product_code for item in preview.outbound_items], ["M0004", "M1068", "M1069", "M1013"])
             self.assertEqual([item.quantity for item in preview.outbound_items], [2, 3, 3, 4])
+
+    def test_factory_selection_keeps_order_materials_and_selected_hardware_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            traveler = root / "Work Order Traveler(PP0099-KITCHEN).xlsx"
+            catalog = root / "products.xlsx"
+            mappings = root / "mappings.json"
+            make_traveler(traveler, [("18mm--Plywood", 2), ("Hinge", 3)])
+            make_catalog(catalog)
+            mappings.write_text('{"manual": {"Hinge": "M1001"}, "ignored": {}}', encoding="utf-8")
+
+            preview = build_preview(
+                traveler,
+                catalog,
+                mappings,
+                selected_document_remarks=["PP0099-KITCHEN"],
+            )
+
+            self.assertTrue(preview.ready)
+            self.assertEqual(
+                [(item.document_remark, item.product_code) for item in preview.outbound_items],
+                [("PP0099", "M0004"), ("PP0099-KITCHEN", "M1001")],
+            )
+            self.assertEqual(
+                set(document["remark"] for document in preview.document_payloads()),
+                {"PP0099", "PP0099-KITCHEN"},
+            )
+
+    def test_zero_quantity_items_are_not_outbound_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            traveler = root / "Work Order Traveler(PP0099-KITCHEN).xlsx"
+            catalog = root / "products.xlsx"
+            mappings = root / "mappings.json"
+            make_traveler(traveler, [("18mm--Plywood", 2), ("5.4mm--Plywood", 0)])
+            make_catalog(catalog)
+            mappings.write_text('{"manual": {}, "ignored": {}}', encoding="utf-8")
+
+            preview = build_preview(traveler, catalog, mappings)
+
+            self.assertEqual([item.traveler_name for item in preview.outbound_items], ["18mm--Plywood"])
+            self.assertIn("5.4mm--Plywood", [item["name"] for item in preview.payload()["zero_items"]])
 
     def test_unique_exact_inventory_name_maps_bls36(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -216,6 +1071,27 @@ class InventoryTests(unittest.TestCase):
             preview = build_preview(traveler, catalog, mappings)
             self.assertEqual(preview.outbound_items[0].quantity, 38)
             self.assertIn("37.75m→38m", preview.outbound_items[0].match_source)
+
+    def test_manual_edge_mapping_also_rounds_quantity_for_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            traveler = root / "Work Order Traveler(PP0099-KITCHEN).xlsx"
+            catalog = root / "products.xlsx"
+            mappings = root / "mappings.json"
+            make_traveler(traveler, [("Edge banding--Woodline 4", 94.25)])
+            make_catalog(catalog)
+            mappings.write_text(
+                json.dumps({"manual": {"Edge banding--Woodline 4": "M0020"}, "ignored": {}}),
+                encoding="utf-8",
+            )
+
+            preview = build_preview(traveler, catalog, mappings)
+
+            self.assertTrue(preview.ready)
+            self.assertEqual(preview.outbound_items[0].product_code, "M0020")
+            self.assertEqual(preview.outbound_items[0].quantity, 94)
+            self.assertIn("人工指定", preview.outbound_items[0].match_source)
+            self.assertIn("94.25m→94m", preview.outbound_items[0].match_source)
 
     def test_edge_prefers_matching_color_abs_banding_with_24mm_suffix(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -267,6 +1143,70 @@ class InventoryTests(unittest.TestCase):
             InventoryMappings(path).remove_ignored("SPECIAL MATERIAL")
             self.assertIsNone(InventoryMappings(path).ignored_reason("Special Material"))
 
+    def test_source_codes_are_not_treated_as_inventory_skus(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = Config(state_dir=root / "state")
+            config.prepare_storage()
+            make_catalog(config.state_dir / "inventory" / "current-products.xlsx")
+            set_ignored_mapping(config, "LED", True, "用户确认全局忽略")
+
+            result = resolve_inventory_items(
+                config,
+                [
+                    (TravelerItem(1, "五金", "LED", 2, "F0099"), "WJ-CBD"),
+                    (TravelerItem(2, "五金", "未建档五金", 1, "F0099"), "WJ-UNKNOWN"),
+                ],
+            )
+
+            self.assertEqual([item["name"] for item in result["ignored"]], ["LED"])
+            self.assertEqual([item["name"] for item in result["missing"]], ["未建档五金"])
+            self.assertEqual(result["missing"][0]["source_code"], "WJ-UNKNOWN")
+            self.assertEqual(result["outbound"], [])
+
+    def test_ignoring_hardware_removes_existing_database_facts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = Config(state_dir=root / "state")
+            config.prepare_storage()
+            connection = sqlite3.connect(config.workflow_database)
+            connection.executemany(
+                """insert into hardware_items(
+                    order_id, factory_order, product_code, name, quantity, source_type, updated_at
+                ) values(?,?,?,?,?,?,?)""",
+                [
+                    ("PP0099", "F0099", "WJ-CBT", "Adjustable shelf holder", 2, "aicnc", "now"),
+                    ("PP0099", "F0099", "71T950A", "TestFullHinge", 4, "aicnc", "now"),
+                    ("PP0099", "F0099", "WJ-CBD", "LED", 5, "aicnc", "now"),
+                ],
+            )
+            connection.commit()
+            connection.close()
+
+            result = set_ignored_mapping(config, "Shelf Holder", True, "不再采购")
+            self.assertEqual(result["removed_database_rows"], 1)
+            connection = sqlite3.connect(config.workflow_database)
+            try:
+                self.assertEqual(connection.execute("select count(*) from hardware_items").fetchone()[0], 2)
+            finally:
+                connection.close()
+
+            result = set_ignored_mapping(config, "Hinge", True, "不再采购")
+            self.assertEqual(result["removed_database_rows"], 1)
+            connection = sqlite3.connect(config.workflow_database)
+            try:
+                self.assertEqual(connection.execute("select count(*) from hardware_items").fetchone()[0], 1)
+            finally:
+                connection.close()
+
+            result = set_ignored_mapping(config, "LED", True, "不再采购")
+            self.assertEqual(result["removed_database_rows"], 1)
+            connection = sqlite3.connect(config.workflow_database)
+            try:
+                self.assertEqual(connection.execute("select count(*) from hardware_items").fetchone()[0], 0)
+            finally:
+                connection.close()
+
     def test_manual_mapping_can_be_saved_and_replaces_ignore(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mappings.json"
@@ -276,6 +1216,20 @@ class InventoryTests(unittest.TestCase):
             reloaded = InventoryMappings(path)
             self.assertEqual(reloaded.manual_code("special material"), "M1093")
             self.assertIsNone(reloaded.ignored_reason("Special Material"))
+
+    def test_manual_mapping_can_be_viewed_updated_and_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = Config(state_dir=root / "state")
+            config.prepare_storage()
+            make_catalog(config.state_dir / "inventory" / "current-products.xlsx")
+
+            save_manual_mapping(config, "Hinge", "M1001")
+            self.assertEqual(list_inventory_mappings(config)["manual"]["Hinge"], "M1001")
+            update_manual_mapping(config, "Hinge", "Cabinet Hinge", "M1001")
+            self.assertEqual(list_inventory_mappings(config)["manual"], {"Cabinet Hinge": "M1001"})
+            remove_manual_mapping(config, "Cabinet Hinge")
+            self.assertEqual(list_inventory_mappings(config)["manual"], {})
 
     def test_sync_status_changes_with_traveler_fingerprint(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -306,7 +1260,7 @@ class InventoryTests(unittest.TestCase):
             mapping_path = root / "mappings.json"
             make_traveler(path, [("Hinge", 2)])
             make_catalog(catalog_path)
-            mapping_path.write_text('{"manual": {}, "ignored": {}}', encoding="utf-8")
+            mapping_path.write_text('{"manual": {"Hinge": "M1001"}, "ignored": {}}', encoding="utf-8")
             preview = build_preview(path, catalog_path, mapping_path)
             store = InventorySyncStore(root / "sync.json", root / "backups")
             plans = store.prepare_documents(preview)

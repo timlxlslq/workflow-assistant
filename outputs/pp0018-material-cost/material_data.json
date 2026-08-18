@@ -1,0 +1,938 @@
+{
+  "order": "PP0018",
+  "source_dir": "/Users/lantian/Library/Mobile Documents/com~apple~CloudDocs/PacificPride/Order/PP0018",
+  "catalog_path": "/Users/lantian/Documents/pp-flowhub/data/inventory/current-products.xlsx",
+  "catalog_price_field": "预计采购价",
+  "method_note": "每个 Traveler 文件作为一个房间单独汇总，共 8 个房间；Pickinglist数量优先，数量为空时回退Cuttinglist；材料单价来自当前库存商品资料预计采购价；未知价格按0计算并标红。",
+  "rows": [
+    {
+      "room": "landing--laundry（PP0018landinglaundry）",
+      "material_name": "18mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 7.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018landinglaundry).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "18mm--plywood"
+      ],
+      "canonical_name": "18mm--plywood",
+      "code": "M0004",
+      "product_name": "3/4 Finished,UV2S",
+      "product_spec": "18*1220*2440mm",
+      "unit": "SHT",
+      "price": 31.76,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 222.32
+    },
+    {
+      "room": "landing--laundry（PP0018landinglaundry）",
+      "material_name": "19.1mm--Cashmere SM",
+      "spec": "2745*1220",
+      "quantity": 4.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018landinglaundry).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "19.1mm--Cashmere SM"
+      ],
+      "canonical_name": "19.1mm--Cashmere SM",
+      "code": "M0049",
+      "product_name": "Cashmere SM",
+      "product_spec": "19.1*1220*2745mm",
+      "unit": "SHT",
+      "price": 205.0,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 820.0
+    },
+    {
+      "room": "landing--laundry（PP0018landinglaundry）",
+      "material_name": "5.4mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 2.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018landinglaundry).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "5.4mm--plywood"
+      ],
+      "canonical_name": "5.4mm--plywood",
+      "code": "M0002",
+      "product_name": "1/4 Finished,UV1S",
+      "product_spec": "5.2*1220*2440mm",
+      "unit": "SHT",
+      "price": 12.5,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 25.0
+    },
+    {
+      "room": "landing--laundry（PP0018landinglaundry）",
+      "material_name": "Edge banding--Cashmere SM",
+      "spec": "M/米",
+      "quantity": 101.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018landinglaundry).xlsx"
+      ],
+      "inferred_color": true,
+      "raw_names": [
+        "Edge banding"
+      ],
+      "canonical_name": "Edge banding--Cashmere SM",
+      "code": "M0050",
+      "product_name": "Cashmere SM Edge Banding",
+      "product_spec": "22mm*1mm*225m",
+      "unit": "M",
+      "price": 1.07,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则；封边颜色按该房间唯一 Panel 颜色推定",
+      "amount": 108.07
+    },
+    {
+      "room": "PP0018-BATH 3 PP0018-Bath 4 PP0018-bath 2 PP0018-BATH 1 PP0018-master bath（PP0018bathrooms）",
+      "material_name": "14.5mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 4.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bathrooms).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "14.5mm--plywood"
+      ],
+      "canonical_name": "14.5mm--plywood",
+      "code": "M0003",
+      "product_name": "5/8 Finished,UV2S",
+      "product_spec": "15*1220*2440mm",
+      "unit": "SHT",
+      "price": 27.41,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 109.64
+    },
+    {
+      "room": "PP0018-BATH 3 PP0018-Bath 4 PP0018-bath 2 PP0018-BATH 1 PP0018-master bath（PP0018bathrooms）",
+      "material_name": "18mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 6.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bathrooms).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "18mm--plywood"
+      ],
+      "canonical_name": "18mm--plywood",
+      "code": "M0004",
+      "product_name": "3/4 Finished,UV2S",
+      "product_spec": "18*1220*2440mm",
+      "unit": "SHT",
+      "price": 31.76,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 190.56
+    },
+    {
+      "room": "PP0018-BATH 3 PP0018-Bath 4 PP0018-bath 2 PP0018-BATH 1 PP0018-master bath（PP0018bathrooms）",
+      "material_name": "19.1mm--Ivory Oak",
+      "spec": "2794*1232",
+      "quantity": 2.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bathrooms).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "19.1mm--Ivory Oak"
+      ],
+      "canonical_name": "19.1mm--Ivory Oak",
+      "code": "M0144",
+      "product_name": "Ivory Oak",
+      "product_spec": "19.1*1220*2745mm",
+      "unit": "SHT",
+      "price": 455.0,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 910.0
+    },
+    {
+      "room": "PP0018-BATH 3 PP0018-Bath 4 PP0018-bath 2 PP0018-BATH 1 PP0018-master bath（PP0018bathrooms）",
+      "material_name": "19.1mm--Ivory Oak",
+      "spec": "562*1232",
+      "quantity": 1.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bathrooms).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "19.1mm--Ivory Oak"
+      ],
+      "canonical_name": "19.1mm--Ivory Oak",
+      "code": "M0144",
+      "product_name": "Ivory Oak",
+      "product_spec": "19.1*1220*2745mm",
+      "unit": "SHT",
+      "price": 455.0,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 455.0
+    },
+    {
+      "room": "PP0018-BATH 3 PP0018-Bath 4 PP0018-bath 2 PP0018-BATH 1 PP0018-master bath（PP0018bathrooms）",
+      "material_name": "5.4mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 2.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bathrooms).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "5.4mm--plywood"
+      ],
+      "canonical_name": "5.4mm--plywood",
+      "code": "M0002",
+      "product_name": "1/4 Finished,UV1S",
+      "product_spec": "5.2*1220*2440mm",
+      "unit": "SHT",
+      "price": 12.5,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 25.0
+    },
+    {
+      "room": "PP0018-BED 1 CLOSET（PP0018bed1closet）",
+      "material_name": "14.5mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 1.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bed1closet).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "14.5mm--plywood"
+      ],
+      "canonical_name": "14.5mm--plywood",
+      "code": "M0003",
+      "product_name": "5/8 Finished,UV2S",
+      "product_spec": "15*1220*2440mm",
+      "unit": "SHT",
+      "price": 27.41,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 27.41
+    },
+    {
+      "room": "PP0018-BED 1 CLOSET（PP0018bed1closet）",
+      "material_name": "18mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 1.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bed1closet).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "18mm--plywood"
+      ],
+      "canonical_name": "18mm--plywood",
+      "code": "M0004",
+      "product_name": "3/4 Finished,UV2S",
+      "product_spec": "18*1220*2440mm",
+      "unit": "SHT",
+      "price": 31.76,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 31.76
+    },
+    {
+      "room": "PP0018-BED 1 CLOSET（PP0018bed1closet）",
+      "material_name": "19.1mm--Woodline 4",
+      "spec": "2745*1220",
+      "quantity": 6.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bed1closet).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "19.1mm--Woodline 4"
+      ],
+      "canonical_name": "19.1mm--Woodline 4",
+      "code": "M0019",
+      "product_name": "Woodline 4",
+      "product_spec": "19.1*1220*2745mm",
+      "unit": "SHT",
+      "price": 108.7,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 652.2
+    },
+    {
+      "room": "PP0018-BED 1 CLOSET（PP0018bed1closet）",
+      "material_name": "9mm--Woodline 4",
+      "spec": "2745*1220",
+      "quantity": 3.0,
+      "quantity_sources": [
+        "Cuttinglist（Pickinglist缺少）"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bed1closet).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "9mm--Woodline 4"
+      ],
+      "canonical_name": "9mm--Woodline 4",
+      "code": "",
+      "product_name": "",
+      "product_spec": "",
+      "unit": "",
+      "price": 0.0,
+      "price_status": "未知价格",
+      "price_note": "商品库中没有可确认的对应价格",
+      "amount": 0.0
+    },
+    {
+      "room": "PP0018-BED 1 CLOSET（PP0018bed1closet）",
+      "material_name": "Edge banding--Woodline 4",
+      "spec": "M/米",
+      "quantity": 89.18,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bed1closet).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "Edge banding--Woodline 4"
+      ],
+      "canonical_name": "Edge banding--Woodline 4",
+      "code": "M0020",
+      "product_name": "Woodline 4 Edge Banding",
+      "product_spec": "22mm*1mm*225m",
+      "unit": "M",
+      "price": 0.8,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 71.344
+    },
+    {
+      "room": "PP0018-Bedroom2 PP0018-Bedroom3 PP0018-Bedroom4（PP0018bedroom_2_3_4closetwalnut）",
+      "material_name": "14.5mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 4.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bedroom_2_3_4closetwalnut).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "14.5mm--plywood"
+      ],
+      "canonical_name": "14.5mm--plywood",
+      "code": "M0003",
+      "product_name": "5/8 Finished,UV2S",
+      "product_spec": "15*1220*2440mm",
+      "unit": "SHT",
+      "price": 27.41,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 109.64
+    },
+    {
+      "room": "PP0018-Bedroom2 PP0018-Bedroom3 PP0018-Bedroom4（PP0018bedroom_2_3_4closetwalnut）",
+      "material_name": "18mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 21.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bedroom_2_3_4closetwalnut).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "18mm--plywood"
+      ],
+      "canonical_name": "18mm--plywood",
+      "code": "M0004",
+      "product_name": "3/4 Finished,UV2S",
+      "product_spec": "18*1220*2440mm",
+      "unit": "SHT",
+      "price": 31.76,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 666.96
+    },
+    {
+      "room": "PP0018-Bedroom2 PP0018-Bedroom3 PP0018-Bedroom4（PP0018bedroom_2_3_4closetwalnut）",
+      "material_name": "19.1mm--Walnut",
+      "spec": "2745*1220",
+      "quantity": 10.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bedroom_2_3_4closetwalnut).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "19.1mm--Walnut"
+      ],
+      "canonical_name": "19.1mm--Walnut",
+      "code": "M0159",
+      "product_name": "Walnut",
+      "product_spec": "4*9*3/4“inch",
+      "unit": "SHT",
+      "price": 117.3,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 1173.0
+    },
+    {
+      "room": "PP0018-Bedroom2 PP0018-Bedroom3 PP0018-Bedroom4（PP0018bedroom_2_3_4closetwalnut）",
+      "material_name": "5.4mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 11.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bedroom_2_3_4closetwalnut).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "5.4mm--plywood"
+      ],
+      "canonical_name": "5.4mm--plywood",
+      "code": "M0002",
+      "product_name": "1/4 Finished,UV1S",
+      "product_spec": "5.2*1220*2440mm",
+      "unit": "SHT",
+      "price": 12.5,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 137.5
+    },
+    {
+      "room": "PP0018-Bedroom2 PP0018-Bedroom3 PP0018-Bedroom4（PP0018bedroom_2_3_4closetwalnut）",
+      "material_name": "Edge banding--Walnut",
+      "spec": "M/米",
+      "quantity": 346.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018bedroom_2_3_4closetwalnut).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "Edge banding"
+      ],
+      "canonical_name": "Edge banding--Walnut",
+      "code": "M0160",
+      "product_name": "Walnut ABS Edge Banding 22mm",
+      "product_spec": "1*22mm",
+      "unit": "M",
+      "price": 0.2,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 69.2
+    },
+    {
+      "room": "PP0018-FOYER/PP0018-FIRE PLACE（PP0018_fireplace_foyer_updated）",
+      "material_name": "18mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 9.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018_fireplace_foyer_updated).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "18mm--plywood"
+      ],
+      "canonical_name": "18mm--plywood",
+      "code": "M0004",
+      "product_name": "3/4 Finished,UV2S",
+      "product_spec": "18*1220*2440mm",
+      "unit": "SHT",
+      "price": 31.76,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 285.84
+    },
+    {
+      "room": "PP0018-FOYER/PP0018-FIRE PLACE（PP0018_fireplace_foyer_updated）",
+      "material_name": "19.1mm--Ivory Oak",
+      "spec": "2745*1220",
+      "quantity": 14.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018_fireplace_foyer_updated).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "19.1mm--Ivory Oak"
+      ],
+      "canonical_name": "19.1mm--Ivory Oak",
+      "code": "M0144",
+      "product_name": "Ivory Oak",
+      "product_spec": "19.1*1220*2745mm",
+      "unit": "SHT",
+      "price": 455.0,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 6370.0
+    },
+    {
+      "room": "PP0018-FOYER/PP0018-FIRE PLACE（PP0018_fireplace_foyer_updated）",
+      "material_name": "5.4mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 4.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018_fireplace_foyer_updated).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "5.4mm--plywood"
+      ],
+      "canonical_name": "5.4mm--plywood",
+      "code": "M0002",
+      "product_name": "1/4 Finished,UV1S",
+      "product_spec": "5.2*1220*2440mm",
+      "unit": "SHT",
+      "price": 12.5,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 50.0
+    },
+    {
+      "room": "PP0018-FOYER/PP0018-FIRE PLACE（PP0018_fireplace_foyer_updated）",
+      "material_name": "Edge banding--Ivory Oak",
+      "spec": "M/米",
+      "quantity": 298.6,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018_fireplace_foyer_updated).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "Edge banding--Ivory Oak"
+      ],
+      "canonical_name": "Edge banding--Ivory Oak",
+      "code": "M0145",
+      "product_name": "Ivory Oak ABS banding 24mm",
+      "product_spec": "1mm*24mm*50M(164)",
+      "unit": "M",
+      "price": 3.2,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 955.52
+    },
+    {
+      "room": "pp0018-KITCHEN（PP0018kitchenblancosmnew）",
+      "material_name": "19.1mm--Blanco SM",
+      "spec": "2440*1220",
+      "quantity": 8.0,
+      "quantity_sources": [
+        "Cuttinglist（Pickinglist为空）"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018kitchenblancosmnew).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "19.1mm--Blanco SM"
+      ],
+      "canonical_name": "19.1mm--Blanco SM",
+      "code": "M0055",
+      "product_name": "Blanco SM",
+      "product_spec": "19.1*1220*2745mm",
+      "unit": "SHT",
+      "price": 205.0,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 1640.0
+    },
+    {
+      "room": "pp0018-KITCHEN（PP0018kitchen）",
+      "material_name": "14.5mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 4.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018kitchen).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "14.5mm--plywood"
+      ],
+      "canonical_name": "14.5mm--plywood",
+      "code": "M0003",
+      "product_name": "5/8 Finished,UV2S",
+      "product_spec": "15*1220*2440mm",
+      "unit": "SHT",
+      "price": 27.41,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 109.64
+    },
+    {
+      "room": "pp0018-KITCHEN（PP0018kitchen）",
+      "material_name": "18mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 33.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018kitchen).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "18mm--plywood"
+      ],
+      "canonical_name": "18mm--plywood",
+      "code": "M0004",
+      "product_name": "3/4 Finished,UV2S",
+      "product_spec": "18*1220*2440mm",
+      "unit": "SHT",
+      "price": 31.76,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 1048.08
+    },
+    {
+      "room": "pp0018-KITCHEN（PP0018kitchen）",
+      "material_name": "19.1mm--Blanco SM",
+      "spec": "2745*1220",
+      "quantity": 7.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018kitchen).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "19.1mm--Blanco SM"
+      ],
+      "canonical_name": "19.1mm--Blanco SM",
+      "code": "M0055",
+      "product_name": "Blanco SM",
+      "product_spec": "19.1*1220*2745mm",
+      "unit": "SHT",
+      "price": 205.0,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 1435.0
+    },
+    {
+      "room": "pp0018-KITCHEN（PP0018kitchen）",
+      "material_name": "19.1mm--Ivory Oak",
+      "spec": "2745*1220",
+      "quantity": 16.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018kitchen).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "19.1mm--Ivory Oak"
+      ],
+      "canonical_name": "19.1mm--Ivory Oak",
+      "code": "M0144",
+      "product_name": "Ivory Oak",
+      "product_spec": "19.1*1220*2745mm",
+      "unit": "SHT",
+      "price": 455.0,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 7280.0
+    },
+    {
+      "room": "pp0018-KITCHEN（PP0018kitchen）",
+      "material_name": "5.4mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 10.0,
+      "quantity_sources": [
+        "Pickinglist"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018kitchen).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "5.4mm--plywood"
+      ],
+      "canonical_name": "5.4mm--plywood",
+      "code": "M0002",
+      "product_name": "1/4 Finished,UV1S",
+      "product_spec": "5.2*1220*2440mm",
+      "unit": "SHT",
+      "price": 12.5,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 125.0
+    },
+    {
+      "room": "PP0018-master closet（PP0018MasterClosetWalnut）",
+      "material_name": "14.5mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 4.0,
+      "quantity_sources": [
+        "Cuttinglist（Pickinglist缺少）"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018MasterClosetWalnut).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "14.5mm--plywood"
+      ],
+      "canonical_name": "14.5mm--plywood",
+      "code": "M0003",
+      "product_name": "5/8 Finished,UV2S",
+      "product_spec": "15*1220*2440mm",
+      "unit": "SHT",
+      "price": 27.41,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 109.64
+    },
+    {
+      "room": "PP0018-master closet（PP0018MasterClosetWalnut）",
+      "material_name": "18mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 4.0,
+      "quantity_sources": [
+        "Cuttinglist（Pickinglist为空）"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018MasterClosetWalnut).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "18mm--plywood"
+      ],
+      "canonical_name": "18mm--plywood",
+      "code": "M0004",
+      "product_name": "3/4 Finished,UV2S",
+      "product_spec": "18*1220*2440mm",
+      "unit": "SHT",
+      "price": 31.76,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 127.04
+    },
+    {
+      "room": "PP0018-master closet（PP0018MasterClosetWalnut）",
+      "material_name": "19.1mm--Walnut",
+      "spec": "2745*1220",
+      "quantity": 39.0,
+      "quantity_sources": [
+        "Cuttinglist（Pickinglist为空）"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018MasterClosetWalnut).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "19.1mm--Walnut"
+      ],
+      "canonical_name": "19.1mm--Walnut",
+      "code": "M0159",
+      "product_name": "Walnut",
+      "product_spec": "4*9*3/4“inch",
+      "unit": "SHT",
+      "price": 117.3,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 4574.7
+    },
+    {
+      "room": "PP0018-master closet（PP0018MasterClosetWalnut）",
+      "material_name": "5.4mm--plywood",
+      "spec": "2440*1220",
+      "quantity": 1.0,
+      "quantity_sources": [
+        "Cuttinglist（Pickinglist为空）"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018MasterClosetWalnut).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "5.4mm--plywood"
+      ],
+      "canonical_name": "5.4mm--plywood",
+      "code": "M0002",
+      "product_name": "1/4 Finished,UV1S",
+      "product_spec": "5.2*1220*2440mm",
+      "unit": "SHT",
+      "price": 12.5,
+      "price_status": "已知",
+      "price_note": "库存商品资料 / 预计采购价；沿用项目现有材料映射规则",
+      "amount": 12.5
+    },
+    {
+      "room": "PP0018-master closet（PP0018MasterClosetWalnut）",
+      "material_name": "9mm--Walnut",
+      "spec": "2745*1220",
+      "quantity": 11.0,
+      "quantity_sources": [
+        "Cuttinglist（Pickinglist缺少）"
+      ],
+      "source_files": [
+        "Work Order Traveler(PP0018MasterClosetWalnut).xlsx"
+      ],
+      "inferred_color": false,
+      "raw_names": [
+        "9mm--Walnut"
+      ],
+      "canonical_name": "9mm--Walnut",
+      "code": "",
+      "product_name": "",
+      "product_spec": "",
+      "unit": "",
+      "price": 0.0,
+      "price_status": "未知价格",
+      "price_note": "商品库中没有可确认的对应价格",
+      "amount": 0.0
+    }
+  ],
+  "room_summaries": [
+    {
+      "room": "landing--laundry（PP0018landinglaundry）",
+      "amount": 1175.39,
+      "quantity_rows": 4,
+      "unknown_price_rows": 0,
+      "source_files": [
+        "Work Order Traveler(PP0018landinglaundry).xlsx"
+      ]
+    },
+    {
+      "room": "PP0018-BATH 3 PP0018-Bath 4 PP0018-bath 2 PP0018-BATH 1 PP0018-master bath（PP0018bathrooms）",
+      "amount": 1690.2,
+      "quantity_rows": 5,
+      "unknown_price_rows": 0,
+      "source_files": [
+        "Work Order Traveler(PP0018bathrooms).xlsx"
+      ]
+    },
+    {
+      "room": "PP0018-BED 1 CLOSET（PP0018bed1closet）",
+      "amount": 782.714,
+      "quantity_rows": 5,
+      "unknown_price_rows": 1,
+      "source_files": [
+        "Work Order Traveler(PP0018bed1closet).xlsx"
+      ]
+    },
+    {
+      "room": "PP0018-Bedroom2 PP0018-Bedroom3 PP0018-Bedroom4（PP0018bedroom_2_3_4closetwalnut）",
+      "amount": 2156.3,
+      "quantity_rows": 5,
+      "unknown_price_rows": 0,
+      "source_files": [
+        "Work Order Traveler(PP0018bedroom_2_3_4closetwalnut).xlsx"
+      ]
+    },
+    {
+      "room": "PP0018-FOYER/PP0018-FIRE PLACE（PP0018_fireplace_foyer_updated）",
+      "amount": 7661.36,
+      "quantity_rows": 4,
+      "unknown_price_rows": 0,
+      "source_files": [
+        "Work Order Traveler(PP0018_fireplace_foyer_updated).xlsx"
+      ]
+    },
+    {
+      "room": "pp0018-KITCHEN（PP0018kitchenblancosmnew）",
+      "amount": 1640.0,
+      "quantity_rows": 1,
+      "unknown_price_rows": 0,
+      "source_files": [
+        "Work Order Traveler(PP0018kitchenblancosmnew).xlsx"
+      ]
+    },
+    {
+      "room": "pp0018-KITCHEN（PP0018kitchen）",
+      "amount": 9997.72,
+      "quantity_rows": 5,
+      "unknown_price_rows": 0,
+      "source_files": [
+        "Work Order Traveler(PP0018kitchen).xlsx"
+      ]
+    },
+    {
+      "room": "PP0018-master closet（PP0018MasterClosetWalnut）",
+      "amount": 4823.88,
+      "quantity_rows": 5,
+      "unknown_price_rows": 1,
+      "source_files": [
+        "Work Order Traveler(PP0018MasterClosetWalnut).xlsx"
+      ]
+    }
+  ],
+  "grand_total": 29927.564,
+  "unknown_materials": [
+    "9mm--Walnut",
+    "9mm--Woodline 4"
+  ]
+}

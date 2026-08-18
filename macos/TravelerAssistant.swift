@@ -1,10 +1,418 @@
 import SwiftUI
 import AppKit
+import Security
+
+func businessFriendlyMessage(_ raw: String, operation: String) -> String {
+    let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    let fallback = "\(operation)未完成。请重试；如果仍然失败，请检查相关文件、网络和登录状态后再操作。"
+    guard !text.isEmpty else { return fallback }
+    let lowered = text.lowercased()
+    if lowered.contains("permission denied") || lowered.contains("not permitted") {
+        return "\(operation)未完成：App 没有访问所需文件或目录的权限。请在系统设置中允许访问后重试。"
+    }
+    if lowered.contains("no such file") || lowered.contains("file doesn’t exist") || lowered.contains("file doesn't exist") {
+        return "\(operation)未完成：找不到所需文件或目录。请确认文件没有被移动或删除后重试。"
+    }
+    if text.contains("左侧“仓库”菜单未在等待时间内加载完成") {
+        return "\(operation)未完成：库存业务工作台已打开，但左侧“仓库”菜单还没有加载完成。请保持库存系统页面可见后重试。"
+    }
+    if text.contains("左侧“商品”菜单未在等待时间内加载完成") {
+        return "\(operation)未完成：库存业务工作台已打开，但左侧“商品”菜单还没有加载完成。请保持库存系统页面可见后重试。"
+    }
+    if lowered.contains("otheroutbound_menu") || text.contains("仓库菜单已打开，但找不到") {
+        return "\(operation)未完成：已找到左侧“仓库”菜单，但“其他出库单”入口没有出现。请保持库存系统页面可见后重试。"
+    }
+    if text.contains("找不到其他出库单记录列表") || text.contains("记录列表控件未加载完成") {
+        return "\(operation)未完成：已进入“其他出库单”，但记录列表还没有加载完成。请保持库存系统页面可见后重试。"
+    }
+    if text.contains("内嵌表单") || text.contains("编辑表单未加载完成") {
+        return "\(operation)未完成：已进入“其他出库单”，但出库表单还没有加载完成。请保持库存系统页面可见后重试。"
+    }
+    if lowered.contains("timed out") || lowered.contains("timeout") || lowered.contains("network") || lowered.contains("connection refused") {
+        return "\(operation)未完成：网络或业务系统暂时没有响应。请确认网络连接正常，稍后重试。"
+    }
+    if lowered.contains("database is locked") {
+        return "\(operation)未完成：订单数据库正在被其他任务使用。请等待当前任务结束后重试。"
+    }
+    if lowered.contains("keychain") || lowered.contains("osstatus") || text.contains("状态码") {
+        return "\(operation)未完成：macOS 钥匙串没有成功保存或读取账号信息。请重新输入密码并保存；仍失败时检查 App 的钥匙串访问权限。"
+    }
+    let technicalMarkers = [
+        "traceback", "error domain=", "nsposixerrordomain", "sqlite3.", "file \"",
+        "exit status", "valid json", "json result", "status code", "error code",
+        "missing_materials", "material_generation_failed", "exception:", "errno ",
+        "cannot access local variable", "unboundlocalerror", "nameerror", "attributeerror", "typeerror",
+        " code=", "错误代码", "异常代码",
+    ]
+    if technicalMarkers.contains(where: { lowered.contains($0) }) {
+        return fallback
+    }
+    let hasChinese = text.unicodeScalars.contains { scalar in
+        (0x4E00...0x9FFF).contains(Int(scalar.value))
+    }
+    return hasChinese ? text : fallback
+}
+
+func dashboardFailureMessage(_ failureStatus: String, rawError: String, operation: String) -> String {
+    let status = failureStatus.trimmingCharacters(in: .whitespacesAndNewlines)
+    return status.isEmpty ? businessFriendlyMessage(rawError, operation: operation) : status
+}
 
 struct OrderFolderItem: Identifiable {
     let id: String
     let orderId: String
     let modifiedAt: String
+}
+
+struct OrderDashboardFactory: Identifiable {
+    let id: String
+    let factoryOrder: String
+    let orderId: String
+    let orderName: String
+    let nameSource: String
+    let reportState: String
+    let ownershipStatus: String
+    let hasHardware: Bool
+    let optimized: Bool
+    let outboundStatus: String
+    let outboundDocument: String
+}
+
+struct OrderDashboardItem: Identifiable {
+    let id: String
+    let orderId: String
+    let orderType: String
+    let sourceFolder: String
+    let modifiedAt: String
+    let validationStatus: String
+    let validationMessage: String
+    let stage: String
+    let materialStatus: String
+    let factoryCount: Int
+    let optimizedCount: Int
+    let shippedCount: Int
+    let optimizationProgress: String
+    let outboundProgress: String
+    let factories: [OrderDashboardFactory]
+}
+
+struct ServerChangePreview: Identifiable {
+    let id: String
+    let changeType: String
+    let kind: String
+    let orderId: String
+    let sourceFolder: String
+    let path: String
+    let oldPath: String
+    let message: String
+    let manualOnly: Bool
+    let eventTime: String
+
+    init(
+        id: String,
+        changeType: String,
+        kind: String,
+        orderId: String,
+        sourceFolder: String,
+        path: String,
+        oldPath: String = "",
+        message: String,
+        manualOnly: Bool,
+        eventTime: String
+    ) {
+        self.id = id
+        self.changeType = changeType
+        self.kind = kind
+        self.orderId = orderId
+        self.sourceFolder = sourceFolder
+        self.path = path
+        self.oldPath = oldPath
+        self.message = message
+        self.manualOnly = manualOnly
+        self.eventTime = eventTime
+    }
+}
+
+struct ServerFolderChangeGroup: Identifiable {
+    let id: String
+    let folderPath: String
+    let folderName: String
+    let orderId: String
+    let changes: [ServerChangePreview]
+    let manualOnly: Bool
+
+    var requiresManualReview: Bool {
+        changes.contains { $0.changeType == "missing_report" }
+    }
+}
+
+struct PendingCenterItem: Identifiable {
+    let id: String
+    let title: String
+    let subtitle: String
+    let status: String
+    let folderPath: String
+    let folderName: String
+    let orderId: String
+    let serverGroup: ServerFolderChangeGroup?
+    let issues: [CurrentIssue]
+    let aimesReviews: [AimesReviewItem]
+}
+
+func serverFolderChangeGroups(_ changes: [ServerChangePreview]) -> [ServerFolderChangeGroup] {
+    let grouped = Dictionary(grouping: changes) { change in
+        change.sourceFolder.isEmpty ? URL(fileURLWithPath: change.path).deletingLastPathComponent().path : change.sourceFolder
+    }
+    return grouped.map { folderPath, rows in
+        let sorted = rows.sorted { lhs, rhs in lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending }
+        let orderID = sorted.map(\.orderId).first(where: { !$0.isEmpty }) ?? ""
+        return ServerFolderChangeGroup(
+            id: folderPath,
+            folderPath: folderPath,
+            folderName: URL(fileURLWithPath: folderPath).lastPathComponent,
+            orderId: orderID,
+            changes: sorted,
+            manualOnly: sorted.allSatisfy(\.manualOnly)
+        )
+    }
+    .sorted { lhs, rhs in lhs.folderPath.localizedStandardCompare(rhs.folderPath) == .orderedAscending }
+}
+
+func buildPendingCenterItems(
+    serverChanges: [ServerChangePreview],
+    currentIssues: [CurrentIssue],
+    aimesReviews: [AimesReviewItem]
+) -> [PendingCenterItem] {
+    let groups = serverFolderChangeGroups(serverChanges)
+    var attachedIssueIDs = Set<String>()
+    var attachedAimesIDs = Set<String>()
+    var result: [PendingCenterItem] = []
+
+    func belongs(_ issue: CurrentIssue, to group: ServerFolderChangeGroup) -> Bool {
+        guard !issue.path.isEmpty else { return false }
+        return issue.path == group.folderPath || issue.path.hasPrefix(group.folderPath + "/")
+    }
+
+    for group in groups {
+        let issues = currentIssues.filter { issue in
+            guard belongs(issue, to: group) else { return false }
+            attachedIssueIDs.insert(issue.id)
+            return true
+        }
+        let factoryOrders = Set(issues.map(\.factoryOrder).filter { !$0.isEmpty })
+        let reviews = aimesReviews.filter { item in
+            guard !item.factoryOrder.isEmpty, factoryOrders.contains(item.factoryOrder) else { return false }
+            attachedAimesIDs.insert(item.id)
+            return true
+        }
+        let status: String
+        if !reviews.isEmpty || issues.contains(where: { $0.kind == "factory_ownership" || $0.kind == "server_missing_report" }) {
+            status = "需人工确认"
+        } else if issues.contains(where: { $0.kind == "temporary_processing" && $0.message.contains("未映射材料") }) {
+            status = "需人工处理"
+        } else if !issues.isEmpty {
+            status = "处理失败"
+        } else {
+            status = "待扫描处理"
+        }
+        let source = reviews.isEmpty ? "Server" : "Server · AIMES"
+        result.append(PendingCenterItem(
+            id: "folder:\(group.folderPath)",
+            title: group.orderId.isEmpty ? group.folderName : group.orderId,
+            subtitle: "\(source) · \(group.folderName)",
+            status: status,
+            folderPath: group.folderPath,
+            folderName: group.folderName,
+            orderId: group.orderId,
+            serverGroup: group,
+            issues: issues,
+            aimesReviews: reviews
+        ))
+    }
+
+    for issue in currentIssues where !attachedIssueIDs.contains(issue.id) {
+        let location = issue.path.isEmpty ? "" : URL(fileURLWithPath: issue.path).deletingLastPathComponent().path
+        let folderName = location.isEmpty ? "" : URL(fileURLWithPath: location).lastPathComponent
+        result.append(PendingCenterItem(
+            id: "issue:\(issue.id)",
+            title: issue.factoryOrder.isEmpty ? (issue.orderId.isEmpty ? "当前问题" : issue.orderId) : issue.factoryOrder,
+            subtitle: issue.kind == "factory_ownership" ? "订单归属问题" : (issue.kind == "server_missing_report" ? "报表检查" : (issue.message.contains("未映射材料") ? "出库前需要材料映射" : "订单处理问题")),
+            status: issue.kind == "factory_ownership" || issue.kind == "server_missing_report" ? "需人工确认" : (issue.message.contains("未映射材料") ? "需人工处理" : "处理失败"),
+            folderPath: location,
+            folderName: folderName,
+            orderId: issue.orderId,
+            serverGroup: nil,
+            issues: [issue],
+            aimesReviews: []
+        ))
+    }
+
+    for item in aimesReviews where !attachedAimesIDs.contains(item.id) {
+        result.append(PendingCenterItem(
+            id: "aimes:\(item.id)",
+            title: item.factoryOrder.isEmpty ? "AIMES 工厂单" : item.factoryOrder,
+            subtitle: "AIMES · 工厂单待确认",
+            status: "需人工确认",
+            folderPath: "",
+            folderName: "",
+            orderId: item.suggestedOrderID,
+            serverGroup: nil,
+            issues: [],
+            aimesReviews: [item]
+        ))
+    }
+
+    return result
+}
+
+struct CurrentIssue: Identifiable, Equatable {
+    let id: String
+    let kind: String
+    let orderId: String
+    let factoryOrder: String
+    let path: String
+    let message: String
+    let firstSeen: String
+    let lastSeen: String
+}
+
+struct AimesReviewItem: Identifiable, Equatable {
+    let id: String
+    let ignoreKey: String
+    let factoryOrder: String
+    let factoryName: String
+    let salesOrderName: String
+    let reason: String
+    let suggestedOrderID: String
+    let ignoredAt: String
+    let sourcePath: String
+}
+
+func aimesReviewItems(_ object: [String: Any], key: String) -> [AimesReviewItem] {
+    (object[key] as? [[String: Any]] ?? []).compactMap { row in
+        guard let ignoreKey = row["ignore_key"] as? String, !ignoreKey.isEmpty else { return nil }
+        return AimesReviewItem(
+            id: ignoreKey,
+            ignoreKey: ignoreKey,
+            factoryOrder: row["factory_order"] as? String ?? "",
+            factoryName: row["factory_name"] as? String ?? "",
+            salesOrderName: row["sales_order_name"] as? String ?? "",
+            reason: row["reason"] as? String ?? "需要人工确认",
+            suggestedOrderID: row["suggested_order_id"] as? String ?? "",
+            ignoredAt: row["ignored_at"] as? String ?? "",
+            sourcePath: object["aimes_source_file"] as? String ?? ""
+        )
+    }
+}
+
+func aimesReviewItemsFromWarnings(_ warnings: [[String: Any]]) -> [AimesReviewItem] {
+    warnings.compactMap { row in
+        let ignoreKey = row["ignore_key"] as? String ?? ""
+        let factoryOrder = row["factory_order"] as? String ?? ""
+        guard !ignoreKey.isEmpty, !factoryOrder.isEmpty else { return nil }
+        return AimesReviewItem(
+            id: ignoreKey,
+            ignoreKey: ignoreKey,
+            factoryOrder: factoryOrder,
+            factoryName: row["factory_name"] as? String ?? "",
+            salesOrderName: row["sales_order_name"] as? String ?? "",
+            reason: row["reason"] as? String ?? "销售单名称格式不符合规则",
+            suggestedOrderID: row["suggested_order_id"] as? String ?? "",
+            ignoredAt: "",
+            sourcePath: ""
+        )
+    }
+}
+
+func dashboardActivitySteps(_ object: [String: Any], includeChanges: Bool = true) -> [InventoryStep] {
+    guard includeChanges else { return [] }
+    return (object["changes"] as? [[String: Any]] ?? []).map { row in
+        let observed = row["observed_at"] as? String ?? ""
+        let time = observed.split(separator: "T").last.map(String.init) ?? observed
+        let severity = row["severity"] as? String ?? "info"
+        let kind = row["kind"] as? String ?? ""
+        let rawMessage = row["message"] as? String ?? "订单数据发生变化"
+        let orderID = row["order_id"] as? String ?? ""
+        let factoryOrder = row["factory_order"] as? String ?? ""
+        let path = row["path"] as? String ?? ""
+        let title: String
+        switch kind {
+        case "order_validation": title = "订单校验"
+        case "aimes", "aimes_order_assignment": title = "AIMES"
+        case "report_error": title = "报表检查"
+        case "report_empty": title = "报表检查"
+        default: title = "订单数据更新"
+        }
+        var detail = businessFriendlyMessage(rawMessage, operation: "处理订单数据")
+        if !path.isEmpty {
+            let fileName = URL(fileURLWithPath: path).lastPathComponent
+            if !fileName.isEmpty && !detail.contains(fileName) {
+                detail += "（文件：\(fileName)）"
+            }
+        }
+        var operationDetails = [
+            "更新对象：订单号 \(orderID.isEmpty ? "未识别" : orderID)，工厂单号 \(factoryOrder.isEmpty ? "未识别" : factoryOrder)。",
+            "更新内容：\(detail)",
+        ]
+        if !path.isEmpty {
+            operationDetails.append("读取文件：\(path)")
+        }
+        return InventoryStep(
+            time: String(time.prefix(8)),
+            title: title,
+            detail: detail,
+            state: severity == "error" ? "failure" : (severity == "warning" ? "warning" : "success"),
+            paths: path.isEmpty ? [] : [path],
+            operationDetails: operationDetails
+        )
+    }
+}
+
+func serverChangePreviews(_ rows: [[String: Any]]) -> [ServerChangePreview] {
+    rows.compactMap { row in
+        guard let id = row["id"] as? String, let path = row["path"] as? String else { return nil }
+        return ServerChangePreview(
+            id: id,
+            changeType: row["change_type"] as? String ?? "modified",
+            kind: row["kind"] as? String ?? "file",
+            orderId: row["order_id"] as? String ?? "",
+            sourceFolder: row["source_folder"] as? String ?? "",
+            path: path,
+            oldPath: row["old_path"] as? String ?? "",
+            message: businessFriendlyMessage(
+                row["message"] as? String ?? URL(fileURLWithPath: path).lastPathComponent,
+                operation: "扫描 Server"
+            ),
+            manualOnly: row["manual_only"] as? Bool ?? false,
+            eventTime: row["event_time"] as? String ?? ""
+        )
+    }
+}
+
+func serverChangeTypeName(_ type: String) -> String {
+    switch type {
+    case "added": return "新增"
+    case "removed": return "删除"
+    case "renamed": return "改名"
+    case "missing_report": return "缺少报表"
+    default: return "修改"
+    }
+}
+
+struct OrderPreviewIssue: Equatable {
+    let orderId: String
+    let code: String
+    let message: String
+}
+
+func orderPreviewIssues(_ object: [String: Any]) -> [OrderPreviewIssue] {
+    (object["errors"] as? [[String: Any]] ?? []).map {
+        OrderPreviewIssue(
+            orderId: $0["order_id"] as? String ?? "",
+            code: $0["code"] as? String ?? "",
+            message: $0["message"] as? String ?? "订单校验失败"
+        )
+    }
 }
 
 struct OrderMaterialPreview: Identifiable {
@@ -24,6 +432,38 @@ func orderMaterialDisplayName(_ row: OrderMaterialPreview) -> String {
     if abs(thickness - 14.5) < 0.01 { return "抽屉板" }
     if abs(thickness - 5.4) < 0.01 { return "背板" }
     return "Plywood"
+}
+
+func orderedMaterialRows(_ rows: [OrderMaterialPreview]) -> [OrderMaterialPreview] {
+    rows.sorted {
+        let leftRank: Int
+        let rightRank: Int
+        if $0.kind == "plywood" {
+            leftRank = abs($0.thickness - 18) < 0.01 ? 0 : abs($0.thickness - 14.5) < 0.01 ? 1 : abs($0.thickness - 5.4) < 0.01 ? 2 : 3
+        } else {
+            leftRank = 10
+        }
+        if $1.kind == "plywood" {
+            rightRank = abs($1.thickness - 18) < 0.01 ? 0 : abs($1.thickness - 14.5) < 0.01 ? 1 : abs($1.thickness - 5.4) < 0.01 ? 2 : 3
+        } else {
+            rightRank = 10
+        }
+        if leftRank != rightRank { return leftRank < rightRank }
+        return $0.color.localizedStandardCompare($1.color) == .orderedAscending
+    }
+}
+
+func orderedEdgeColors(_ colors: [String], matching panels: [OrderMaterialPreview]) -> [String] {
+    var order: [String] = []
+    for panel in panels where panel.kind == "panel" {
+        let color = panel.color.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !color.isEmpty && !order.contains(where: { $0.caseInsensitiveCompare(color) == .orderedSame }) {
+            order.append(color)
+        }
+    }
+    let remaining = colors.filter { color in !order.contains(where: { $0.caseInsensitiveCompare(color) == .orderedSame }) }
+        .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    return order + remaining
 }
 
 func panelColorsNeedingThicknessWarning(_ rows: [OrderMaterialPreview]) -> Set<String> {
@@ -55,6 +495,40 @@ struct OrderFittingPreview: Identifiable {
     let unit: String
     let quantity: Double
     let ignored: Bool
+}
+
+struct OrderStockPreview: Identifiable {
+    let id: String
+    let productCode: String
+    let productName: String
+    let unit: String
+    let travelerNames: [String]
+    let required: Double
+    let available: Double
+    let shortage: Double
+    let sufficient: Bool
+}
+
+struct OrderCostLine: Identifiable {
+    let id = UUID()
+    let category: String
+    let factoryOrder: String
+    let roomName: String
+    let name: String
+    let spec: String
+    let quantity: Double
+    let unit: String
+    let productCode: String
+    let costPrice: Double?
+    let amount: Double?
+    let missing: String
+}
+
+struct OrderCostFactoryTotal: Identifiable {
+    let id: String
+    let factoryOrder: String
+    let total: Double
+    let hasMissing: Bool
 }
 
 struct InventoryTraveler: Identifiable {
@@ -104,12 +578,149 @@ struct InventoryProductCandidate: Identifiable {
     let unit: String
 }
 
+struct InventoryIgnoredMapping: Identifiable {
+    let id: String
+    let name: String
+    let reason: String
+}
+
+struct InventoryManualMapping: Identifiable {
+    let id: String
+    let name: String
+    let productCode: String
+}
+
 struct InventoryStep: Identifiable {
-    let id = UUID()
+    let id: UUID
     let time: String
     let title: String
     let detail: String
     let state: String
+    let paths: [String]
+    let operationDetails: [String]
+    let contextDetails: [String]
+    let startedAt: Date?
+    let duration: TimeInterval?
+
+    init(
+        id: UUID = UUID(),
+        time: String,
+        title: String,
+        detail: String,
+        state: String,
+        paths: [String] = [],
+        operationDetails: [String] = [],
+        contextDetails: [String] = [],
+        startedAt: Date? = nil,
+        duration: TimeInterval? = nil
+    ) {
+        self.id = id
+        self.time = time
+        self.title = title
+        self.detail = detail
+        self.state = state
+        self.paths = paths
+        self.operationDetails = operationDetails
+        self.contextDetails = contextDetails
+        self.startedAt = startedAt
+        self.duration = duration
+    }
+}
+
+func operationDurationText(_ duration: TimeInterval) -> String {
+    let rounded = max(0, duration).rounded(toPlaces: 2)
+    return String(format: "%.2f 秒", rounded)
+}
+
+struct DashboardOperationDuration: Equatable, Identifiable {
+    let id: String
+    let label: String
+    let duration: TimeInterval
+
+    init(id: String? = nil, label: String, duration: TimeInterval) {
+        self.label = label
+        self.duration = max(0, duration)
+        self.id = id ?? "\(label)-\(UUID().uuidString)"
+    }
+}
+
+private struct DashboardOperationStart {
+    let label: String
+    let startedAt: Date
+}
+
+private extension Double {
+    func rounded(toPlaces places: Int) -> Double {
+        let factor = pow(10.0, Double(places))
+        return (self * factor).rounded() / factor
+    }
+}
+
+func dashboardClockTime(_ date: Date = Date()) -> String {
+    date.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits).second(.twoDigits))
+}
+
+/// Format persisted ISO timestamps only at the presentation boundary.
+/// Storage, sorting, and comparisons continue to use the original value.
+func appDisplayTimestamp(_ value: String) -> String {
+    value.replacingOccurrences(of: "T", with: " ")
+}
+
+func updatingLatestRunningStep(_ steps: [InventoryStep], detail: String) -> [InventoryStep]? {
+    guard let index = steps.lastIndex(where: { $0.state == "running" }) else { return nil }
+    var updated = steps
+    let current = updated[index]
+    updated[index] = InventoryStep(
+        id: current.id,
+        time: current.time,
+        title: current.title,
+        detail: detail,
+        state: "running",
+        paths: current.paths,
+        operationDetails: current.operationDetails,
+        contextDetails: current.contextDetails,
+        startedAt: current.startedAt,
+        duration: current.duration
+    )
+    return updated
+}
+
+func appendingInventoryProgressStep(_ steps: [InventoryStep], message: String) -> [InventoryStep] {
+    var updated = steps
+    if let index = updated.lastIndex(where: { $0.state == "running" }) {
+        let current = updated[index]
+        updated[index] = InventoryStep(
+            id: current.id,
+            time: current.time,
+            title: current.title,
+            detail: current.detail,
+            state: "success",
+            paths: current.paths,
+            operationDetails: current.operationDetails,
+            contextDetails: current.contextDetails,
+            startedAt: current.startedAt,
+            duration: current.duration
+        )
+    }
+    let formatter = DateFormatter()
+    formatter.dateFormat = "HH:mm:ss"
+    updated.append(InventoryStep(
+        time: formatter.string(from: Date()),
+        title: "后台操作",
+        detail: message,
+        state: "running",
+        startedAt: Date()
+    ))
+    return updated
+}
+
+func orderUpdateActionReady(existingTravelerPath: String, selectedOrderPath: String, selectedOrderId: String) -> Bool {
+    !existingTravelerPath.isEmpty && !selectedOrderPath.isEmpty && !selectedOrderId.isEmpty
+}
+
+func orderTravelerOpenActionReady(existingTravelerPath: String) -> Bool {
+    let path = existingTravelerPath.trimmingCharacters(in: .whitespacesAndNewlines)
+    return !path.isEmpty && FileManager.default.fileExists(atPath: path)
 }
 
 struct TodoItem: Identifiable, Codable, Equatable {
@@ -134,57 +745,98 @@ struct TodoItem: Identifiable, Codable, Equatable {
     }
 }
 
+struct AssistantTaskItem: Identifiable, Equatable {
+    let id = UUID()
+    let text: String
+    var status: String = "排队中"
+}
+
 final class AppModel: ObservableObject {
-    @Published var query = ""
-    @Published var running = false
-    @Published var status = "准备就绪"
-    @Published var details = "尚未运行查询。"
-    @Published var hasError = false
-    @Published var pendingOrder: String? = nil
-    @Published var activityLines: [String] = []
+    @Published var assistantInput = ""
+    @Published var assistantOutput = "输入或说出一条指令。"
+    @Published var assistantOrderPreview: AssistantOrderResult?
+    @Published var assistantOrderList: [OrderFolderItem] = []
+    @Published var assistantStockRows: [OrderStockPreview] = []
+    @Published var assistantStockOrderId = ""
+    @Published var assistantStockTraveler = ""
+    @Published var assistantRunning = false
+    @Published var assistantPendingApproval = false
+    @Published var assistantTokenSummary = "本次 0 Token"
+    @Published var assistantUsageSummary = "本周 0 · 本月 0 · 累计 0 Token"
+    @Published var assistantTasks: [AssistantTaskItem] = []
+    @Published var assistantActiveTaskID: UUID?
+    var assistantProcess: Process?
+    var assistantWriteInProgress = false
     @Published var initialDate = Calendar.current.date(from: DateComponents(year: 2026, month: 7, day: 22))!
-    @Published var companyWiFi = "SpectrumSetup-7C81"
     @Published var sourceRoot = "/Volumes/server/Optimized Orders"
     @Published var orderRoot = NSHomeDirectory() + "/Library/Mobile Documents/com~apple~CloudDocs/PacificPride/Order"
-    @Published var templatePath = NSHomeDirectory() + "/Library/Mobile Documents/com~apple~CloudDocs/PacificPride/模版/Work Order Traveler().xlsx"
-    @Published var backupRoot = NSHomeDirectory() + "/Library/Mobile Documents/com~apple~CloudDocs/PacificPride/Work Order Traveler Backups"
-    @Published var leftoverThreshold = 100.0
-    @Published var aimesUsername = ""
-    @Published var aimesPassword = ""
-    @Published var plywoodThicknesses = "18, 14.5, 5.4"
-    @Published var panelThicknesses = "19.1, 8, 9"
-    @Published var plywoodLength = 2440.0
-    @Published var plywoodWidth = 1220.0
-    @Published var panelLength = 2745.0
-    @Published var panelWidth = 1220.0
-    @Published var aliasSource = 5.0
-    @Published var aliasTarget = 5.4
-    @Published var edgeDecimals = 2
-    @Published var materialPlywood34 = 18.0
-    @Published var materialPlywood58 = 14.5
-    @Published var materialPlywood14 = 5.4
-    @Published var materialPanel34 = 19.1
-    @Published var materialPanel14 = 9.0
-    @Published var shelfHolderCode = "WJ-CBT"
-    @Published var hingeCode = "71T950A"
-    @Published var hRailCode = "H-RAIL"
-    @Published var lRailCode = "L-RAIL"
+    @Published var backupRoot = "/Volumes/server/g/pp-flowhub/database-backups"
     @Published var settingsStatus = ""
+    @Published var operationLogEnabled = true
     @Published var inventoryTravelers: [InventoryTraveler] = []
     @Published var selectedInventoryPaths: Set<String> = []
+    @Published var selectedInventoryOrderID = ""
+    @Published var selectedInventoryDocumentRemarks: Set<String> = []
+    @Published var selectedInventoryFactoryOrders: Set<String> = []
     @Published var inventoryPreviewRows: [InventoryPreviewRow] = []
     @Published var inventoryErrors: [String] = []
+    @Published var inventoryWriteBlocked = false
+    @Published var inventoryWriteCompleted = false
     @Published var inventoryRunning = false
     @Published var inventoryStatus = "尚未载入 Traveler"
     @Published var inventorySuccessMessage = ""
     @Published var inventoryCatalogStatus = "商品资料尚未检查"
+    @Published var inventoryChromeStatus = "库存专用 Chrome 尚未打开"
+    private var inventoryChromeOpenedByApp = false
     @Published var showInventoryHistory = false
     @Published var jdyUsername = ""
     @Published var jdyPassword = ""
+    @Published var aimesUsername = ""
+    @Published var aimesPassword = ""
     @Published var inventorySteps: [InventoryStep] = []
     @Published var inventoryProductCandidates: [InventoryProductCandidate] = []
     @Published var inventoryProductSearchStatus = ""
+    @Published var inventoryIgnoredMappings: [InventoryIgnoredMapping] = []
+    @Published var inventoryManualMappings: [InventoryManualMapping] = []
+    @Published var inventoryMappingRequestPath = ""
+    private var pendingInventoryMappingFolder = ""
     @Published var orderFolders: [OrderFolderItem] = []
+    @Published var dashboardOrders: [OrderDashboardItem] = []
+    @Published var dashboardChanges: [String] = []
+    @Published var dashboardActivity: [InventoryStep] = []
+    @Published var dashboardOperationDetails: [String: [String]] = [:]
+    @Published private(set) var dashboardOperationDurations: [String: TimeInterval] = [:]
+    @Published private(set) var dashboardOperationStageDurations: [String: [DashboardOperationDuration]] = [:]
+    private var dashboardOperationStartedAt: [String: DashboardOperationStart] = [:]
+    @Published var dashboardSyncStatus = "订单数据尚未同步" {
+        didSet { dashboardSyncStatusTime = dashboardClockTime() }
+    }
+    @Published var dashboardAimesStatus = "AIMES 尚未检查" {
+        didSet { dashboardAimesStatusTime = dashboardClockTime() }
+    }
+    @Published var aimesFailureAlert = ""
+    @Published var dashboardServerStatus = "Server 尚未扫描" {
+        didSet { dashboardServerStatusTime = dashboardClockTime() }
+    }
+    @Published private(set) var dashboardSyncStatusTime = dashboardClockTime()
+    @Published private(set) var dashboardAimesStatusTime = dashboardClockTime()
+    @Published private(set) var dashboardServerStatusTime = dashboardClockTime()
+    @Published var pendingServerChanges: [ServerChangePreview] = []
+    @Published var selectedServerFolderPaths: Set<String> = []
+    @Published var includeHardwareForServerProcessing = true
+    @Published var pendingServerFolderURL: URL?
+    @Published var showServerProcessingOptions = false
+    @Published var currentIssues: [CurrentIssue] = []
+    @Published var showPendingCenterPrompt = false
+    @Published var showCurrentIssuesPrompt = false
+    @Published var showServerChangesPrompt = false
+    @Published var pendingAimesReviews: [AimesReviewItem] = []
+    @Published var ignoredAimesFactories: [AimesReviewItem] = []
+    @Published var assignedAimesFactories: [AimesReviewItem] = []
+    @Published var aimesFormatWarnings: [AimesReviewItem] = []
+    @Published var aimesWarnings: [[String: Any]] = []
+    @Published var selectedAimesReviewIDs: Set<String> = []
+    @Published var showAimesReviewPrompt = false
     @Published var orderSourceKind = "owned"
     @Published var selectedOrderPath = ""
     @Published var selectedOrderId = ""
@@ -194,49 +846,128 @@ final class AppModel: ObservableObject {
     @Published var orderFactories: [OrderFactoryPreview] = []
     @Published var orderFittings: [OrderFittingPreview] = []
     @Published var orderWarnings: [String] = []
+    @Published var orderStockRows: [OrderStockPreview] = []
     @Published var orderSteps: [InventoryStep] = []
     @Published var orderRunning = false
+    @Published var orderPreviewValidated = false
+    @Published var orderDetailWaiting = false
+    @Published var orderMissingMaterial = false
+    @Published var orderCostStatus = ""
+    @Published var orderCostTotal: Double?
+    @Published var orderCostKnown: Double = 0
+    @Published var orderCostLines: [OrderCostLine] = []
+    @Published var orderCostFactoryTotals: [OrderCostFactoryTotal] = []
+    @Published var orderCostMissingItems: [String] = []
+    @Published var orderCostExportPath = ""
+    @Published var showCostSheet = false
+    @Published var selectedOrderIsOptimized = false
     @Published var orderStatus = "点击刷新读取服务器订单文件夹"
     @Published var orderError = ""
     @Published var orderCreatedPath = ""
     @Published var orderExistingTravelerPath = ""
-    @Published var legacySteps: [InventoryStep] = []
+    @Published var showMaterialGenerationPrompt = false
     @Published var todoItems: [TodoItem] = []
     @Published var todoStatus = ""
-    private var stderrBuffer = ""
-    private var rawStderr = ""
+    @Published var showBackupReminder = false
+    @Published var backupReminderStatus = ""
+    @Published var backupStatus = ""
     private var inventoryStderrBuffer = ""
     private var inventoryRawErrors = ""
     private var orderStderrBuffer = ""
     private var orderRawErrors = ""
+    private var pendingOrderDetailItem: OrderDashboardItem?
+    private var orderDetailRetryScheduled = false
+    private var dashboardStartupStarted = false
+
+    var pendingCenterItems: [PendingCenterItem] {
+        buildPendingCenterItems(
+            serverChanges: pendingServerChanges,
+            currentIssues: currentIssues,
+            aimesReviews: pendingAimesReviews
+        )
+    }
 
     var orderPreviewReady: Bool {
-        !selectedOrderPath.isEmpty && orderError.isEmpty && !orderMaterialsFile.isEmpty &&
-            (selectedOrderId.hasPrefix("CS") || !orderFactories.isEmpty)
+        !selectedOrderId.isEmpty && !orderMaterials.isEmpty
+    }
+
+    var orderCanGenerateTraveler: Bool {
+        !orderRunning && !selectedOrderId.isEmpty
+    }
+
+    var orderTravelerOpenReady: Bool {
+        orderTravelerOpenActionReady(existingTravelerPath: orderExistingTravelerPath)
+    }
+
+    var activeOwnedSourceRoot: String {
+        sourceRoot.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var activeCutToSizeRoot: String {
+        return URL(fileURLWithPath: sourceRoot, isDirectory: true)
+            .deletingLastPathComponent()
+            .appendingPathComponent("CUT TO SIZE", isDirectory: true).path
+    }
+
+    var activeOrderRoot: String {
+        orderRoot.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var activeBackupRoot: String {
+        backupRoot.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var databaseBackupRoot: String {
+        NSHomeDirectory() + "/Documents/pp-flowhub/data/database-backups"
     }
 
     init() {
         loadSettings()
-        loadBusinessRules()
+        OperationLogWriter.shared.setEnabled(operationLogEnabled)
+        OperationLogWriter.shared.record(
+            "app.started",
+            message: "App 启动",
+            details: ["operation_log_enabled": operationLogEnabled]
+        )
         loadTodoItems()
+        loadAssistantUsage()
+    }
+
+    func checkBackupReminder() {
+        runOrder(["backup-status"]) { object in
+            if object["requires_user_attention"] as? Bool == true {
+                self.backupReminderStatus = "今日尚无成功的本机数据库备份。"
+                self.showBackupReminder = true
+            }
+        }
+    }
+
+    func performBackup() {
+        guard !orderRunning else {
+            backupStatus = "⚠️ 当前正在扫描或同步，请等待任务完成后再备份。"
+            return
+        }
+        backupStatus = "正在备份数据库…"
+        runOrder(["backup-now"], failureStatus: "数据库备份失败", onFailure: {
+            let message = businessFriendlyMessage(self.orderError, operation: "数据库备份")
+            self.backupStatus = "⚠️ \(message)"
+            self.backupReminderStatus = message
+        }) { object in
+            let path = object["path"] as? String ?? self.databaseBackupRoot
+            self.backupStatus = "✅ 数据库备份完成：\(path)"
+            self.backupReminderStatus = self.backupStatus
+            self.showBackupReminder = false
+        }
     }
 
     private var settingsURL: URL {
         URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Library/Application Support/工作流程助手/settings.json")
-    }
-
-    private var localRulesURL: URL {
-        settingsURL.deletingLastPathComponent().appendingPathComponent("business-rules.json")
-    }
-
-    private var bundledRulesURL: URL {
-        projectRoot.appendingPathComponent("config/business-rules.json")
+            .appendingPathComponent("Documents/pp-flowhub/data/settings.json")
     }
 
     var todoDataURL: URL {
         URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Documents/工作流程助手/data/todo-items.json")
+            .appendingPathComponent("Documents/pp-flowhub/data/todo-items.json")
     }
 
     func loadTodoItems() {
@@ -250,11 +981,12 @@ final class AppModel: ObservableObject {
             todoItems = try decoder.decode([TodoItem].self, from: Data(contentsOf: todoDataURL))
             todoStatus = ""
         } catch {
-            todoStatus = "无法读取待办数据：\(error.localizedDescription)"
+            todoStatus = businessFriendlyMessage(error.localizedDescription, operation: "读取待办")
         }
     }
 
     func addTodo(content: String, deadline: Date?) {
+        logUserAction("点击添加待办", details: ["deadline_present": deadline != nil])
         let value = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else {
             todoStatus = "请输入任务内容"
@@ -265,6 +997,7 @@ final class AppModel: ObservableObject {
     }
 
     func updateTodo(_ item: TodoItem, content: String, deadline: Date?) {
+        logUserAction("点击保存待办编辑", details: ["deadline_present": deadline != nil])
         let value = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty, let index = todoItems.firstIndex(where: { $0.id == item.id }) else {
             todoStatus = "请输入任务内容"
@@ -276,12 +1009,14 @@ final class AppModel: ObservableObject {
     }
 
     func toggleTodoCompletion(_ item: TodoItem) {
+        logUserAction("点击切换待办完成状态")
         guard let index = todoItems.firstIndex(where: { $0.id == item.id }) else { return }
         todoItems[index].completedAt = todoItems[index].completedAt == nil ? Date() : nil
         saveTodoItems()
     }
 
     func deleteTodo(_ item: TodoItem) {
+        logUserAction("点击删除待办")
         todoItems.removeAll { $0.id == item.id }
         saveTodoItems()
     }
@@ -296,9 +1031,14 @@ final class AppModel: ObservableObject {
             encoder.dateEncodingStrategy = .iso8601
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             try encoder.encode(todoItems).write(to: todoDataURL, options: .atomic)
+            OperationLogWriter.shared.record(
+                "file.write",
+                message: "保存待办数据",
+                details: ["file": todoDataURL.path, "item_count": todoItems.count]
+            )
             todoStatus = ""
         } catch {
-            todoStatus = "无法保存待办数据：\(error.localizedDescription)"
+            todoStatus = businessFriendlyMessage(error.localizedDescription, operation: "保存待办")
         }
     }
 
@@ -314,182 +1054,116 @@ final class AppModel: ObservableObject {
         guard let data = try? Data(contentsOf: settingsURL),
               let values = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         if let value = values["initial_date"] as? String, let date = Self.dateFormatter.date(from: value) { initialDate = date }
-        companyWiFi = values["company_wifi"] as? String ?? companyWiFi
-        sourceRoot = values["source_root"] as? String ?? sourceRoot
-        orderRoot = values["order_root"] as? String ?? orderRoot
-        templatePath = values["template"] as? String ?? templatePath
-        backupRoot = values["backup_root"] as? String ?? backupRoot
-        leftoverThreshold = values["leftover_threshold_mm"] as? Double ?? leftoverThreshold
-        aimesUsername = values["aimes_username"] as? String ?? aimesUsername
+        sourceRoot = values["server_source_root"] as? String
+            ?? values["source_root"] as? String
+            ?? sourceRoot
+        orderRoot = values["production_order_root"] as? String
+            ?? values["order_root"] as? String
+            ?? orderRoot
+        backupRoot = values["production_backup_root"] as? String
+            ?? values["backup_root"] as? String
+            ?? backupRoot
         jdyUsername = values["jdy_username"] as? String ?? jdyUsername
+        aimesUsername = values["aimes_username"] as? String ?? aimesUsername
+        operationLogEnabled = values["operation_log_enabled"] as? Bool ?? operationLogEnabled
     }
 
     func saveSettings() {
+        logUserAction("点击保存设置")
         let values: [String: Any] = [
             "initial_date": Self.dateFormatter.string(from: initialDate),
-            "company_wifi": companyWiFi.trimmingCharacters(in: .whitespacesAndNewlines),
-            "source_root": sourceRoot.trimmingCharacters(in: .whitespacesAndNewlines),
-            "order_root": orderRoot.trimmingCharacters(in: .whitespacesAndNewlines),
-            "template": templatePath.trimmingCharacters(in: .whitespacesAndNewlines),
-            "backup_root": backupRoot.trimmingCharacters(in: .whitespacesAndNewlines),
-            "leftover_threshold_mm": leftoverThreshold,
-            "aimes_username": aimesUsername.trimmingCharacters(in: .whitespacesAndNewlines),
+            "source_root": activeOwnedSourceRoot,
+            "server_source_root": sourceRoot.trimmingCharacters(in: .whitespacesAndNewlines),
+            "order_root": activeOrderRoot,
+            "production_order_root": orderRoot.trimmingCharacters(in: .whitespacesAndNewlines),
+            "backup_root": activeBackupRoot,
+            "production_backup_root": backupRoot.trimmingCharacters(in: .whitespacesAndNewlines),
             "jdy_username": jdyUsername.trimmingCharacters(in: .whitespacesAndNewlines),
+            "aimes_username": aimesUsername.trimmingCharacters(in: .whitespacesAndNewlines),
+            "operation_log_enabled": operationLogEnabled,
         ]
         do {
             try FileManager.default.createDirectory(at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let data = try JSONSerialization.data(withJSONObject: values, options: [.prettyPrinted, .sortedKeys])
             try data.write(to: settingsURL, options: .atomic)
+            OperationLogWriter.shared.record(
+                "file.write",
+                message: "保存设置文件",
+                details: ["file": settingsURL.path]
+            )
             settingsStatus = "✅ 设置已保存，下次任务立即生效。"
         } catch {
-            settingsStatus = "❌ 保存失败：\(error.localizedDescription)"
+            settingsStatus = "❌ \(businessFriendlyMessage(error.localizedDescription, operation: "保存设置"))"
         }
     }
 
-    private func numberList(_ text: String) -> [Double]? {
-        let values = text.split(separator: ",").map {
-            Double($0.trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        guard !values.isEmpty, values.allSatisfy({ $0 != nil }) else { return nil }
-        return values.compactMap { $0 }
+    var operationLogURL: URL {
+        URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("Documents/pp-flowhub/data/operation-log.jsonl")
     }
 
-    func loadBusinessRules() {
-        let source = FileManager.default.fileExists(atPath: localRulesURL.path) ? localRulesURL : bundledRulesURL
-        guard let data = try? Data(contentsOf: source),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let sheets = root["sheet_materials"] as? [String: Any],
-              let plywood = sheets["plywood"] as? [String: Any],
-              let panel = sheets["panel"] as? [String: Any],
-              let materials = root["materials_workbook"] as? [String: Any],
-              let fittings = root["fittings"] as? [String: Any] else {
-            settingsStatus = "❌ 无法读取业务规则配置。"
-            return
+    func setOperationLogEnabled(_ enabled: Bool) {
+        guard enabled != operationLogEnabled else { return }
+        if !enabled {
+            OperationLogWriter.shared.record(
+                "user.operation_log.disabled",
+                message: "用户关闭操作日志",
+                details: ["enabled_after_change": false],
+                force: true
+            )
         }
-        func doubles(_ value: Any?) -> [Double] {
-            (value as? [NSNumber])?.map(\.doubleValue) ?? []
-        }
-        let plywoodValues = doubles(plywood["thicknesses_mm"])
-        let panelValues = doubles(panel["thicknesses_mm"])
-        let plywoodSize = doubles(plywood["standard_size_mm"])
-        let panelSize = doubles(panel["standard_size_mm"])
-        if !plywoodValues.isEmpty { plywoodThicknesses = plywoodValues.map(formatNumber).joined(separator: ", ") }
-        if !panelValues.isEmpty { panelThicknesses = panelValues.map(formatNumber).joined(separator: ", ") }
-        if plywoodSize.count == 2 { plywoodLength = plywoodSize[0]; plywoodWidth = plywoodSize[1] }
-        if panelSize.count == 2 { panelLength = panelSize[0]; panelWidth = panelSize[1] }
-        edgeDecimals = (sheets["edge_decimals"] as? NSNumber)?.intValue ?? edgeDecimals
-        if let aliases = sheets["thickness_aliases"] as? [String: Any],
-           let pair = aliases.first,
-           let source = Double(pair.key),
-           let target = pair.value as? NSNumber {
-            aliasSource = source
-            aliasTarget = target.doubleValue
-        }
-        if let columns = materials["plywood_columns"] as? [String: Any] {
-            materialPlywood34 = (columns["3"] as? NSNumber)?.doubleValue ?? materialPlywood34
-            materialPlywood58 = (columns["4"] as? NSNumber)?.doubleValue ?? materialPlywood58
-            materialPlywood14 = (columns["5"] as? NSNumber)?.doubleValue ?? materialPlywood14
-        }
-        if let rows = materials["panel_rows"] as? [String: Any] {
-            materialPanel34 = (rows["3/4"] as? NSNumber)?.doubleValue ?? materialPanel34
-            materialPanel14 = (rows["1/4"] as? NSNumber)?.doubleValue ?? materialPanel14
-        }
-        if let direct = fittings["direct_codes"] as? [String: Any] {
-            shelfHolderCode = direct.first(where: { $0.value as? String == "Shelf Holder" })?.key ?? shelfHolderCode
-            hingeCode = direct.first(where: { $0.value as? String == "Hinge" })?.key ?? hingeCode
-        }
-        if let paired = fittings["paired_codes"] as? [String: Any] {
-            hRailCode = paired.first(where: { $0.value as? String == "H-Rail" })?.key ?? hRailCode
-            lRailCode = paired.first(where: { $0.value as? String == "L-Rail" })?.key ?? lRailCode
+        operationLogEnabled = enabled
+        OperationLogWriter.shared.setEnabled(enabled)
+        saveSettings()
+        if enabled {
+            OperationLogWriter.shared.record(
+                "user.operation_log.enabled",
+                message: "用户开启操作日志",
+                details: ["enabled_after_change": true]
+            )
         }
     }
 
-    private func formatNumber(_ value: Double) -> String {
-        value.rounded() == value ? String(Int(value)) : String(value)
+    func logUserAction(_ action: String, details: [String: Any] = [:]) {
+        OperationLogWriter.shared.record("user.action", message: action, details: details)
     }
 
-    func saveBusinessRules() -> Bool {
-        guard let plywoodValues = numberList(plywoodThicknesses), plywoodValues.count == 3 else {
-            settingsStatus = "❌ Plywood厚度必须填写3个用逗号分隔的数值。"
-            return false
+    func newOperationID(_ name: String, details: [String: Any] = [:]) -> String {
+        let operationID = UUID().uuidString
+        OperationLogWriter.shared.record(
+            "operation.started",
+            message: name,
+            details: details,
+            operationID: operationID
+        )
+        return operationID
+    }
+
+    func environmentForOperation(_ operationID: String) -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        for (key, value) in OperationLogWriter.shared.environment(operationID: operationID) {
+            environment[key] = value
         }
-        guard let panelValues = numberList(panelThicknesses), !panelValues.isEmpty else {
-            settingsStatus = "❌ Panel厚度格式不正确。"
-            return false
-        }
-        guard plywoodLength > 0, plywoodWidth > 0, panelLength > 0, panelWidth > 0,
-              edgeDecimals >= 0, edgeDecimals <= 4,
-              !shelfHolderCode.isEmpty, !hingeCode.isEmpty, !hRailCode.isEmpty, !lRailCode.isEmpty else {
-            settingsStatus = "❌ 业务规则中存在空值或无效数值。"
-            return false
-        }
-        let rules: [String: Any] = [
-            "schema_version": 1,
-            "sheet_materials": [
-                "thickness_aliases": [formatNumber(aliasSource): aliasTarget],
-                "plywood": ["thicknesses_mm": plywoodValues, "standard_size_mm": [plywoodLength, plywoodWidth]],
-                "panel": ["thicknesses_mm": panelValues, "standard_size_mm": [panelLength, panelWidth]],
-                "display_order_mm": plywoodValues + panelValues.sorted(by: >),
-                "edge_decimals": edgeDecimals,
-            ],
-            "materials_workbook": [
-                "plywood_columns": ["3": materialPlywood34, "4": materialPlywood58, "5": materialPlywood14],
-                "panel_rows": ["3/4": materialPanel34, "1/4": materialPanel14],
-            ],
-            "fittings": [
-                "direct_codes": [shelfHolderCode.uppercased(): "Shelf Holder", hingeCode.uppercased(): "Hinge"],
-                "paired_codes": [hRailCode.uppercased(): "H-Rail", lRailCode.uppercased(): "L-Rail"],
-                "units": ["Hinge": "pcs/个", "Shelf Holder": "pcs/个", "H-Rail": "set/套", "L-Rail": "set/套"],
-            ],
-        ]
-        do {
-            try FileManager.default.createDirectory(at: localRulesURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let data = try JSONSerialization.data(withJSONObject: rules, options: [.prettyPrinted, .sortedKeys])
-            try data.write(to: localRulesURL, options: .atomic)
-            return true
-        } catch {
-            settingsStatus = "❌ 业务规则保存失败：\(error.localizedDescription)"
-            return false
-        }
+        return environment
     }
 
     func saveAllSettings() {
-        guard saveBusinessRules() else { return }
+        logUserAction("点击保存全部配置")
         saveSettings()
-        settingsStatus = "✅ 常规设置和业务规则已保存，下次任务立即生效。"
-    }
-
-    func saveAimesPassword() {
-        guard !aimesUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            settingsStatus = "❌ 请先填写并保存 AIMES 用户名。"
-            return
+        if !jdyPassword.isEmpty {
+            saveJdyPassword()
         }
-        guard !aimesPassword.isEmpty else {
-            settingsStatus = "❌ 请输入新的 AIMES 密码。"
-            return
-        }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = [
-            "add-generic-password", "-U", "-a", aimesUsername,
-            "-s", "com.pacificpride.traveler-assistant.aimes", "-w", aimesPassword,
-        ]
-        do {
-            try process.run()
-            process.waitUntilExit()
-            if process.terminationStatus == 0 {
-                aimesPassword = ""
-                settingsStatus = "✅ AIMES 密码已更新到 macOS 钥匙串。"
-            } else {
-                settingsStatus = "❌ 钥匙串未能保存 AIMES 密码。"
-            }
-        } catch {
-            settingsStatus = "❌ 无法调用 macOS 钥匙串：\(error.localizedDescription)"
+        if !aimesPassword.isEmpty {
+            saveAimesPassword()
+        } else if settingsStatus.hasPrefix("✅") {
+            settingsStatus = "✅ 常规设置已保存；未修改钥匙串密码。"
         }
     }
 
     func saveJdyPassword() {
-        guard !jdyUsername.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        logUserAction("点击更新库存系统钥匙串密码", details: ["input_present": !jdyPassword.isEmpty])
+        let account = jdyUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !account.isEmpty else {
             settingsStatus = "❌ 请先填写并保存库存系统用户名。"
             return
         }
@@ -497,27 +1171,689 @@ final class AppModel: ObservableObject {
             settingsStatus = "❌ 请输入新的库存系统密码。"
             return
         }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = [
-            "add-generic-password", "-U", "-a", jdyUsername,
-            "-s", "com.pacificpride.workflow-assistant.jdy", "-w", jdyPassword,
+        let service = "com.pacificpride.workflow-assistant.jdy"
+        let baseIdentity: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
         ]
-        do {
-            try process.run()
-            process.waitUntilExit()
-            if process.terminationStatus == 0 {
-                jdyPassword = ""
-                settingsStatus = "✅ 库存系统密码已更新到 macOS 钥匙串。"
-            } else {
-                settingsStatus = "❌ 钥匙串未能保存库存系统密码。"
+        var dataProtectionIdentity = baseIdentity
+        dataProtectionIdentity[kSecUseDataProtectionKeychain as String] = true
+        SecItemDelete(dataProtectionIdentity as CFDictionary)
+        var identity = baseIdentity
+        identity[kSecUseDataProtectionKeychain as String] = false
+        guard let passwordData = jdyPassword.data(using: .utf8) else {
+            settingsStatus = "❌ 密码无法转换为钥匙串数据。"
+            return
+        }
+        let update: [String: Any] = [kSecValueData as String: passwordData]
+        var status = SecItemUpdate(identity as CFDictionary, update as CFDictionary)
+        if status == errSecItemNotFound {
+            var item = identity
+            item[kSecValueData as String] = passwordData
+            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+            status = SecItemAdd(item as CFDictionary, nil)
+        }
+        guard status == errSecSuccess else {
+            settingsStatus = "❌ 库存系统密码没有保存成功。请确认已登录 macOS 用户账户，并允许 App 使用钥匙串后重试。"
+            return
+        }
+        var verification = identity
+        verification[kSecReturnData as String] = true
+        verification[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        let verifyStatus = SecItemCopyMatching(verification as CFDictionary, &result)
+        guard verifyStatus == errSecSuccess, result is Data else {
+            settingsStatus = "❌ 库存系统密码保存后未能通过验证。请重新输入并保存；仍失败时检查 App 的钥匙串访问权限。"
+            return
+        }
+        jdyPassword = ""
+        settingsStatus = "✅ 库存系统密码已保存到本机登录钥匙串，并通过回读验证。"
+    }
+
+    func saveAimesPassword() {
+        logUserAction("点击保存 AIMES 密码", details: ["input_present": !aimesPassword.isEmpty])
+        let account = aimesUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !account.isEmpty else { settingsStatus = "❌ 请先填写 AIMES 用户名。"; return }
+        guard !aimesPassword.isEmpty else { settingsStatus = "❌ 请输入 AIMES 密码。"; return }
+        saveSettings()
+        let service = "com.pacificpride.ppflowhub.aimes"
+        let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
+        SecItemDelete(base as CFDictionary)
+        var item = base
+        item[kSecValueData as String] = aimesPassword.data(using: .utf8)
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else {
+            settingsStatus = "❌ AIMES 密码保存失败。"
+            return
+        }
+        aimesPassword = ""
+        settingsStatus = "✅ AIMES 密码已保存到 macOS 钥匙串。"
+    }
+
+    private func applyDashboardObject(_ object: [String: Any], includeChanges: Bool = true) {
+        applyDashboardOperationTrace(object)
+        applyCurrentIssues(from: object)
+        let rows = object["orders"] as? [[String: Any]] ?? []
+        dashboardOrders = rows.compactMap { row in
+            guard let orderID = row["order_id"] as? String, !orderID.isEmpty else { return nil }
+            let factories = (row["factories"] as? [[String: Any]] ?? []).compactMap { factory -> OrderDashboardFactory? in
+                guard let number = factory["factory_order"] as? String, !number.isEmpty else { return nil }
+                return OrderDashboardFactory(
+                    id: number,
+                    factoryOrder: number,
+                    orderId: factory["order_id"] as? String ?? orderID,
+                    orderName: factory["order_name"] as? String ?? "",
+                    nameSource: factory["name_source"] as? String ?? "",
+                    reportState: factory["report_state"] as? String ?? "未发现",
+                    ownershipStatus: factory["ownership_status"] as? String ?? "待确认",
+                    hasHardware: (factory["has_hardware"] as? NSNumber)?.boolValue ?? false,
+                    optimized: (factory["optimized"] as? NSNumber)?.boolValue ?? false,
+                    outboundStatus: factory["outbound_status"] as? String ?? "未查询",
+                    outboundDocument: factory["outbound_document"] as? String ?? ""
+                )
             }
-        } catch {
-            settingsStatus = "❌ 无法调用 macOS 钥匙串：\(error.localizedDescription)"
+            let number = { (key: String) -> Int in
+                (row[key] as? NSNumber)?.intValue ?? 0
+            }
+            return OrderDashboardItem(
+                id: orderID,
+                orderId: orderID,
+                orderType: row["order_type"] as? String ?? "owned",
+                sourceFolder: row["source_folder"] as? String ?? "",
+                modifiedAt: row["modified_at"] as? String ?? "",
+                validationStatus: row["validation_status"] as? String ?? "待同步",
+                validationMessage: {
+                    let message = row["validation_message"] as? String ?? ""
+                    return message.isEmpty
+                        ? ""
+                        : businessFriendlyMessage(message, operation: "校验订单")
+                }(),
+                stage: row["stage"] as? String ?? "已设计",
+                materialStatus: row["material_status"] as? String ?? "待校验",
+                factoryCount: number("factory_count"),
+                optimizedCount: number("optimized_count"),
+                shippedCount: number("shipped_count"),
+                optimizationProgress: row["optimization_progress"] as? String ?? "—",
+                outboundProgress: row["outbound_progress"] as? String ?? "—",
+                factories: factories
+            )
+        }
+        guard includeChanges else { return }
+        dashboardChanges = (object["changes"] as? [[String: Any]] ?? []).compactMap {
+            guard let message = $0["message"] as? String else { return nil }
+            return businessFriendlyMessage(message, operation: "处理 Server 变化")
+        }
+        dashboardActivity = dashboardActivitySteps(object)
+    }
+
+    private func applyCurrentIssues(from object: [String: Any]) {
+        guard let rows = object["current_issues"] as? [[String: Any]] else { return }
+        currentIssues = rows.compactMap { row in
+            guard let issueKey = row["issue_key"] as? String, !issueKey.isEmpty else { return nil }
+            return CurrentIssue(
+                id: issueKey,
+                kind: row["kind"] as? String ?? "",
+                orderId: row["order_id"] as? String ?? "",
+                factoryOrder: row["factory_order"] as? String ?? "",
+                path: row["path"] as? String ?? "",
+                message: row["message"] as? String ?? "当前问题需要处理",
+                firstSeen: row["first_seen"] as? String ?? "",
+                lastSeen: row["last_seen"] as? String ?? ""
+            )
+        }
+    }
+
+    private func applyDashboardOperationTrace(_ object: [String: Any]) {
+        guard let trace = object["operation_trace"] as? [String: Any] else { return }
+        for entry in trace {
+            guard let details = entry.value as? [String] else { continue }
+            var merged = dashboardOperationDetails[entry.key] ?? []
+            for detail in details where !merged.contains(detail) {
+                merged.append(detail)
+            }
+            dashboardOperationDetails[entry.key] = merged
+        }
+    }
+
+    private func applyAimesReviewObject(_ object: [String: Any], presentIfNeeded: Bool = true) {
+        pendingAimesReviews = aimesReviewItems(object, key: "aimes_issues")
+        ignoredAimesFactories = aimesReviewItems(object, key: "ignored_aimes")
+        assignedAimesFactories = aimesReviewItems(object, key: "assigned_aimes")
+        aimesWarnings = object["aimes_warnings"] as? [[String: Any]] ?? []
+        aimesFormatWarnings = aimesReviewItemsFromWarnings(aimesWarnings)
+        selectedAimesReviewIDs.formIntersection(Set(pendingAimesReviews.map(\.id)))
+        if presentIfNeeded && pendingAimesReviews.isEmpty && !aimesFormatWarnings.isEmpty {
+            showAimesReviewPrompt = true
+        }
+        if shouldPresentPendingCenterAfterAimes(
+            presentIfNeeded: presentIfNeeded,
+            pendingAimesReviews: pendingAimesReviews
+        ) {
+            showPendingCenterPrompt = true
+        }
+    }
+
+    private func closePendingCenterIfEmpty() {
+        if pendingCenterItems.isEmpty {
+            showPendingCenterPrompt = false
+        }
+    }
+
+    private func beginDashboardOperation(_ source: String, label: String, continuing: Bool = false) {
+        if !continuing {
+            dashboardOperationStageDurations[source] = []
+            dashboardOperationDurations[source] = 0
+            dashboardOperationDetails[source] = []
+        }
+        dashboardOperationStartedAt[source] = DashboardOperationStart(label: label, startedAt: Date())
+    }
+
+    private func finishDashboardOperation(_ source: String) {
+        guard let start = dashboardOperationStartedAt.removeValue(forKey: source) else { return }
+        let duration = max(0, Date().timeIntervalSince(start.startedAt))
+        var stages = dashboardOperationStageDurations[source] ?? []
+        stages.append(DashboardOperationDuration(label: start.label, duration: duration))
+        dashboardOperationStageDurations[source] = stages
+        dashboardOperationDurations[source] = stages.reduce(0) { $0 + $1.duration }
+    }
+
+    private func applyAuthoritativeDashboardTiming(
+        _ source: String,
+        seconds: Double,
+        stages: [[String: Any]]
+    ) {
+        let duration = max(0, seconds)
+        dashboardOperationDurations[source] = duration
+        let parsed = stages.compactMap { stage -> DashboardOperationDuration? in
+            guard let label = stage["label"] as? String, !label.isEmpty else { return nil }
+            let duration = (stage["duration_seconds"] as? NSNumber)?.doubleValue ?? 0
+            return DashboardOperationDuration(label: label, duration: duration)
+        }
+        dashboardOperationStageDurations[source] = parsed.isEmpty
+            ? [DashboardOperationDuration(label: "后台返回总耗时", duration: duration)]
+            : parsed
+    }
+
+    func startOrderDashboard() {
+        guard !dashboardStartupStarted else { return }
+        dashboardStartupStarted = true
+        loadOrderDashboardCache()
+    }
+
+    func loadOrderDashboardCache() {
+        beginDashboardOperation("sync", label: "读取本地订单缓存")
+        dashboardSyncStatus = "正在读取本地订单缓存…"
+        runOrder(["list-index"], onFailure: {
+            self.finishDashboardOperation("sync")
+            self.dashboardStartupStarted = false
+            self.dashboardSyncStatus = "⚠️ \(businessFriendlyMessage(self.orderError, operation: "读取本地订单缓存"))"
+        }) { object in
+            self.finishDashboardOperation("sync")
+            self.applyDashboardObject(object, includeChanges: false)
+            // The cache is only an initial display snapshot.  Do not open the
+            // actionable pending center until the following AIMES/Server
+            // startup refresh has completed; otherwise the sheet opens while
+            // orderRunning is still true and presents stale data as locked UI.
+            self.applyAimesReviewObject(object, presentIfNeeded: false)
+            self.dashboardSyncStatus = "✅ 已显示本地缓存；正在后台检查数据"
+            self.runDailyBackupAfterLocalCache {
+                self.syncDashboardAimes(force: false, scanServerAfter: true)
+            }
+        }
+    }
+
+    private func runDailyBackupAfterLocalCache(completion: @escaping () -> Void) {
+        runOrder(["backup-status"], failureStatus: "数据库备份状态检查失败", onFailure: {
+            let message = businessFriendlyMessage(self.orderError, operation: "检查数据库备份")
+            self.backupReminderStatus = message
+            self.showBackupReminder = true
+            completion()
+        }) { object in
+            guard object["requires_user_attention"] as? Bool == true else {
+                completion()
+                return
+            }
+            self.backupReminderStatus = "今日尚无成功的本机数据库备份，正在自动备份…"
+            self.runOrder(["backup-now"], failureStatus: "数据库备份失败", onFailure: {
+                let message = businessFriendlyMessage(self.orderError, operation: "自动数据库备份")
+                self.backupReminderStatus = message
+                self.showBackupReminder = true
+                completion()
+            }) { object in
+                let path = object["path"] as? String ?? self.databaseBackupRoot
+                self.backupReminderStatus = "✅ 今日数据库备份已完成：\(path)"
+                completion()
+            }
+        }
+    }
+
+    func autoResolveCurrentIssue(_ issue: CurrentIssue) {
+        guard !orderRunning else { return }
+        beginDashboardOperation("sync", label: "自动处理当前问题")
+        dashboardSyncStatus = "正在自动处理当前问题：\(issue.factoryOrder.isEmpty ? issue.message : issue.factoryOrder)…"
+        runOrder(["auto-resolve-issue", "--issue-key", issue.id], onFailure: {
+            self.finishDashboardOperation("sync")
+            self.dashboardSyncStatus = "⚠️ \(businessFriendlyMessage(self.orderError, operation: "自动处理当前问题"))"
+        }) { object in
+            self.finishDashboardOperation("sync")
+            self.applyDashboardObject(object, includeChanges: false)
+            self.closePendingCenterIfEmpty()
+            self.dashboardSyncStatus = self.pendingCenterItems.isEmpty ? "✅ 当前问题已自动处理" : "⚠️ 待处理中心仍有项目需要处理"
+        }
+    }
+
+    func resolveCurrentIssue(_ issue: CurrentIssue, orderID: String) {
+        let trimmed = orderID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard (issue.kind != "factory_ownership" || !trimmed.isEmpty), !orderRunning else { return }
+        beginDashboardOperation("sync", label: "保存人工归属")
+        dashboardSyncStatus = "正在保存 \(issue.factoryOrder) 的人工归属…"
+        var arguments = ["resolve-issue", "--issue-key", issue.id]
+        if !trimmed.isEmpty { arguments += ["--order-id", trimmed] }
+        runOrder(arguments, onFailure: {
+            self.finishDashboardOperation("sync")
+            self.dashboardSyncStatus = "⚠️ \(businessFriendlyMessage(self.orderError, operation: "确认工厂单归属"))"
+        }) { object in
+            self.finishDashboardOperation("sync")
+            self.applyDashboardObject(object, includeChanges: false)
+            self.closePendingCenterIfEmpty()
+            self.dashboardSyncStatus = self.pendingCenterItems.isEmpty ? "✅ 当前问题已处理" : "⚠️ 待处理中心仍有项目需要处理"
+        }
+    }
+
+    func syncDashboardAimes(force: Bool, scanServerAfter: Bool = false) {
+        logUserAction(force ? "点击再次获取 AIMES" : "触发 AIMES 后台获取", details: ["force": force])
+        beginDashboardOperation("aimes", label: "获取 AIMES")
+        dashboardAimesStatus = force ? "正在获取 AIMES…" : "正在检查今日 AIMES 获取记录…"
+        let arguments = force
+            ? ["sync-aimes", "--refresh-aimes"]
+            : ["sync-aimes", "--aimes-if-needed"]
+        runOrder(arguments, onFailure: {
+            self.finishDashboardOperation("aimes")
+            let message = businessFriendlyMessage(self.orderError, operation: "获取 AIMES 数据")
+            self.aimesFailureAlert = message
+            self.dashboardAimesStatus = "⚠️ \(message)"
+            self.dashboardSyncStatus = self.dashboardAimesStatus
+            if scanServerAfter { self.scanDashboardServer(background: true) }
+        }) { object in
+            self.finishDashboardOperation("aimes")
+            if let aimes = object["aimes"] as? [String: Any],
+               let seconds = aimes["duration_seconds"] as? NSNumber {
+                self.applyAuthoritativeDashboardTiming(
+                    "aimes",
+                    seconds: seconds.doubleValue,
+                    stages: object["aimes_stage_durations"] as? [[String: Any]] ?? []
+                )
+            }
+            self.applyAimesReviewObject(object, presentIfNeeded: !scanServerAfter)
+            let aimes = object["aimes"] as? [String: Any] ?? [:]
+            let attempted = (aimes["attempted"] as? NSNumber)?.boolValue ?? false
+            let succeeded = (aimes["succeeded"] as? NSNumber)?.boolValue ?? false
+            let skipped = (aimes["skipped_today"] as? NSNumber)?.boolValue ?? false
+            let changed = (aimes["changed"] as? NSNumber)?.boolValue ?? false
+            let count = (aimes["count"] as? NSNumber)?.intValue ?? 0
+            let issueCount = (aimes["issue_count"] as? NSNumber)?.intValue ?? self.pendingAimesReviews.count
+            let warningCount = (aimes["warning_count"] as? NSNumber)?.intValue
+                ?? ((object["aimes_warnings"] as? [[String: Any]])?.count ?? 0)
+            let error = aimes["error"] as? String ?? ""
+            if succeeded && changed {
+                self.applyDashboardObject(object)
+            }
+            if warningCount > 0 {
+                self.dashboardAimesStatus = "⚠️ 获取 AIMES 数据成功，发现 \(warningCount) 条销售单格式异常，已跳过且未写入数据库"
+            } else if issueCount > 0 {
+                self.dashboardAimesStatus = "⚠️ 获取 AIMES 数据成功，有 \(issueCount) 条工厂单需要人工确认"
+            } else if succeeded && changed {
+                self.dashboardAimesStatus = "✅ 获取 AIMES 数据成功，已更新最近 50 条（\(count) 条）"
+            } else if skipped {
+                self.dashboardAimesStatus = "✅ 今天已成功获取过 AIMES，本次略过"
+            } else if succeeded && attempted {
+                self.dashboardAimesStatus = "✅ 获取 AIMES 数据成功，最近 50 条无变化（\(count) 条）"
+            } else {
+                let message = businessFriendlyMessage(error, operation: "获取 AIMES 数据")
+                if attempted && !succeeded {
+                    self.aimesFailureAlert = message
+                }
+                self.dashboardAimesStatus = "⚠️ 尝试获取 AIMES 数据失败：\(message)"
+            }
+            self.dashboardSyncStatus = self.dashboardAimesStatus
+            if scanServerAfter { self.scanDashboardServer(background: true) }
+        }
+    }
+
+    func toggleAimesReviewSelection(_ item: AimesReviewItem) {
+        logUserAction("点击选择 AIMES 待确认记录")
+        if selectedAimesReviewIDs.contains(item.id) {
+            selectedAimesReviewIDs.remove(item.id)
+        } else {
+            selectedAimesReviewIDs.insert(item.id)
+        }
+    }
+
+    func ignoreSelectedAimesFactories() {
+        logUserAction("点击忽略选中的 AIMES 工厂单")
+        let keys = pendingAimesReviews
+            .filter { selectedAimesReviewIDs.contains($0.id) }
+            .map(\.ignoreKey)
+        guard !keys.isEmpty else { return }
+        var arguments = ["ignore-aimes"]
+        for key in keys {
+            arguments += ["--ignore-key", key]
+        }
+        beginDashboardOperation("aimes", label: "保存 AIMES 忽略记录")
+        dashboardAimesStatus = "正在保存 AIMES 忽略记录…"
+        runOrder(arguments, failureStatus: "AIMES 忽略记录保存失败", onFailure: {
+            self.finishDashboardOperation("aimes")
+            self.dashboardAimesStatus = "⚠️ \(businessFriendlyMessage(self.orderError, operation: "保存 AIMES 忽略记录"))"
+        }) { object in
+            self.finishDashboardOperation("aimes")
+            self.applyDashboardObject(object)
+            self.applyAimesReviewObject(object, presentIfNeeded: false)
+            self.selectedAimesReviewIDs.removeAll()
+            self.dashboardAimesStatus = "✅ 已忽略 \(keys.count) 条 AIMES 工厂单"
+            self.dashboardSyncStatus = self.dashboardAimesStatus
+            self.closePendingCenterIfEmpty()
+        }
+    }
+
+    func restoreAimesFactory(_ item: AimesReviewItem) {
+        logUserAction("点击恢复 AIMES 工厂单提醒", details: ["factory_order_present": !item.factoryOrder.isEmpty])
+        beginDashboardOperation("aimes", label: "恢复 AIMES 忽略记录")
+        dashboardAimesStatus = "正在恢复 AIMES 工厂单提醒…"
+        runOrder(
+            ["restore-aimes-ignore", "--ignore-key", item.ignoreKey],
+            failureStatus: "AIMES 忽略记录恢复失败",
+            onFailure: {
+                self.finishDashboardOperation("aimes")
+                self.dashboardAimesStatus = "⚠️ \(businessFriendlyMessage(self.orderError, operation: "恢复 AIMES 工厂单提醒"))"
+            }
+        ) { object in
+            self.finishDashboardOperation("aimes")
+            self.applyDashboardObject(object)
+            self.applyAimesReviewObject(object, presentIfNeeded: false)
+            self.dashboardAimesStatus = "✅ 已恢复 \(item.factoryOrder.isEmpty ? "所选记录" : item.factoryOrder)，下次获取时重新校验"
+            self.dashboardSyncStatus = self.dashboardAimesStatus
+        }
+    }
+
+    func assignAimesFactoryToSuggestedOrder(_ item: AimesReviewItem) {
+        guard !item.suggestedOrderID.isEmpty else { return }
+        assignAimesFactoryToOrder(item, orderID: item.suggestedOrderID)
+    }
+
+    func assignAimesFactoryToOrder(_ item: AimesReviewItem, orderID: String) {
+        let trimmedOrderID = orderID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !trimmedOrderID.isEmpty else { return }
+        logUserAction("点击确认 AIMES 工厂单归属", details: [
+            "suggestion_present": !item.suggestedOrderID.isEmpty,
+            "manual_order_id": trimmedOrderID,
+        ])
+        beginDashboardOperation("aimes", label: "确认 AIMES 工厂单归属")
+        dashboardAimesStatus = "正在确认 \(item.factoryOrder) 的订单归属…"
+        runOrder(
+            [
+                "assign-aimes-order",
+                "--ignore-key", item.ignoreKey,
+                "--order-id", trimmedOrderID,
+            ],
+            failureStatus: "AIMES 工厂单归属保存失败",
+            onFailure: {
+                self.finishDashboardOperation("aimes")
+                self.dashboardAimesStatus = "⚠️ \(businessFriendlyMessage(self.orderError, operation: "保存 AIMES 工厂单归属"))"
+            }
+        ) { object in
+            self.finishDashboardOperation("aimes")
+            self.applyDashboardObject(object)
+            self.applyAimesReviewObject(object, presentIfNeeded: false)
+            self.showAimesReviewPrompt = false
+            self.dashboardAimesStatus = trimmedOrderID == item.suggestedOrderID
+                ? "✅ 已将 \(item.factoryOrder) 按建议归入 \(trimmedOrderID)"
+                : "✅ 已将 \(item.factoryOrder) 手工归入 \(trimmedOrderID)"
+            self.dashboardSyncStatus = self.dashboardAimesStatus
+            self.closePendingCenterIfEmpty()
+        }
+    }
+
+    func restoreAimesFactoryAssignment(_ item: AimesReviewItem) {
+        logUserAction("点击撤销 AIMES 工厂单归属")
+        beginDashboardOperation("aimes", label: "撤销 AIMES 工厂单归属")
+        dashboardAimesStatus = "正在撤销 \(item.factoryOrder) 的建议归属…"
+        runOrder(
+            ["restore-aimes-assignment", "--ignore-key", item.ignoreKey],
+            failureStatus: "AIMES 建议归属撤销失败",
+            onFailure: {
+                self.finishDashboardOperation("aimes")
+                self.dashboardAimesStatus = "⚠️ \(businessFriendlyMessage(self.orderError, operation: "撤销 AIMES 工厂单归属"))"
+            }
+        ) { object in
+            self.finishDashboardOperation("aimes")
+            self.applyDashboardObject(object)
+            self.applyAimesReviewObject(object, presentIfNeeded: false)
+            self.dashboardAimesStatus = "✅ 已撤销 \(item.factoryOrder) 的建议归属"
+            self.dashboardSyncStatus = self.dashboardAimesStatus
+        }
+    }
+
+    func scanDashboardServer(background: Bool = false) {
+        logUserAction(background ? "触发后台扫描 Server" : "点击扫描 Server", details: ["background": background])
+        beginDashboardOperation("server", label: "扫描 Server")
+        dashboardServerStatus = background ? "正在后台扫描 Server 变化…" : "正在扫描 Server 变化…"
+        runOrder(["scan-server"], onFailure: {
+            self.finishDashboardOperation("server")
+            self.dashboardServerStatus = "⚠️ \(businessFriendlyMessage(self.orderError, operation: "扫描 Server"))"
+            self.dashboardSyncStatus = self.dashboardServerStatus
+        }) { object in
+            self.finishDashboardOperation("server")
+            let server = object["server"] as? [String: Any] ?? [:]
+            self.applyCurrentIssues(from: object)
+            self.applyDashboardOperationTrace(object)
+            let rows = server["changes"] as? [[String: Any]] ?? []
+            self.pendingServerChanges = serverChangePreviews(rows)
+            self.selectedServerFolderPaths.removeAll()
+            // Refresh the local index even when the lightweight scan found
+            // actionable changes. This updates statuses from already-present
+            // production evidence, while keeping the pending folder list for
+            // explicit user approval; it never processes outbound here.
+            self.refreshDashboardIndexAfterServerScan(
+                hasPendingChanges: !self.pendingServerChanges.isEmpty,
+                snapshotPath: server["snapshot_path"] as? String
+            )
+        }
+    }
+
+    private func refreshDashboardIndexAfterServerScan(hasPendingChanges: Bool, snapshotPath: String?) {
+        beginDashboardOperation("server", label: "更新 Server 订单索引", continuing: true)
+        dashboardServerStatus = "正在更新 Server 订单索引…"
+        dashboardSyncStatus = dashboardServerStatus
+        let failureStatus = "更新 Server 订单索引失败"
+        var arguments = ["sync-index"]
+        if let snapshotPath, !snapshotPath.isEmpty {
+            arguments += ["--server-snapshot", snapshotPath]
+        }
+        runOrder(arguments, failureStatus: failureStatus, onFailure: {
+            self.finishDashboardOperation("server")
+            self.dashboardServerStatus = "⚠️ \(dashboardFailureMessage(failureStatus, rawError: self.orderError, operation: "更新 Server 订单索引"))"
+            self.dashboardSyncStatus = self.dashboardServerStatus
+        }) { object in
+            self.finishDashboardOperation("server")
+            self.applyDashboardObject(object, includeChanges: false)
+            self.applyAimesReviewObject(object, presentIfNeeded: false)
+            if hasPendingChanges {
+                self.dashboardServerStatus = "⚠️ Server 发现 \(self.pendingServerChanges.count) 项待处理变化"
+                self.dashboardSyncStatus = "✅ 已扫描自有订单和来料加工目录；订单索引已更新"
+                self.showPendingCenterPrompt = true
+            } else {
+                self.closePendingCenterIfEmpty()
+                self.dashboardServerStatus = "✅ Server 扫描完成，没有待处理变化"
+                self.dashboardSyncStatus = "✅ 已扫描自有订单和来料加工目录；订单索引已更新"
+            }
+        }
+    }
+
+    func toggleServerFolderSelection(_ folderPath: String) {
+        logUserAction("点击选择 Server 文件夹")
+        guard let group = serverFolderChangeGroups(pendingServerChanges).first(where: { $0.folderPath == folderPath }),
+              !group.requiresManualReview else { return }
+        if selectedServerFolderPaths.contains(folderPath) {
+            selectedServerFolderPaths.remove(folderPath)
+        } else {
+            selectedServerFolderPaths.insert(folderPath)
+        }
+    }
+
+    func selectAllServerFolders() {
+        logUserAction("点击全选 Server 文件夹")
+        selectedServerFolderPaths = Set(
+            serverFolderChangeGroups(pendingServerChanges)
+                .filter { !$0.requiresManualReview }
+                .map(\.folderPath)
+        )
+    }
+
+    func clearServerFolderSelection() {
+        logUserAction("点击取消全选 Server 文件夹")
+        selectedServerFolderPaths.removeAll()
+    }
+
+    func processPendingServerChanges() {
+        logUserAction("点击自动处理待处理 Server 变化")
+        let selectedFolders = selectedServerFolderPaths
+        let selectedCount = serverFolderChangeGroups(pendingServerChanges)
+            .filter { selectedFolders.contains($0.folderPath) && !$0.requiresManualReview }
+            .count
+        guard selectedCount > 0 else {
+            dashboardServerStatus = "⚠️ 请先选择要自动处理的文件夹"
+            dashboardSyncStatus = dashboardServerStatus
+            showPendingCenterPrompt = true
+            return
+        }
+        beginDashboardOperation("server", label: "处理 Server 变化")
+        showPendingCenterPrompt = false
+        dashboardServerStatus = "正在自动处理 Server 变化、解析报表并准备出库…"
+        dashboardSyncStatus = dashboardServerStatus
+        var arguments = ["process-server-changes"]
+        arguments += ["--include-hardware", includeHardwareForServerProcessing ? "true" : "false"]
+        for folder in selectedFolders.sorted() {
+            arguments += ["--server-folder", folder]
+        }
+        runOrder(arguments, failureStatus: "Server 变化处理失败", onFailure: {
+            self.finishDashboardOperation("server")
+            self.dashboardServerStatus = "⚠️ \(businessFriendlyMessage(self.orderError, operation: "处理 Server 变化"))"
+            self.dashboardSyncStatus = self.dashboardServerStatus
+            self.dashboardActivity.insert(
+                InventoryStep(
+                    time: dashboardClockTime(),
+                    title: "Server 变化处理",
+                    detail: self.dashboardServerStatus,
+                    state: "failure",
+                    paths: selectedFolders.sorted()
+                ),
+                at: 0
+            )
+        }) { object in
+            self.finishDashboardOperation("server")
+            // This is a user-approved processing action.  Show its result in
+            // the main dashboard; only a background scan may open the sheet.
+            self.applyDashboardObject(object)
+            self.applyAimesReviewObject(object, presentIfNeeded: false)
+            let pendingRows = object["pending_server_changes"] as? [[String: Any]] ?? []
+            self.pendingServerChanges = serverChangePreviews(pendingRows)
+            let failedCount = (object["temporary_processing"] as? [String: Any])?["failed"] as? [[String: Any]] ?? []
+            self.dashboardServerStatus = self.pendingServerChanges.isEmpty
+                ? "✅ Server 变化已处理（\(selectedCount) 个文件夹）"
+                : "⚠️ Server 已处理（\(selectedCount) 个文件夹），仍有 \(self.pendingServerChanges.count) 项待处理"
+            if !failedCount.isEmpty {
+                self.dashboardServerStatus = "⚠️ 有 \(failedCount.count) 个临时文件夹解析或出库失败，已保留待处理"
+            }
+            self.dashboardSyncStatus = self.dashboardServerStatus
+            self.selectedServerFolderPaths = self.selectedServerFolderPaths.intersection(
+                Set(serverFolderChangeGroups(self.pendingServerChanges).map(\.folderPath))
+            )
+        }
+    }
+
+    private func applyServerIndexResult(_ object: [String: Any]) {
+        applyDashboardObject(object, includeChanges: true)
+        applyAimesReviewObject(object)
+    }
+
+    func prepareSelectedServerFolder(_ folderURL: URL) {
+        pendingServerFolderURL = folderURL
+        includeHardwareForServerProcessing = true
+        showServerProcessingOptions = true
+    }
+
+    func processSelectedServerFolder(_ folderURL: URL, includeHardware: Bool) {
+        logUserAction("点击处理 Server 文件夹", details: ["include_hardware": includeHardware])
+        guard !orderRunning else { return }
+        let folderPath = folderURL.standardizedFileURL.path
+        let folderName = folderURL.lastPathComponent
+        let hasSecurityScope = folderURL.startAccessingSecurityScopedResource()
+        beginDashboardOperation("server", label: "解析 Server 文件夹")
+        showPendingCenterPrompt = false
+        dashboardServerStatus = "正在解析 Server 文件夹：\(folderName)…"
+        dashboardSyncStatus = dashboardServerStatus
+        runOrder(
+            [
+                "process-server-folder", "--folder", folderPath,
+                "--include-hardware", includeHardware ? "true" : "false",
+                "--process-temporary",
+            ],
+            failureStatus: "Server 文件夹处理失败",
+            onFailure: {
+                self.finishDashboardOperation("server")
+                if hasSecurityScope { folderURL.stopAccessingSecurityScopedResource() }
+                self.dashboardSyncStatus = self.dashboardServerStatus
+                self.dashboardActivity.insert(
+                    InventoryStep(
+                        time: dashboardClockTime(),
+                        title: "Server 文件夹处理",
+                        detail: self.dashboardSyncStatus,
+                        state: "failure",
+                        paths: [folderPath]
+                    ),
+                    at: 0
+                )
+            }
+        ) { object in
+            self.finishDashboardOperation("server")
+            if hasSecurityScope { folderURL.stopAccessingSecurityScopedResource() }
+            self.applyDashboardObject(object)
+            self.applyAimesReviewObject(object, presentIfNeeded: false)
+            let prefix = folderPath.hasSuffix("/") ? folderPath : folderPath + "/"
+            self.pendingServerChanges.removeAll { $0.path == folderPath || $0.path.hasPrefix(prefix) }
+            self.dashboardServerStatus = "✅ 已解析 Server 文件夹：\(folderName)"
+            self.dashboardSyncStatus = self.dashboardServerStatus
+        }
+    }
+
+    func ignoreServerFolder(_ folderPath: String) {
+        logUserAction("点击忽略 Server 文件夹")
+        guard !orderRunning else { return }
+        beginDashboardOperation("server", label: "记录 Server 忽略设置")
+        dashboardServerStatus = "正在记录忽略设置：(URL(fileURLWithPath: folderPath).lastPathComponent)…"
+        dashboardSyncStatus = dashboardServerStatus
+        runOrder(
+            ["ignore-server-folder", "--folder", folderPath],
+            failureStatus: "忽略 Server 文件夹失败",
+            onFailure: {
+                self.finishDashboardOperation("server")
+                self.dashboardSyncStatus = "⚠️ \(businessFriendlyMessage(self.orderError, operation: "忽略 Server 文件夹"))"
+            }
+        ) { object in
+            self.finishDashboardOperation("server")
+            self.applyCurrentIssues(from: object)
+            let rows = object["pending_server_changes"] as? [[String: Any]] ?? []
+            self.pendingServerChanges = serverChangePreviews(rows)
+            self.selectedServerFolderPaths.remove(folderPath)
+            self.closePendingCenterIfEmpty()
+            self.dashboardServerStatus = "✅ 已忽略文件夹；未来一个月内发生变化会重新提醒"
+            self.dashboardSyncStatus = self.dashboardServerStatus
         }
     }
 
     func loadInventory() {
+        logUserAction("点击刷新 Traveler 列表")
         beginInventoryOperation("刷新 Traveler 列表")
         addInventoryStep("读取订单目录", "正在查找 Work Order Traveler 文件", "running")
         runInventory(["list-names"]) { object in
@@ -537,7 +1873,10 @@ final class AppModel: ObservableObject {
             let errors = object["errors"] as? [[String: Any]] ?? []
             self.inventoryErrors = errors.map {
                 let file = URL(fileURLWithPath: $0["path"] as? String ?? "").lastPathComponent
-                let message = $0["message"] as? String ?? "Traveler 格式异常"
+                let message = businessFriendlyMessage(
+                    $0["message"] as? String ?? "Traveler 格式异常，请检查文件内容后重试。",
+                    operation: "读取 Traveler"
+                )
                 return file.isEmpty ? message : "\(file)：\(message)"
             }
             if let catalog = object["catalog"] as? [String: Any],
@@ -552,18 +1891,138 @@ final class AppModel: ObservableObject {
                 self.addInventoryStep("发现异常文件", self.inventoryErrors.joined(separator: "；"), "warning")
             }
             self.finishRunningInventoryStep("Traveler 列表刷新完成", errors.isEmpty ? "success" : "warning")
+            self.activatePendingInventoryMapping()
+        }
+    }
+
+    func requestInventoryMapping(folderPath: String) {
+        let trimmed = folderPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        showPendingCenterPrompt = false
+        showServerChangesPrompt = false
+        pendingInventoryMappingFolder = trimmed
+        inventoryMappingRequestPath = trimmed
+    }
+
+    private func rereadPendingSourceFolder() {
+        guard !pendingInventoryMappingFolder.isEmpty else { return }
+        let candidate = URL(fileURLWithPath: pendingInventoryMappingFolder)
+        var isDirectory = ObjCBool(false)
+        let path = FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory) && isDirectory.boolValue
+            ? candidate.path
+            : candidate.deletingLastPathComponent().path
+        pendingInventoryMappingFolder = ""
+        beginDashboardOperation("server", label: "重新读取订单文件")
+        runOrder(["process-server-folder", "--folder", path, "--include-hardware", "true"], failureStatus: "重新读取订单文件失败", onFailure: {
+            self.finishDashboardOperation("server")
+            self.dashboardSyncStatus = "⚠️ \(businessFriendlyMessage(self.orderError, operation: "重新读取订单文件"))"
+        }) { object in
+            self.finishDashboardOperation("server")
+            self.applyDashboardObject(object)
+            self.dashboardSyncStatus = "✅ 已重新读取订单文件并更新数据库事实"
+        }
+    }
+
+    func activatePendingInventoryMapping() {
+        guard !pendingInventoryMappingFolder.isEmpty else { return }
+        guard !inventoryRunning else { return }
+        let folderName = URL(fileURLWithPath: pendingInventoryMappingFolder).lastPathComponent
+        let normalizedFolderName = folderName.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        let candidates = inventoryTravelers.filter { traveler in
+            let travelerFolder = URL(fileURLWithPath: traveler.id).deletingLastPathComponent().lastPathComponent
+            return travelerFolder.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current) == normalizedFolderName
+        }
+        guard let traveler = candidates.sorted(by: { $0.modifiedAt > $1.modifiedAt }).first else {
+            inventoryStatus = "未找到 (folderName) 对应的 Traveler，请先刷新 Traveler 列表"
+            return
+        }
+        inventoryMappingRequestPath = ""
+        selectedInventoryOrderID = ""
+        selectedInventoryPaths = [traveler.id]
+        inventoryPreviewRows = []
+        inventoryErrors = []
+        previewSelectedInventory()
+    }
+
+    func openInventoryChrome() {
+        guard !inventoryRunning else { return }
+        inventoryChromeStatus = "正在打开库存专用 Chrome…"
+        runInventory(["open-chrome"], manageRunning: false, onFailure: { reason in
+            self.inventoryChromeStatus = "❌ \(reason)"
+        }) { object in
+            if object["launched"] as? Bool == true {
+                self.inventoryChromeOpenedByApp = true
+            }
+            self.inventoryChromeStatus = ""
         }
     }
 
     func updateInventoryCatalog() {
+        logUserAction("点击更新商品资料")
         beginInventoryOperation("更新商品资料")
-        runInventory(["update-products"]) { object in
+        inventoryCatalogStatus = "正在更新商品资料…"
+        runInventory(["update-products"], onFailure: { reason in
+            let status = inventoryCatalogUpdateFailureStatus(reason)
+            self.inventoryCatalogStatus = status
+        }) { object in
             let count = object["count"] as? Int ?? 0
-            self.inventoryCatalogStatus = "\(count) 个商品 · 刚刚更新"
-            self.inventoryStatus = "商品资料更新完成"
-            self.finishRunningInventoryStep("已导出、校验并替换本地商品资料，共 \(count) 个商品", "success")
+            let added = object["added_count"] as? Int ?? 0
+            let updated = object["updated_count"] as? Int ?? 0
+            let removed = object["removed_count"] as? Int ?? 0
+            let status = inventoryCatalogUpdateSuccessStatus(
+                count,
+                added: added,
+                updated: updated,
+                removed: removed
+            )
+            self.inventoryCatalogStatus = status
+            self.inventoryStatus = status
+            self.finishRunningInventoryStep(
+                "已导出、校验并替换本地商品资料，共 \(count) 个商品；新增 \(added) 个，更新 \(updated) 个，删除 \(removed) 个",
+                "success"
+            )
         }
         inventoryStatus = "正在在线更新商品资料…"
+    }
+
+    func closeInventoryChromeOnQuit() {
+        guard inventoryChromeOpenedByApp else { return }
+        let command = projectRoot.appendingPathComponent("scripts/pp-flowhub")
+        let process = Process()
+        process.executableURL = command
+        process.arguments = ["inventory", "close-chrome"]
+        process.currentDirectoryURL = projectRoot
+        process.environment = ProcessInfo.processInfo.environment
+        do {
+            try process.run()
+            process.waitUntilExit()
+            OperationLogWriter.shared.record(
+                "inventory.chrome.close",
+                message: process.terminationStatus == 0
+                    ? "退出 App 时已关闭库存专用 Chrome"
+                    : "退出 App 时关闭库存专用 Chrome 失败",
+                details: ["exit_status": process.terminationStatus],
+                force: true
+            )
+        } catch {
+            OperationLogWriter.shared.record(
+                "inventory.chrome.close",
+                message: "退出 App 时无法关闭库存专用 Chrome",
+                details: ["error": error.localizedDescription],
+                force: true
+            )
+        }
+        inventoryChromeOpenedByApp = false
+    }
+
+    func refreshInventoryCatalogStatus() {
+        guard !inventoryRunning, inventoryCatalogStatus == "商品资料尚未检查" else { return }
+        runInventory(["list-names"], manageRunning: false) { object in
+            guard let catalog = object["catalog"] as? [String: Any],
+                  let count = catalog["count"] as? Int else { return }
+            let stale = catalog["stale"] as? Bool ?? false
+            self.inventoryCatalogStatus = "\(count) 个商品" + (stale ? " · 已超过30天，请更新" : " · 资料有效")
+        }
     }
 
     func refreshInventoryFolder(_ folder: String) {
@@ -626,8 +2085,22 @@ final class AppModel: ObservableObject {
     }
 
     func previewSelectedInventory() {
+        if !selectedInventoryOrderID.isEmpty {
+            previewOrderInventory(
+                orderID: selectedInventoryOrderID,
+                factoryOrderNames: Array(selectedInventoryDocumentRemarks),
+                factoryOrders: Array(selectedInventoryFactoryOrders)
+            )
+            return
+        }
+        inventorySteps.removeAll()
+        inventoryStderrBuffer = ""
+        inventoryRawErrors = ""
         inventoryPreviewRows = []
         inventoryErrors = []
+        inventoryWriteBlocked = false
+        inventoryWriteCompleted = false
+        selectedInventoryOrderID = ""
         beginInventoryOperation("预检所选 Traveler")
         let paths = Array(selectedInventoryPaths).sorted()
         guard !paths.isEmpty else {
@@ -636,28 +2109,122 @@ final class AppModel: ObservableObject {
             return
         }
         addInventoryStep("选择文件", "已选择 \(paths.count) 份 Traveler", "success")
-        previewNext(paths, index: 0, accumulated: [])
+        previewNext(
+            paths,
+            index: 0,
+            selectedDocumentRemarks: selectedInventoryDocumentRemarks,
+            accumulated: []
+        )
     }
 
-    func openAndFillSelectedInventory(confirmSave: Bool = false) {
+    func previewOrderInventory(
+        orderID: String,
+        factoryOrderNames: [String],
+        factoryOrders: [String] = []
+    ) {
+        selectedInventoryOrderID = orderID
+        selectedInventoryPaths = []
+        selectedInventoryDocumentRemarks = Set(factoryOrderNames.filter { !$0.isEmpty })
+        selectedInventoryFactoryOrders = Set(factoryOrders.filter { !$0.isEmpty })
+        inventorySteps.removeAll()
+        inventoryStderrBuffer = ""
+        inventoryRawErrors = ""
+        inventoryPreviewRows = []
+        inventoryErrors = []
+        inventoryWriteBlocked = false
+        inventoryWriteCompleted = false
+        beginInventoryOperation("预检订单出库数据")
+        addInventoryStep("读取数据库订单事实", "正在读取 " + orderID + " 的材料、封边和所选工厂单五金", "running")
+        var arguments = ["order-preview", "--order-id", orderID]
+        for factoryOrder in selectedInventoryFactoryOrders.sorted() {
+            arguments += ["--factory-order", factoryOrder]
+        }
+        runInventory(arguments) { object in
+            self.applyInventoryPreviewObject(object, accumulated: [])
+            self.inventoryStatus = self.inventoryErrors.isEmpty
+                ? "订单出库数据预检通过，共 " + String(self.inventoryPreviewRows.count) + " 行"
+                : "订单出库数据预检未通过，请先处理 " + String(self.inventoryErrors.count) + " 项异常"
+        }
+    }
+
+    func saveOutboundScope(
+        orderID: String,
+        scopeType: String,
+        requirement: String,
+        factoryOrder: String = "",
+        reason: String,
+        completion: @escaping (Bool) -> Void = { _ in }
+    ) {
+        guard !orderID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        var arguments = [
+            "set-outbound-scope",
+            "--order-id", orderID,
+            "--scope-type", scopeType,
+            "--requirement", requirement,
+        ]
+        if !factoryOrder.isEmpty { arguments += ["--factory-order", factoryOrder] }
+        if !reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            arguments += ["--reason", reason]
+        }
+        runInventory(arguments, onFailure: { message in
+            self.inventoryStatus = "❌ (message)"
+            completion(false)
+        }) { object in
+            self.inventoryStatus = "✅ 出库范围已保存"
+            self.addInventoryStep("保存出库范围", object["material"] != nil ? "订单材料范围已更新" : "工厂单出库范围已更新", "success")
+            completion(true)
+        }
+    }
+
+    func openAndFillSelectedInventory() {
+        logUserAction("点击确认写入库存系统", details: ["confirm_save": true])
         let paths = Array(selectedInventoryPaths).sorted()
-        guard paths.count == 1 else {
-            inventoryStatus = "浏览器模拟填写时请一次只选择一份 Traveler"
+        let orderID = selectedInventoryOrderID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !orderID.isEmpty || paths.count == 1 else {
+            inventoryStatus = "出库操作需要一次只选择一份 Traveler"
             return
         }
         guard inventoryErrors.isEmpty, !inventoryPreviewRows.isEmpty else {
             inventoryStatus = "请先完成预检并处理全部异常"
             return
         }
-        beginInventoryOperation(confirmSave ? "真实写入库存系统" : "后台模拟填写")
-        addInventoryStep("安全确认", confirmSave ? "用户已明确确认保存真实出库单" : "本次将在保存前停止", "success")
-        inventoryStatus = confirmSave ? "正在后台填写并保存库存出库单…" : "正在后台填写；本次绝不会点击保存…"
-        var arguments = ["outbound", "--traveler", paths[0]]
-        if confirmSave { arguments.append("--confirm-save") }
-        runInventory(arguments) { object in
-            if object["saved"] as? Bool == false {
-                self.inventoryStatus = "模拟填写完成，已在保存前停止"
-                self.addInventoryStep("任务完成", "所有字段已填写并核对，未点击保存", "success")
+        guard !inventoryWriteBlocked else {
+            inventoryStatus = "上一次库存操作未完成，请重新预检后再试"
+            return
+        }
+        guard !inventoryWriteCompleted else {
+            inventoryStatus = "本次出库已经完成，不能重复操作"
+            return
+        }
+        beginInventoryOperation("真实写入库存系统")
+        addInventoryStep("安全确认", "用户已明确确认保存真实出库单", "success")
+        inventoryStatus = "正在后台填写并保存库存出库单…"
+        var arguments = ["outbound"]
+        if !orderID.isEmpty {
+            arguments += ["--order-id", orderID]
+        } else {
+            arguments += ["--traveler", paths[0]]
+        }
+        for remark in selectedInventoryDocumentRemarks.sorted() {
+            arguments += ["--document-remark", remark]
+        }
+        for factoryOrder in selectedInventoryFactoryOrders.sorted() {
+            arguments += ["--factory-order", factoryOrder]
+        }
+        arguments.append("--confirm-save")
+        runInventory(arguments, onFailure: { reason in
+            self.inventoryWriteBlocked = true
+            self.inventoryWriteCompleted = false
+            self.inventoryStatus = "❌ \(reason)；请重新预检后再试"
+        }) { object in
+            self.finishRunningInventoryStep(
+                self.inventorySteps.last(where: { $0.state == "running" })?.detail ?? "库存系统后台操作已完成",
+                "success"
+            )
+            if object["no_outbound_required"] as? Bool == true {
+                self.inventoryWriteCompleted = true
+                self.inventoryStatus = "✅ 本订单已明确标记为无需出库"
+                self.addInventoryStep("任务完成", "已记录无需出库决定，未打开库存系统", "success")
             } else if object["saved"] as? Bool == true {
                 let results = object["results"] as? [[String: Any]] ?? []
                 let numbers = results.compactMap { $0["documentNumber"] as? String }
@@ -670,13 +2237,16 @@ final class AppModel: ObservableObject {
                     return "\(remark)：\(number) \(result["updated"] as? Bool == true ? "已更新" : "已新增")"
                 }.joined(separator: "；")
                 let numberText = numbers.isEmpty ? "未知单号" : numbers.joined(separator: "、")
+                self.inventoryWriteCompleted = true
                 self.inventoryStatus = "✅✅ 出库处理成功！\(numberText)"
                 self.inventorySuccessMessage = "出库处理成功！\(detail)"
                 self.addInventoryStep("✅ 出库处理成功", "\(detail)；本机同步记录已更新", "success")
-                self.markInventoryTravelerSaved(path: paths[0], documentNumber: numberText)
-                self.addInventoryStep("左侧状态已更新", "当前 Traveler 已立即标记为“已出库”", "success")
-            } else {
-                self.inventoryStatus = "库存系统模拟填写已结束"
+                if orderID.isEmpty {
+                    self.markInventoryTravelerSaved(path: paths[0], documentNumber: numberText)
+                    self.addInventoryStep("左侧状态已更新", "当前 Traveler 已立即标记为“已出库”", "success")
+                } else {
+                    self.addInventoryStep("订单状态已更新", "数据库订单出库记录已保存，已出库工厂单状态将重新同步", "success")
+                }
             }
         }
     }
@@ -704,8 +2274,9 @@ final class AppModel: ObservableObject {
         }
         beginInventoryOperation(ignored ? "忽略选中材料" : "恢复选中材料")
         var arguments = [ignored ? "ignore-item" : "unignore-item"]
+        let nameArgument = selectedInventoryOrderID.isEmpty ? "--traveler-name" : "--item-name"
         for name in uniqueNames {
-            arguments += ["--traveler-name", name]
+            arguments += [nameArgument, name]
         }
         if ignored {
             arguments += ["--reason", "用户在出库预览中选择忽略"]
@@ -717,10 +2288,126 @@ final class AppModel: ObservableObject {
                 "success"
             )
             self.previewSelectedInventory()
+            self.rereadPendingSourceFolder()
+        }
+    }
+
+    func refreshInventoryMappings() {
+        runInventory(["list-mappings"]) { object in
+            let manual = object["manual"] as? [String: Any] ?? [:]
+            self.inventoryManualMappings = manual.keys.sorted().map { name in
+                InventoryManualMapping(
+                    id: name,
+                    name: name,
+                    productCode: manual[name] as? String ?? ""
+                )
+            }
+            let ignored = object["ignored"] as? [String: Any] ?? [:]
+            self.inventoryIgnoredMappings = ignored.keys.sorted().map { name in
+                InventoryIgnoredMapping(
+                    id: name,
+                    name: name,
+                    reason: ignored[name] as? String ?? ""
+                )
+            }
+        }
+    }
+
+    func saveSettingsManualMapping(name: String, productCode: String) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedCode = productCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !trimmedName.isEmpty, !trimmedCode.isEmpty else {
+            settingsStatus = "❌ 映射名称和商品 SKU 不能为空。"
+            return
+        }
+        beginInventoryOperation("保存材料映射")
+        runInventory(["set-mapping", "--item-name", trimmedName, "--product-code", trimmedCode]) { _ in
+            self.settingsStatus = "✅ 材料映射已保存：\(trimmedName) → \(trimmedCode)"
+            self.refreshInventoryMappings()
+        }
+    }
+
+    func updateSettingsManualMapping(oldName: String, name: String, productCode: String) {
+        let trimmedOldName = oldName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedCode = productCode.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard !trimmedOldName.isEmpty, !trimmedName.isEmpty, !trimmedCode.isEmpty else {
+            settingsStatus = "❌ 映射名称和商品 SKU 不能为空。"
+            return
+        }
+        beginInventoryOperation("修改材料映射")
+        runInventory([
+            "update-mapping", "--old-name", trimmedOldName,
+            "--item-name", trimmedName, "--product-code", trimmedCode,
+        ]) { _ in
+            self.settingsStatus = "✅ 材料映射已修改：\(trimmedName) → \(trimmedCode)"
+            self.refreshInventoryMappings()
+        }
+    }
+
+    func removeSettingsManualMapping(name: String) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return }
+        beginInventoryOperation("删除材料映射")
+        runInventory(["remove-mapping", "--item-name", trimmedName]) { _ in
+            self.settingsStatus = "✅ 已删除材料映射：\(trimmedName)"
+            self.refreshInventoryMappings()
+        }
+    }
+
+    func saveInventoryIgnoredMapping(name: String, reason: String) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            settingsStatus = "❌ 忽略项目名称不能为空。"
+            return
+        }
+        beginInventoryOperation("保存全局忽略项目")
+        runInventory([
+            "ignore-item",
+            "--item-name", trimmedName,
+            "--reason", reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "用户在设置中选择全局忽略"
+                : reason.trimmingCharacters(in: .whitespacesAndNewlines),
+        ]) { _ in
+            self.settingsStatus = "✅ 全局忽略项目已保存：(trimmedName)"
+            self.refreshInventoryMappings()
+        }
+    }
+
+    func updateInventoryIgnoredMapping(oldName: String, name: String, reason: String) {
+        let trimmedOldName = oldName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedOldName.isEmpty, !trimmedName.isEmpty else {
+            settingsStatus = "❌ 忽略项目名称不能为空。"
+            return
+        }
+        beginInventoryOperation("修改全局忽略项目")
+        runInventory([
+            "update-ignore",
+            "--old-name", trimmedOldName,
+            "--name", trimmedName,
+            "--ignored", "true",
+            "--reason", reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "用户在设置中选择全局忽略"
+                : reason.trimmingCharacters(in: .whitespacesAndNewlines),
+        ]) { _ in
+            self.settingsStatus = "✅ 全局忽略项目已修改：(trimmedName)"
+            self.refreshInventoryMappings()
+        }
+    }
+
+    func removeInventoryIgnoredMapping(name: String) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return }
+        beginInventoryOperation("删除全局忽略项目")
+        runInventory(["unignore-item", "--item-name", trimmedName]) { _ in
+            self.settingsStatus = "✅ 已删除全局忽略项目：(trimmedName)"
+            self.refreshInventoryMappings()
         }
     }
 
     func searchInventoryProducts(_ query: String) {
+        logUserAction("点击搜索库存商品", details: ["query_present": !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty])
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             inventoryProductSearchStatus = "请输入商品编号、名称或规格"
@@ -747,10 +2434,12 @@ final class AppModel: ObservableObject {
     }
 
     func saveInventoryMapping(travelerName: String, productCode: String) {
+        logUserAction("点击保存材料映射", details: ["traveler_name_present": !travelerName.isEmpty, "product_code_present": !productCode.isEmpty])
         beginInventoryOperation("保存材料映射")
         addInventoryStep("确认映射", "\(travelerName) → \(productCode)", "running")
+        let nameArgument = selectedInventoryOrderID.isEmpty ? "--traveler-name" : "--item-name"
         runInventory([
-            "set-mapping", "--traveler-name", travelerName,
+            "set-mapping", nameArgument, travelerName,
             "--product-code", productCode,
         ]) { object in
             let product = object["product"] as? [String: Any] ?? [:]
@@ -758,10 +2447,102 @@ final class AppModel: ObservableObject {
             self.finishRunningInventoryStep("已映射到 \(productCode) \(name)", "success")
             self.inventoryStatus = "映射已保存，正在重新预检"
             self.previewSelectedInventory()
+            self.rereadPendingSourceFolder()
         }
     }
 
-    private func previewNext(_ paths: [String], index: Int, accumulated: [InventoryPreviewRow]) {
+    @discardableResult
+    private func consumeInventoryPreviewObject(
+        _ object: [String: Any],
+        accumulated: [InventoryPreviewRow]
+    ) -> [InventoryPreviewRow] {
+        var next = accumulated
+        let items = object["outbound_items"] as? [[String: Any]] ?? []
+        next += items.map {
+            InventoryPreviewRow(
+                travelerName: $0["traveler_name"] as? String ?? "",
+                productCode: $0["product_code"] as? String ?? "",
+                productName: $0["product_name"] as? String ?? "",
+                quantity: $0["quantity"] as? Double ?? 0,
+                source: $0["match_source"] as? String ?? "",
+                status: "已映射",
+                section: $0["section"] as? String ?? ""
+            )
+        }
+        let ignored = object["ignored_items"] as? [[String: Any]] ?? []
+        next += ignored.map {
+            InventoryPreviewRow(
+                travelerName: $0["name"] as? String ?? "",
+                productCode: "—",
+                productName: "不写入库存系统",
+                quantity: $0["quantity"] as? Double ?? 0,
+                source: $0["reason"] as? String ?? "已忽略",
+                status: "已忽略",
+                section: $0["section"] as? String ?? ""
+            )
+        }
+        let excluded = object["excluded_items"] as? [[String: Any]] ?? []
+        next += excluded.map {
+            InventoryPreviewRow(
+                travelerName: $0["name"] as? String ?? "",
+                productCode: "—",
+                productName: "不进入出库单",
+                quantity: $0["quantity"] as? Double ?? 0,
+                source: $0["reason"] as? String ?? "已确认的出库范围外项目",
+                status: $0["status"] as? String ?? "不出库",
+                section: $0["section"] as? String ?? ""
+            )
+        }
+        let missing = object["missing_items"] as? [[String: Any]] ?? []
+        next += missing.compactMap {
+            guard let name = $0["name"] as? String, !name.isEmpty else { return nil }
+            return InventoryPreviewRow(
+                travelerName: name,
+                productCode: "未找到",
+                productName: "请选择忽略，或补充商品映射",
+                quantity: $0["quantity"] as? Double ?? 0,
+                source: businessFriendlyMessage(
+                    $0["message"] as? String ?? "未找到唯一库存商品，请补充商品映射或选择忽略。",
+                    operation: "校验库存材料"
+                ),
+                status: "未映射",
+                section: $0["section"] as? String ?? ""
+            )
+        }
+        if object["ready"] as? Bool != true {
+            inventoryErrors += missing.map {
+                businessFriendlyMessage(
+                    $0["message"] as? String ?? "存在未映射材料，请补充商品映射或选择忽略。",
+                    operation: "校验库存材料"
+                )
+            }
+        }
+        let sourceIsDatabase = (object["source_type"] as? String) == "database"
+        finishRunningInventoryStep(
+            object["ready"] as? Bool == true
+                ? (sourceIsDatabase ? "数据库事实、数量和商品映射检查通过" : "文件结构、数量和商品映射检查通过")
+                : "存在未映射或无效材料",
+            object["ready"] as? Bool == true ? "success" : "failure"
+        )
+        return next
+    }
+
+    private func applyInventoryPreviewObject(
+        _ object: [String: Any],
+        accumulated: [InventoryPreviewRow]
+    ) {
+        inventoryPreviewRows = consumeInventoryPreviewObject(object, accumulated: accumulated)
+        inventoryStatus = inventoryErrors.isEmpty
+            ? "订单出库数据预检通过，共 \(inventoryPreviewRows.count) 行"
+            : "订单出库数据预检未通过，请先处理 \(inventoryErrors.count) 项异常"
+    }
+
+    private func previewNext(
+        _ paths: [String],
+        index: Int,
+        selectedDocumentRemarks: Set<String> = [],
+        accumulated: [InventoryPreviewRow]
+    ) {
         guard index < paths.count else {
             inventoryPreviewRows = accumulated
             inventoryStatus = inventoryErrors.isEmpty
@@ -779,78 +2560,42 @@ final class AppModel: ObservableObject {
             URL(fileURLWithPath: paths[index]).lastPathComponent,
             "running"
         )
-        runInventory(["preview", "--traveler", paths[index]], manageRunning: index == 0) { object in
-            var next = accumulated
-            let items = object["outbound_items"] as? [[String: Any]] ?? []
-            next += items.map {
-                InventoryPreviewRow(
-                    travelerName: $0["traveler_name"] as? String ?? "",
-                    productCode: $0["product_code"] as? String ?? "",
-                    productName: $0["product_name"] as? String ?? "",
-                    quantity: $0["quantity"] as? Double ?? 0,
-                    source: $0["match_source"] as? String ?? "",
-                    status: "已映射",
-                    section: $0["section"] as? String ?? ""
-                )
-            }
-            let ignored = object["ignored_items"] as? [[String: Any]] ?? []
-            next += ignored.map {
-                InventoryPreviewRow(
-                    travelerName: $0["name"] as? String ?? "",
-                    productCode: "—",
-                    productName: "不写入库存系统",
-                    quantity: $0["quantity"] as? Double ?? 0,
-                    source: $0["reason"] as? String ?? "已忽略",
-                    status: "已忽略",
-                    section: $0["section"] as? String ?? ""
-                )
-            }
-            let zeroItems = object["zero_items"] as? [[String: Any]] ?? []
-            next += zeroItems.map {
-                InventoryPreviewRow(
-                    travelerName: $0["name"] as? String ?? "",
-                    productCode: "—",
-                    productName: "数量为 0，不出库",
-                    quantity: 0,
-                    source: "Traveler 数量为 0",
-                    status: "零数量",
-                    section: $0["section"] as? String ?? ""
-                )
-            }
-            let missing = object["missing_items"] as? [[String: Any]] ?? []
-            next += missing.compactMap {
-                guard let name = $0["name"] as? String, !name.isEmpty else { return nil }
-                return InventoryPreviewRow(
-                    travelerName: name,
-                    productCode: "未找到",
-                    productName: "请选择忽略，或补充商品映射",
-                    quantity: $0["quantity"] as? Double ?? 0,
-                    source: $0["message"] as? String ?? "未找到唯一库存商品",
-                    status: "未映射",
-                    section: $0["section"] as? String ?? ""
-                )
-            }
-            if object["ready"] as? Bool != true {
-                self.inventoryErrors += missing.map { $0["message"] as? String ?? "存在未映射材料" }
-            }
-            self.finishRunningInventoryStep(
-                object["ready"] as? Bool == true ? "文件结构、数量和商品映射检查通过" : "存在未映射或无效材料",
-                object["ready"] as? Bool == true ? "success" : "failure"
+        var previewArguments = ["preview", "--traveler", paths[index]]
+        for remark in selectedDocumentRemarks.sorted() {
+            previewArguments += ["--document-remark", remark]
+        }
+        runInventory(previewArguments, manageRunning: index == 0) { object in
+            let next = self.consumeInventoryPreviewObject(object, accumulated: accumulated)
+            self.previewNext(
+                paths,
+                index: index + 1,
+                selectedDocumentRemarks: selectedDocumentRemarks,
+                accumulated: next
             )
-            self.previewNext(paths, index: index + 1, accumulated: next)
         }
     }
 
-    private func runInventory(_ arguments: [String], manageRunning: Bool = true, completion: @escaping ([String: Any]) -> Void) {
+    private func runInventory(
+        _ arguments: [String],
+        manageRunning: Bool = true,
+        onFailure: ((String) -> Void)? = nil,
+        completion: @escaping ([String: Any]) -> Void
+    ) {
         if manageRunning {
             guard !inventoryRunning else { return }
             inventoryRunning = true
-            inventoryStatus = "正在检查 Traveler 和商品资料…"
+            inventoryStatus = selectedInventoryOrderID.isEmpty
+                ? "正在检查 Traveler 和商品资料…"
+                : "正在检查订单数据库和商品资料…"
             inventoryStderrBuffer = ""
             inventoryRawErrors = ""
         }
         let root = projectRoot
-        let command = root.appendingPathComponent("scripts/traveler-assistant")
+        let command = root.appendingPathComponent("scripts/pp-flowhub")
+        let operationID = newOperationID(
+            "库存后台操作",
+            details: ["command": "inventory", "argument_count": arguments.count, "write_requested": arguments.contains("--confirm-save")]
+        )
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             let output = Pipe()
@@ -858,6 +2603,7 @@ final class AppModel: ObservableObject {
             process.executableURL = command
             process.arguments = ["inventory"] + arguments
             process.currentDirectoryURL = root
+            process.environment = self.environmentForOperation(operationID)
             process.standardOutput = output
             process.standardError = errors
             errors.fileHandleForReading.readabilityHandler = { handle in
@@ -867,8 +2613,26 @@ final class AppModel: ObservableObject {
             }
             do {
                 try process.run()
+                let timeoutLock = NSLock()
+                var timedOut = false
+                let timeoutWork = DispatchWorkItem {
+                    timeoutLock.lock()
+                    timedOut = process.isRunning
+                    timeoutLock.unlock()
+                    if process.isRunning {
+                        process.terminate()
+                    }
+                }
+                DispatchQueue.global(qos: .utility).asyncAfter(
+                    // Browser page waits are capped at 60 seconds; keep the
+                    // outer App deadline longer so one page wait can return
+                    // its specific diagnostic before the App cancels it.
+                    deadline: .now() + 90,
+                    execute: timeoutWork
+                )
                 let data = output.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
+                timeoutWork.cancel()
                 errors.fileHandleForReading.readabilityHandler = nil
                 let remainder = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
                 DispatchQueue.main.async {
@@ -877,17 +2641,32 @@ final class AppModel: ObservableObject {
                     if !self.inventoryStderrBuffer.isEmpty {
                         self.consumeInventoryLogChunk("\n")
                     }
+                    timeoutLock.lock()
+                    let operationTimedOut = timedOut
+                    timeoutLock.unlock()
+                    if operationTimedOut {
+                        let reason = "库存系统操作超过 90 秒未完成，请检查网络、登录状态或库存系统页面后重试。"
+                        self.inventoryStatus = "❌ \(reason)"
+                        self.finishRunningInventoryStep(reason, "failure")
+                        onFailure?(reason)
+                        return
+                    }
                     let errorText = self.inventoryRawErrors.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                        let reason = errorText.isEmpty ? "后台没有返回有效 JSON 结果" : errorText
-                        self.inventoryStatus = "❌ 无法解析库存预检结果"
+                        let reason = businessFriendlyMessage(errorText, operation: "读取库存结果")
+                        self.inventoryStatus = "❌ \(reason)"
                         self.finishRunningInventoryStep(reason, "failure")
+                        onFailure?(reason)
                         return
                     }
                     if let fatal = object["fatal"] as? [String: Any] {
-                        let reason = fatal["message"] as? String ?? "库存预检失败"
+                        let reason = businessFriendlyMessage(
+                            fatal["message"] as? String ?? "库存预检未通过，请检查 Traveler 和商品资料后重试。",
+                            operation: "库存操作"
+                        )
                         self.inventoryStatus = "❌ \(reason)"
                         self.finishRunningInventoryStep(reason, "failure")
+                        onFailure?(reason)
                         return
                     }
                     completion(object)
@@ -895,8 +2674,10 @@ final class AppModel: ObservableObject {
             } catch {
                 DispatchQueue.main.async {
                     self.inventoryRunning = false
-                    self.inventoryStatus = "❌ 无法启动库存功能：\(error.localizedDescription)"
-                    self.finishRunningInventoryStep(error.localizedDescription, "failure")
+                    let reason = businessFriendlyMessage(error.localizedDescription, operation: "启动库存操作")
+                    self.inventoryStatus = "❌ \(reason)"
+                    self.finishRunningInventoryStep(reason, "failure")
+                    onFailure?(reason)
                 }
             }
         }
@@ -911,9 +2692,19 @@ final class AppModel: ObservableObject {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
         inventorySteps.append(InventoryStep(time: formatter.string(from: Date()), title: title, detail: detail, state: state))
+        OperationLogWriter.shared.record(
+            "app.step",
+            message: title,
+            details: ["detail": detail, "state": state, "workflow": "inventory"]
+        )
     }
 
     private func finishRunningInventoryStep(_ detail: String, _ state: String) {
+        OperationLogWriter.shared.record(
+            "app.step.finished",
+            message: state == "failure" ? "库存步骤失败" : "库存步骤完成",
+            details: ["detail": detail, "state": state, "workflow": "inventory"]
+        )
         guard let index = inventorySteps.lastIndex(where: { $0.state == "running" }) else {
             addInventoryStep(state == "failure" ? "操作失败" : "操作完成", detail, state)
             return
@@ -934,23 +2725,54 @@ final class AppModel: ObservableObject {
                 inventoryRawErrors += line + "\n"
                 continue
             }
-            addInventoryStep("后台操作", message, "success")
+            inventorySteps = appendingInventoryProgressStep(inventorySteps, message: message)
         }
     }
 
     private func addOrderStep(_ title: String, _ detail: String, _ state: String) {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
-        orderSteps.append(InventoryStep(time: formatter.string(from: Date()), title: title, detail: detail, state: state))
+        let now = Date()
+        orderSteps.append(InventoryStep(
+            time: formatter.string(from: now),
+            title: title,
+            detail: detail,
+            state: state,
+            startedAt: state == "running" ? now : nil,
+            duration: state == "running" ? nil : 0
+        ))
+        OperationLogWriter.shared.record(
+            "app.step",
+            message: title,
+            details: ["detail": detail, "state": state, "workflow": "order"]
+        )
     }
 
     private func finishOrderStep(_ detail: String, _ state: String) {
+        OperationLogWriter.shared.record(
+            "app.step.finished",
+            message: state == "failure" ? "订单步骤失败" : "订单步骤完成",
+            details: ["detail": detail, "state": state, "workflow": "order"]
+        )
         guard let index = orderSteps.lastIndex(where: { $0.state == "running" }) else {
             addOrderStep(state == "failure" ? "操作失败" : "操作完成", detail, state)
             return
         }
         let current = orderSteps[index]
-        orderSteps[index] = InventoryStep(time: current.time, title: current.title, detail: detail, state: state)
+        let now = Date()
+        let elapsed = current.startedAt.map { max(0, now.timeIntervalSince($0)) } ?? 0
+        orderSteps[index] = InventoryStep(
+            id: current.id,
+            time: current.time,
+            title: current.title,
+            detail: detail,
+            state: state,
+            paths: current.paths,
+            operationDetails: current.operationDetails,
+            contextDetails: current.contextDetails,
+            startedAt: current.startedAt,
+            duration: elapsed
+        )
     }
 
     private func consumeOrderLogChunk(_ chunk: String) {
@@ -965,11 +2787,20 @@ final class AppModel: ObservableObject {
                 orderRawErrors += line + "\n"
                 continue
             }
-            addOrderStep("后台校验", message, "success")
+            if let updated = updatingLatestRunningStep(orderSteps, detail: message) {
+                orderSteps = updated
+            } else {
+                addOrderStep("后台操作", message, "running")
+            }
         }
     }
 
-    private func runOrder(_ arguments: [String], completion: @escaping ([String: Any]) -> Void) {
+    private func runOrder(
+        _ arguments: [String],
+        failureStatus: String = "校验未通过",
+        onFailure: (() -> Void)? = nil,
+        completion: @escaping ([String: Any]) -> Void
+    ) {
         guard !orderRunning else { return }
         orderRunning = true
         orderError = ""
@@ -977,7 +2808,11 @@ final class AppModel: ObservableObject {
         orderStderrBuffer = ""
         orderRawErrors = ""
         let root = projectRoot
-        let command = root.appendingPathComponent("scripts/traveler-assistant")
+        let command = root.appendingPathComponent("scripts/pp-flowhub")
+        let operationID = newOperationID(
+            "订单后台操作",
+            details: ["command": "order", "argument_count": arguments.count]
+        )
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             let output = Pipe()
@@ -985,6 +2820,7 @@ final class AppModel: ObservableObject {
             process.executableURL = command
             process.arguments = ["order"] + arguments
             process.currentDirectoryURL = root
+            process.environment = self.environmentForOperation(operationID)
             process.standardOutput = output
             process.standardError = errors
             errors.fileHandleForReading.readabilityHandler = { handle in
@@ -1003,17 +2839,32 @@ final class AppModel: ObservableObject {
                     if !remainder.isEmpty { self.consumeOrderLogChunk(remainder + "\n") }
                     if !self.orderStderrBuffer.isEmpty { self.consumeOrderLogChunk("\n") }
                     guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                        let reason = self.orderRawErrors.isEmpty ? "后台没有返回有效结果" : self.orderRawErrors
+                        let reason = businessFriendlyMessage(self.orderRawErrors, operation: "读取订单结果")
                         self.orderError = reason
-                        self.orderStatus = "读取失败"
+                        self.orderStatus = failureStatus
                         self.finishOrderStep(reason, "failure")
+                        onFailure?()
                         return
                     }
                     if let fatal = object["fatal"] as? [String: Any] {
-                        let reason = fatal["message"] as? String ?? "订单校验失败"
+                        let code = fatal["code"] as? String ?? ""
+                        let reason = businessFriendlyMessage(
+                            fatal["message"] as? String ?? "订单校验未通过，请检查订单报表后重试。",
+                            operation: "订单操作"
+                        )
                         self.orderError = reason
-                        self.orderStatus = "校验未通过"
+                        if code == "missing_materials" {
+                            self.orderStatus = "未找到 material 文件"
+                        } else if code == "material_generation_failed" {
+                            self.orderStatus = "自动生成失败，请手动生成 material 文件"
+                        } else {
+                            self.orderStatus = failureStatus
+                        }
                         self.finishOrderStep(reason, "failure")
+                        if code == "missing_materials" && !self.selectedOrderPath.isEmpty {
+                            self.showMaterialGenerationPrompt = true
+                        }
+                        onFailure?()
                         return
                     }
                     completion(object)
@@ -1021,15 +2872,19 @@ final class AppModel: ObservableObject {
             } catch {
                 DispatchQueue.main.async {
                     self.orderRunning = false
-                    self.orderError = error.localizedDescription
+                    let reason = businessFriendlyMessage(error.localizedDescription, operation: "启动订单操作")
+                    self.orderError = reason
                     self.orderStatus = "无法启动订单读取功能"
-                    self.finishOrderStep(error.localizedDescription, "failure")
+                    self.finishOrderStep(reason, "failure")
+                    onFailure?()
                 }
             }
         }
     }
 
     func loadOrderFolders() {
+        logUserAction("点击刷新订单文件夹列表")
+        orderSteps.removeAll()
         selectedOrderPath = ""
         selectedOrderId = ""
         orderMaterials = []
@@ -1038,12 +2893,17 @@ final class AppModel: ObservableObject {
         orderEdgeBanding = [:]
         orderWarnings = []
         orderExistingTravelerPath = ""
+        orderPreviewValidated = false
+        orderMissingMaterial = false
+        selectedOrderIsOptimized = false
+        let source = orderSourceKind == "cutToSize" ? activeCutToSizeRoot : activeOwnedSourceRoot
         orderStatus = "正在读取服务器文件夹列表…"
-        addOrderStep("读取服务器目录", "只读取订单文件夹名称，不打开 Excel", "running")
-        var arguments = ["list"]
-        if orderSourceKind == "cutToSize" {
-            arguments += ["--source-root", "/Volumes/server/CUT TO SIZE"]
-        }
+        addOrderStep(
+            "读取服务器目录",
+            "只读取订单文件夹名称，不打开 Excel：\(source)",
+            "running"
+        )
+        let arguments = ["list", "--source-root", source]
         runOrder(arguments) { object in
             let rows = object["orders"] as? [[String: Any]] ?? []
             self.orderFolders = rows.map {
@@ -1053,13 +2913,14 @@ final class AppModel: ObservableObject {
                     modifiedAt: $0["modified_at"] as? String ?? ""
                 )
             }
-            self.orderStatus = "已读取 \(rows.count) 个订单文件夹；点击后才会校验 Excel"
+            self.orderStatus = "已读取 \(rows.count) 个服务器订单文件夹；点击后才会校验 Excel"
             let kind = self.orderSourceKind == "cutToSize" ? "来料加工" : "自有"
             self.finishOrderStep("找到 \(rows.count) 个\(kind)订单文件夹", "success")
         }
     }
 
     func previewOrderFolder(_ item: OrderFolderItem, recordSelection: Bool = true) {
+        orderSteps.removeAll()
         selectedOrderPath = item.id
         selectedOrderId = item.orderId
         orderMaterials = []
@@ -1067,8 +2928,11 @@ final class AppModel: ObservableObject {
         orderFactories = []
         orderEdgeBanding = [:]
         orderWarnings = []
+        orderStockRows = []
         orderMaterialsFile = ""
         orderExistingTravelerPath = findLocalOrderTraveler(item.orderId)
+        orderPreviewValidated = false
+        orderMissingMaterial = false
         orderStatus = "正在校验 \(item.orderId)…"
         if recordSelection {
             addOrderStep("选择订单", "\(item.orderId) · \(item.id)", "success")
@@ -1085,8 +2949,31 @@ final class AppModel: ObservableObject {
             item.orderId.hasPrefix("CS") ? "material 板材与封边数量" : "material、板材清单和 Fittingslist",
             "running"
         )
-        runOrder(["preview", "--folder", item.id]) { object in
-            self.applyOrderPreview(object)
+        runOrder(["preview-related", "--folder", item.id]) { object in
+            let issues = orderPreviewIssues(object)
+            if let issue = issues.first(where: { $0.orderId == item.orderId }) ?? issues.first {
+                let reason = businessFriendlyMessage(issue.message, operation: "校验订单")
+                self.orderError = reason
+                self.finishOrderStep(reason, "failure")
+                if issue.code == "missing_materials" {
+                    self.orderStatus = "未找到 material 文件"
+                    self.orderMissingMaterial = true
+                    self.showMaterialGenerationPrompt = true
+                } else {
+                    self.orderStatus = "校验未通过"
+                }
+                for additional in issues where additional != issue {
+                    self.addOrderStep(
+                        "关联订单校验失败",
+                        businessFriendlyMessage(additional.message, operation: "校验关联订单"),
+                        "failure"
+                    )
+                }
+                return
+            }
+            self.applyOrderPreview(object, targetOrderID: item.orderId)
+            self.orderPreviewValidated = true
+            self.orderMissingMaterial = false
             let existing = !self.orderExistingTravelerPath.isEmpty
             if item.orderId.hasPrefix("CS") {
                 self.orderStatus = existing
@@ -1110,7 +2997,7 @@ final class AppModel: ObservableObject {
 
     private func findLocalOrderTraveler(_ orderId: String) -> String {
         let manager = FileManager.default
-        let root = URL(fileURLWithPath: orderRoot, isDirectory: true)
+        let root = URL(fileURLWithPath: activeOrderRoot, isDirectory: true)
         var folder = root.appendingPathComponent(orderId, isDirectory: true)
         var isDirectory: ObjCBool = false
         if !manager.fileExists(atPath: folder.path, isDirectory: &isDirectory) || !isDirectory.boolValue {
@@ -1142,14 +3029,23 @@ final class AppModel: ObservableObject {
         })?.path ?? ""
     }
 
-    private func applyOrderPreview(_ object: [String: Any]) {
-        selectedOrderId = object["order_id"] as? String ?? selectedOrderId
-        orderMaterialsFile = object["materials_file"] as? String ?? ""
-        if let existing = object["existing_traveler"] as? String, !existing.isEmpty {
+    private func applyOrderPreview(_ object: [String: Any], targetOrderID: String? = nil) {
+        let payload: [String: Any]
+        if let targetOrderID,
+           let related = object["orders"] as? [[String: Any]],
+           let selected = related.first(where: { ($0["order_id"] as? String)?.caseInsensitiveCompare(targetOrderID) == .orderedSame }) {
+            payload = selected
+            selectedOrderId = targetOrderID
+        } else {
+            payload = object
+            selectedOrderId = object["order_id"] as? String ?? selectedOrderId
+        }
+        orderMaterialsFile = payload["materials_file"] as? String ?? ""
+        if let existing = payload["existing_traveler"] as? String, !existing.isEmpty {
             orderExistingTravelerPath = existing
         }
-        orderWarnings = object["warnings"] as? [String] ?? []
-        orderMaterials = (object["materials"] as? [[String: Any]] ?? []).map {
+        orderWarnings = payload["warnings"] as? [String] ?? []
+        orderMaterials = (payload["materials"] as? [[String: Any]] ?? []).map {
             OrderMaterialPreview(
                 kind: $0["kind"] as? String ?? "",
                 thickness: ($0["thickness"] as? NSNumber)?.doubleValue ?? 0,
@@ -1157,11 +3053,11 @@ final class AppModel: ObservableObject {
                 quantity: ($0["quantity"] as? NSNumber)?.doubleValue ?? 0
             )
         }
-        orderEdgeBanding = (object["edge_banding"] as? [String: NSNumber] ?? [:])
+        orderEdgeBanding = (payload["edge_banding"] as? [String: NSNumber] ?? [:])
             .mapValues(\.doubleValue)
         var factories: [OrderFactoryPreview] = []
         var fittings: [OrderFittingPreview] = []
-        for factory in object["factories"] as? [[String: Any]] ?? [] {
+        for factory in payload["factories"] as? [[String: Any]] ?? [] {
             let number = factory["factory_order"] as? String ?? ""
             let name = factory["order_name"] as? String ?? ""
             factories.append(OrderFactoryPreview(id: number, factoryOrder: number, orderName: name))
@@ -1183,6 +3079,85 @@ final class AppModel: ObservableObject {
         }
         orderFactories = factories
         orderFittings = fittings
+    }
+
+    func loadOrderDetailFromDatabase(_ item: OrderDashboardItem) {
+        selectedOrderPath = item.sourceFolder
+        selectedOrderId = item.orderId
+        selectedOrderIsOptimized = item.stage == "已优化"
+        if orderRunning {
+            pendingOrderDetailItem = item
+            orderDetailWaiting = true
+            orderStatus = "正在扫描，扫描完成后自动读取详情…"
+            schedulePendingOrderDetailRetry()
+            return
+        }
+        pendingOrderDetailItem = nil
+        orderDetailWaiting = false
+        orderExistingTravelerPath = ""
+        orderPreviewValidated = false
+        orderMaterials = []
+        orderFittings = []
+        orderFactories = []
+        orderEdgeBanding = [:]
+        orderStatus = "正在读取数据库详情…"
+        runOrder(["detail", "--order-id", item.orderId], onFailure: {
+            self.orderDetailWaiting = false
+        }) { object in
+            let materialRows = object["materials"] as? [[String: Any]] ?? []
+            let hardwareRows = object["hardware"] as? [[String: Any]] ?? []
+            let factories = item.factories.map { factory -> [String: Any] in
+                let rows = hardwareRows.filter { ($0["factory_order"] as? String ?? "").caseInsensitiveCompare(factory.factoryOrder) == .orderedSame }
+                var occurrences: [String: Int] = [:]
+                return [
+                    "factory_order": factory.factoryOrder,
+                    "order_name": factory.orderName,
+                    "fittings": rows.map {
+                        let name = $0["name"] as? String ?? ""
+                        let code = $0["product_code"] as? String ?? ""
+                        let size = $0["spec"] as? String ?? ""
+                        let signature = "\(factory.factoryOrder)|\(code)|\(name)|\(size)"
+                        let occurrence = occurrences[signature, default: 0]
+                        occurrences[signature] = occurrence + 1
+                        return ["key": "\(signature)|\(occurrence)", "name": name, "code": code, "size": size, "unit": $0["unit"] as? String ?? "", "quantity": $0["quantity"] as? NSNumber ?? 0, "ignored": false]
+                    }
+                ]
+            }
+            let materials: [[String: Any]] = materialRows.compactMap { row in
+                guard let kind = row["material_type"] as? String else { return nil }
+                let thickness = Double(row["thickness"] as? String ?? "") ?? (row["thickness"] as? NSNumber)?.doubleValue ?? 0
+                return ["kind": kind, "thickness": thickness, "color": row["color"] as? String ?? "", "quantity": row["quantity"] as? NSNumber ?? 0]
+            }
+            var edges: [String: NSNumber] = [:]
+            for row in materialRows where (row["material_type"] as? String) == "edge" {
+                let color = row["color"] as? String ?? ""
+                edges[color] = row["quantity"] as? NSNumber ?? 0
+            }
+            let payload: [String: Any] = ["order_id": item.orderId, "materials": materials, "edge_banding": edges, "factories": factories, "warnings": []]
+            self.applyOrderPreview(payload, targetOrderID: item.orderId)
+            self.orderDetailWaiting = false
+            self.orderPreviewValidated = !materialRows.isEmpty || item.stage == "已设计"
+            self.orderStatus = materialRows.isEmpty ? "数据库暂无已保存材料明细，请重新同步源文件" : "已读取数据库中的材料、五金和订单状态"
+            self.finishOrderStep(self.orderStatus, materialRows.isEmpty ? "warning" : "success")
+        }
+    }
+
+    private func schedulePendingOrderDetailRetry() {
+        guard !orderDetailRetryScheduled else { return }
+        orderDetailRetryScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            self.orderDetailRetryScheduled = false
+            guard let item = self.pendingOrderDetailItem else { return }
+            guard self.selectedOrderId.caseInsensitiveCompare(item.orderId) == .orderedSame else {
+                self.pendingOrderDetailItem = nil
+                return
+            }
+            if self.orderRunning {
+                self.schedulePendingOrderDetailRetry()
+            } else {
+                self.loadOrderDetailFromDatabase(item)
+            }
+        }
     }
 
     func setOrderFittingsIgnored(_ rows: [OrderFittingPreview], ignored: Bool) {
@@ -1215,226 +3190,529 @@ final class AppModel: ObservableObject {
     }
 
     func generateSelectedOrder() {
-        guard orderPreviewReady else {
-            orderStatus = "请先选择并通过校验"
-            addOrderStep("无法生成 Traveler", "请先选择订单并完成全部校验", "failure")
+        logUserAction("点击生成 Traveler")
+        guard orderCanGenerateTraveler else {
+            orderStatus = "请先选择订单"
+            addOrderStep("无法生成 Traveler", "请先选择订单详情", "failure")
             return
         }
-        let updating = !orderExistingTravelerPath.isEmpty
-        let action = updating ? "更新 Traveler" : "生成 Traveler"
-        addOrderStep(action, "操作前重新读取全部源文件，避免预览后数据发生变化", "running")
-        runOrder([updating ? "update" : "generate", "--folder", selectedOrderPath]) { object in
-            self.applyOrderPreview(object)
-            self.orderCreatedPath = (object[updating ? "updated" : "created"] as? String) ?? ""
-            self.orderExistingTravelerPath = self.orderCreatedPath
-            self.orderStatus = updating ? "Traveler 已更新" : "Traveler 已生成"
-            let backup = object["backup"] as? String ?? ""
-            let detail = backup.isEmpty
-                ? "\(updating ? "已更新" : "已生成")：\(self.orderCreatedPath)"
-                : "已更新：\(self.orderCreatedPath)；原文件备份：\(backup)"
-            self.finishOrderStep(detail, "success")
+        let targetOrderID = selectedOrderId
+        orderStatus = "正在从数据库生成 Traveler…"
+        addOrderStep("从数据库生成 Traveler", "正在读取当前订单已保存的材料和五金", "running")
+        runOrder(["generate-db", "--order-id", targetOrderID], failureStatus: "数据库 Traveler 生成失败") { object in
+            let path = object["traveler"] as? String ?? object["created"] as? String ?? ""
+            guard !path.isEmpty else {
+                self.finishOrderStep("生成结果没有返回 Excel 文件路径", "failure")
+                return
+            }
+            self.orderCreatedPath = path
+            self.orderExistingTravelerPath = path
+            self.orderStatus = "Traveler 已生成，正在打开 Excel"
+            self.finishOrderStep("Traveler 已从数据库生成，用户可在 Excel 中打印或另存", "success")
+            self.openSelectedOrderTraveler()
+        }
+    }
+
+    func generateMissingMaterial() {
+        logUserAction("点击自动生成 material 文件")
+        guard !selectedOrderPath.isEmpty, !selectedOrderId.isEmpty else { return }
+        showMaterialGenerationPrompt = false
+        orderError = ""
+        orderStatus = "正在从 Report 自动生成 material…"
+        addOrderStep(
+            "自动生成 material",
+            "正在读取 Report 中的板材清单和封边统计",
+            "running"
+        )
+        runOrder([
+            "generate-material", "--folder", selectedOrderPath,
+            "--order-id", selectedOrderId,
+        ]) { object in
+            let path = object["materials_file"] as? String ?? ""
+            self.finishOrderStep("已生成：\(path)", "success")
+            self.orderStatus = "material 已生成，正在重新校验订单…"
+            guard let current = self.orderFolders.first(where: { $0.id == self.selectedOrderPath }) else { return }
+            self.previewOrderFolder(current, recordSelection: false)
+        }
+    }
+
+    func checkSelectedOrderStock() {
+        logUserAction("点击查询材料库存")
+        guard orderPreviewReady else {
+            addOrderStep("无法查询库存", "请先选择订单并完成材料校验", "failure")
+            return
+        }
+        orderStockRows = []
+        orderStatus = "正在查询材料库存…"
+        addOrderStep("查询实时库存", "正在汇总当前订单的板材、封边和五金", "running")
+        runOrder(
+            ["stock-check", "--folder", selectedOrderPath],
+            failureStatus: "库存查询失败，可手工重试"
+        ) { object in
+            self.orderStockRows = (object["rows"] as? [[String: Any]] ?? []).map { row in
+                let code = row["productCode"] as? String ?? UUID().uuidString
+                return OrderStockPreview(
+                    id: code,
+                    productCode: code,
+                    productName: row["productName"] as? String ?? "",
+                    unit: row["unit"] as? String ?? "",
+                    travelerNames: row["travelerNames"] as? [String] ?? [],
+                    required: (row["requiredQuantity"] as? NSNumber)?.doubleValue ?? 0,
+                    available: (row["availableQuantity"] as? NSNumber)?.doubleValue ?? 0,
+                    shortage: (row["shortageQuantity"] as? NSNumber)?.doubleValue ?? 0,
+                    sufficient: row["sufficient"] as? Bool ?? false
+                )
+            }
+            let shortages = self.orderStockRows.filter { !$0.sufficient }.count
+            self.orderStatus = shortages == 0 ? "材料和五金库存查询完成" : "材料和五金库存查询完成，存在库存不足"
+            self.finishOrderStep(
+                shortages == 0
+                    ? "当前订单的板材、封边和五金库存全部充足"
+                    : "\(shortages) 项库存不足，请查看下方比对结果",
+                shortages == 0 ? "success" : "warning"
+            )
+        }
+    }
+
+    func calculateSelectedOrderCost(export: Bool = false) {
+        let orderID = selectedOrderId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !orderID.isEmpty else { return }
+        logUserAction(export ? "导出订单成本" : "计算订单成本", details: ["order_id_present": true])
+        orderCostStatus = export ? "正在生成成本 Excel…" : "正在读取数据库成本…"
+        addOrderStep(export ? "导出成本 Excel" : "计算成本", "按数据库材料、五金和 cost_price 计算", "running")
+        runOrder([
+            export ? "cost-export" : "cost", "--order-id", orderID
+        ], failureStatus: "成本计算失败") { object in
+            self.applyOrderCost(object)
+            if export {
+                self.orderCostExportPath = object["export_path"] as? String ?? ""
+                self.orderCostStatus = self.orderCostExportPath.isEmpty
+                    ? "成本已计算，但没有返回 Excel 路径"
+                    : "成本 Excel 已导出"
+                self.finishOrderStep(self.orderCostStatus, self.orderCostExportPath.isEmpty ? "warning" : "success")
+                if !self.orderCostExportPath.isEmpty {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: self.orderCostExportPath))
+                }
+            } else {
+                self.orderCostStatus = "成本计算完成"
+                self.finishOrderStep(
+                    self.orderCostMissingItems.isEmpty ? "订单成本计算完成" : "成本计算完成，但存在待补充项目",
+                    self.orderCostMissingItems.isEmpty ? "success" : "warning"
+                )
+                self.showCostSheet = true
+            }
+        }
+    }
+
+    private func applyOrderCost(_ object: [String: Any]) {
+        orderCostTotal = (object["total_cost"] as? NSNumber)?.doubleValue
+        orderCostKnown = (object["known_cost"] as? NSNumber)?.doubleValue ?? 0
+        orderCostMissingItems = (object["missing_items"] as? [[String: Any]] ?? []).map { row in
+            let name = row["name"] as? String ?? "未命名项目"
+            let quantity = (row["quantity"] as? NSNumber)?.doubleValue ?? 0
+            let unit = row["unit"] as? String ?? ""
+            let missing = row["missing"] as? String ?? "成本资料缺失"
+            return "\(name) \(quantity.formatted())\(unit)：\(missing)"
+        }
+        orderCostLines = (object["factory_lines"] as? [[String: Any]] ?? []).map { row in
+            OrderCostLine(
+                category: row["category"] as? String ?? "",
+                factoryOrder: row["factory_order"] as? String ?? "",
+                roomName: row["room_name"] as? String ?? "",
+                name: row["name"] as? String ?? "",
+                spec: row["spec"] as? String ?? "",
+                quantity: (row["quantity"] as? NSNumber)?.doubleValue ?? 0,
+                unit: row["unit"] as? String ?? "",
+                productCode: row["product_code"] as? String ?? "",
+                costPrice: (row["cost_price"] as? NSNumber)?.doubleValue,
+                amount: (row["amount"] as? NSNumber)?.doubleValue,
+                missing: row["missing"] as? String ?? ""
+            )
+        }
+        orderCostFactoryTotals = (object["factory_totals"] as? [[String: Any]] ?? []).map { row in
+            let factory = row["factory_order"] as? String ?? "材料汇总"
+            return OrderCostFactoryTotal(
+                id: factory,
+                factoryOrder: factory,
+                total: (row["total"] as? NSNumber)?.doubleValue ?? 0,
+                hasMissing: row["has_missing"] as? Bool ?? false
+            )
         }
     }
 
     func openSelectedOrderTraveler() {
+        logUserAction("打开已生成 Traveler")
         guard !orderExistingTravelerPath.isEmpty else {
-            addOrderStep("无法打开 Traveler", "当前订单尚未生成 Traveler", "failure")
+            addOrderStep("无法查看 Traveler", "当前订单尚未生成 Traveler", "failure")
             return
         }
         let url = URL(fileURLWithPath: orderExistingTravelerPath)
         guard FileManager.default.fileExists(atPath: url.path) else {
-            addOrderStep("无法打开 Traveler", "文件不存在：\(url.path)", "failure")
+            addOrderStep("无法查看 Traveler", "文件不存在：\(url.path)", "failure")
             return
         }
         if NSWorkspace.shared.open(url) {
-            addOrderStep("打开 Traveler", url.lastPathComponent, "success")
+            addOrderStep("查看 Traveler", url.lastPathComponent, "success")
         } else {
-            addOrderStep("无法打开 Traveler", "系统未能打开：\(url.path)", "failure")
+            addOrderStep("无法查看 Traveler", "系统未能打开：\(url.path)", "failure")
         }
     }
 
-    private var projectRoot: URL {
+    func openDashboardLocation(_ path: String) {
+        logUserAction("点击打开所在文件夹")
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var isDirectory: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: trimmed, isDirectory: &isDirectory)
+        let url = URL(fileURLWithPath: trimmed)
+        let folderURL = exists && isDirectory.boolValue ? url : url.deletingLastPathComponent()
+        if !NSWorkspace.shared.open(folderURL) {
+            orderError = "无法打开文件夹：(folderURL.path)"
+        }
+    }
+
+    var projectRoot: URL {
         let bundled = Bundle.main.resourceURL?.appendingPathComponent("project")
         if let bundled = bundled, FileManager.default.fileExists(atPath: bundled.path) { return bundled }
         return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
     }
 
-    func execute(_ mode: String, history: Bool = false, query: String? = nil) {
-        if running { return }
-        running = true
-        hasError = false
-        stderrBuffer = ""
-        rawStderr = ""
-        if mode == "preview" || mode == "scan" { pendingOrder = nil }
-        status = "任务正在启动…"
-        appendActivity("任务已启动；不会覆盖已有 Traveler。")
-        let root = projectRoot
-        let command = root.appendingPathComponent("scripts/traveler-assistant")
-        var arguments = [mode]
-        if history { arguments.append("--include-history") }
-        if let query = query, !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            arguments += ["--query", query]
-        }
-        DispatchQueue.global(qos: .userInitiated).async {
-            let process = Process()
-            let output = Pipe()
-            let errors = Pipe()
-            process.executableURL = command
-            process.arguments = arguments
-            process.currentDirectoryURL = root
-            process.standardOutput = output
-            process.standardError = errors
-            errors.fileHandleForReading.readabilityHandler = { handle in
-                let data = handle.availableData
-                guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
-                DispatchQueue.main.async { self.consumeProgressChunk(chunk) }
-            }
-            do {
-                try process.run()
-                process.waitUntilExit()
-                errors.fileHandleForReading.readabilityHandler = nil
-                let out = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                let remainder = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                DispatchQueue.main.async {
-                    if !remainder.isEmpty { self.consumeProgressChunk(remainder) }
-                    self.consume(out, stderr: self.rawStderr)
-                }
-            } catch {
-                DispatchQueue.main.async { self.fail("无法启动扫描程序：\(error.localizedDescription)") }
-            }
-        }
-    }
-
-    private func consumeProgressChunk(_ chunk: String) {
-        stderrBuffer += chunk
-        let parts = stderrBuffer.components(separatedBy: "\n")
-        stderrBuffer = parts.last ?? ""
-        for line in parts.dropLast() where !line.isEmpty {
-            if let data = line.data(using: .utf8),
-               let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               event["event"] as? String == "progress",
-               let message = event["message"] as? String {
-                appendActivity(message)
-            } else {
-                rawStderr += line + "\n"
-            }
-        }
-    }
-
-    private func appendActivity(_ message: String) {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        let time = formatter.string(from: Date())
-        activityLines.append("[\(time)] \(message)")
-        legacySteps.append(InventoryStep(time: time, title: "旧版扫描", detail: message, state: "success"))
-        status = message
-        details = activityLines.joined(separator: "\n")
-    }
-
-    private func consume(_ output: String, stderr: String) {
-        running = false
-        guard let data = output.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            fail(stderr.isEmpty ? "无法解析扫描结果" : stderr)
-            return
-        }
-        if let fatal = object["fatal"] as? [String: Any] {
-            fail(fatal["message"] as? String ?? "发生严重异常")
-            return
-        }
-        let errors = object["errors"] as? [[String: Any]] ?? []
-        let reports = object["reports"] as? [[String: Any]] ?? []
-        var lines: [String] = []
-        for item in reports {
-            let order = item["order_name"] as? String ?? "未知订单"
-            let factory = item["factory_order"] as? String ?? ""
-            if let created = item["created"] as? String {
-                lines.append("✅ \(order)  \(factory)\n    已生成：\(created)")
-            } else if let updated = item["updated"] as? String {
-                lines.append("✅ \(order)  \(factory)\n    已更新：\(updated)\n    旧版本已备份。")
-            } else if item["action_required"] as? Bool == true {
-                lines.append("🟠 \(order)  \(factory)\n    源报表有变化，等待你比较和决定。")
-                pendingOrder = order
-            } else {
-                lines.append("✓ \(order)  \(factory)\n    已检查")
-            }
-            let ignored = item["ignored_fittings"] as? [[String: Any]] ?? []
-            if !ignored.isEmpty {
-                let names = ignored.compactMap { $0["name"] as? String }.joined(separator: "、")
-                lines.append("    提醒：未写入五金：\(names)")
-            }
-            let warnings = item["warnings"] as? [String] ?? []
-            lines.append(contentsOf: warnings.map { "    提醒：\($0)" })
-        }
-        for item in errors {
-            lines.append("❌ \(item["message"] as? String ?? "未知异常")")
-        }
-        hasError = !errors.isEmpty
-        if hasError { status = "发现 \(errors.count) 项异常" }
-        else if reports.contains(where: { $0["created"] != nil || $0["updated"] != nil }) {
-            status = reports.contains(where: { $0["updated"] != nil }) ? "Traveler 已更新并备份旧版本" : "新 Traveler 已安全生成"
-        } else if reports.isEmpty { status = "扫描完成，没有发现新变化" }
-        else { status = "扫描完成，共检查 \(reports.count) 个工厂单" }
-        let resultText = lines.isEmpty ? "没有待处理项目。" : lines.joined(separator: "\n\n")
-        details = (activityLines + ["", "—— 本次任务结果 ——", resultText]).joined(separator: "\n")
-        if hasError || reports.contains(where: { $0["created"] != nil || $0["updated"] != nil }) {
-            let notice = NSUserNotification()
-            notice.title = "工作流程助手"
-            notice.informativeText = status
-            NSUserNotificationCenter.default.deliver(notice)
-        }
-    }
-
-    private func fail(_ message: String) {
-        running = false
-        hasError = true
-        status = "运行失败"
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        legacySteps.append(InventoryStep(time: formatter.string(from: Date()), title: "旧版扫描失败", detail: message, state: "failure"))
-        details = (activityLines + ["", "❌ \(message)"]).joined(separator: "\n")
-    }
-
-    func openOrders() {
-        NSWorkspace.shared.open(URL(fileURLWithPath: orderRoot))
-    }
 }
 
 enum AppLayout {
-    static let headerHeight: CGFloat = 68
-    static let sidebarMinWidth: CGFloat = 300
-    static let sidebarIdealWidth: CGFloat = 340
-    static let sidebarMaxWidth: CGFloat = 380
-    static let contentMinWidth: CGFloat = 680
-    static let contentPadding: CGFloat = 18
-    static let statusHeight: CGFloat = 38
+    static let headerHeight: CGFloat = 64
+    static let topNavHeight: CGFloat = headerHeight
+    static let topPageTitleFontSize: CGFloat = 19
+    static let headerActionSize: CGFloat = 44
+    static let sidebarMinWidth: CGFloat = 220
+    static let sidebarIdealWidth: CGFloat = 250
+    static let sidebarMaxWidth: CGFloat = 280
+    static let contentMinWidth: CGFloat = 500
+    static let contentPadding: CGFloat = 14
+    static let sectionSpacing: CGFloat = 12
+    static let controlHeight: CGFloat = 44
+    static let actionButtonWidth: CGFloat = 96
+    static let inventoryActionMinWidth: CGFloat = 132
+    static let actionSpacing: CGFloat = 10
+    static let cardCornerRadius: CGFloat = 10
+    static let statusHeight: CGFloat = 44
     static let operationRowHeight: CGFloat = 56
     static let operationVisibleRows = 3
     static let operationListHeight: CGFloat = operationRowHeight * CGFloat(operationVisibleRows)
-    static let operationLogHeight: CGFloat = 242
+    static let operationLogHeight: CGFloat = 196
+    static let inventoryPreviewMinHeight: CGFloat = 320
     static let todoDeadlineColumnWidth: CGFloat = 270
     static let todoListMaxHeight: CGFloat = 340
     static let todoInputMinHeight: CGFloat = 92
     static let todoTableHeaderFontSize: CGFloat = 17
     static let todoTableBodyFontSize: CGFloat = 16
     static let materialNameFontSize: CGFloat = 18
-    static let windowMinWidth: CGFloat = 1060
-    static let windowMinHeight: CGFloat = 720
+    // Match the current production workspace size; keep a safe minimum so the
+    // leading icon, navigation, and action controls never get clipped.
+    static let windowMinWidth: CGFloat = 1180
+    static let windowMinHeight: CGFloat = 760
+    static let windowIdealWidth: CGFloat = 1760
+    static let windowIdealHeight: CGFloat = 1360
+    static let inventoryOrderContextWidth: CGFloat = 735
+}
+
+func inventoryActionColumnCount(availableWidth: CGFloat) -> Int {
+    max(1, Int((availableWidth + AppLayout.actionSpacing) /
+        (AppLayout.inventoryActionMinWidth + AppLayout.actionSpacing)))
 }
 
 enum AppPalette {
-    static let accent = Color.accentColor
-    static let surface = Color(nsColor: .controlBackgroundColor)
-    static let success = Color.green
-    static let warning = Color.orange
-    static let danger = Color.red
+    static let interfaceColorScheme: ColorScheme = .light
+    static let accent = Color(red: 0.23, green: 0.43, blue: 0.91)
+    static let cyan = Color(red: 0.10, green: 0.55, blue: 0.65)
+    static let background = Color(red: 0.972, green: 0.965, blue: 0.945)
+    static let surface = Color.white
+    static let subtleSurface = Color(red: 0.956, green: 0.960, blue: 0.968)
+    static let separator = Color(red: 0.885, green: 0.895, blue: 0.915)
+    static let success = Color(red: 0.18, green: 0.56, blue: 0.39)
+    static let warning = Color(red: 0.76, green: 0.47, blue: 0.08)
+    static let danger = Color(red: 0.76, green: 0.27, blue: 0.27)
     static let ignored = Color.gray
+}
+
+func inventoryCatalogUpdateSuccessStatus(_ count: Int) -> String {
+    "✅ 商品资料更新成功，共 \(count) 个商品"
+}
+
+func inventoryCatalogUpdateSuccessStatus(
+    _ count: Int,
+    added: Int,
+    updated: Int,
+    removed: Int
+) -> String {
+    "✅ 商品资料更新成功，共 \(count) 个商品（新增 \(added)，更新 \(updated)，删除 \(removed)）"
+}
+
+func inventoryCatalogUpdateFailureStatus(_ reason: String) -> String {
+    "❌ 商品资料更新失败：\(reason)"
+}
+
+enum SettingsStatusKind: Equatable {
+    case neutral
+    case info
+    case success
+    case warning
+    case danger
+
+    var color: Color {
+        switch self {
+        case .neutral: return .secondary
+        case .info: return AppPalette.accent
+        case .success: return AppPalette.success
+        case .warning: return AppPalette.warning
+        case .danger: return AppPalette.danger
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .neutral: return "info.circle"
+        case .info: return "arrow.triangle.2.circlepath"
+        case .success: return "checkmark.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .danger: return "xmark.circle.fill"
+        }
+    }
+}
+
+func settingsStatusKind(_ status: String) -> SettingsStatusKind {
+    let text = status.trimmingCharacters(in: .whitespacesAndNewlines)
+    if text.hasPrefix("✅") { return .success }
+    if text.hasPrefix("❌") { return .danger }
+    if text.hasPrefix("⚠️") || text.localizedCaseInsensitiveContains("警告") { return .warning }
+    if text.localizedCaseInsensitiveContains("正在") || text.hasSuffix("…") { return .info }
+    return .neutral
+}
+
+func settingsStatusDisplayText(_ status: String) -> String {
+    status
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: "^(✅|❌|⚠️|ℹ️)\\s*", with: "", options: .regularExpression)
+}
+
+struct SettingsStatusBanner: View {
+    let status: String
+
+    var body: some View {
+        if !status.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let kind = settingsStatusKind(status)
+            HStack(alignment: .top, spacing: 9) {
+                Image(systemName: kind.symbol)
+                    .foregroundColor(kind.color)
+                    .frame(width: 18)
+                Text(settingsStatusDisplayText(status))
+                    .font(.callout)
+                    .foregroundColor(.primary)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(kind.color.opacity(0.09))
+            .overlay(
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .stroke(kind.color.opacity(0.24), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(settingsStatusDisplayText(status))
+        }
+    }
 }
 
 extension View {
     func appPageFrame() -> some View {
-        frame(minWidth: AppLayout.windowMinWidth, minHeight: AppLayout.windowMinHeight, alignment: .top)
+        frame(minHeight: AppLayout.windowMinHeight - AppLayout.topNavHeight, alignment: .top)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .background(AppPalette.background)
+    }
+
+    func appInputField(maxWidth: CGFloat? = nil) -> some View {
+        frame(maxWidth: maxWidth, minHeight: AppLayout.controlHeight, maxHeight: AppLayout.controlHeight)
+    }
+
+    func appActionButton(minWidth: CGFloat = AppLayout.actionButtonWidth) -> some View {
+        controlSize(.regular)
+            .frame(minWidth: minWidth, minHeight: AppLayout.controlHeight)
+    }
+
+    func inventoryActionButton(minWidth: CGFloat = AppLayout.inventoryActionMinWidth) -> some View {
+        controlSize(.regular)
+            .frame(
+                minWidth: minWidth,
+                maxWidth: .infinity,
+                minHeight: AppLayout.controlHeight,
+                maxHeight: AppLayout.controlHeight
+            )
+    }
+}
+
+struct AppSurfaceCard<Content: View>: View {
+    let padding: CGFloat
+    @ViewBuilder let content: Content
+
+    init(padding: CGFloat = 16, @ViewBuilder content: () -> Content) {
+        self.padding = padding
+        self.content = content()
+    }
+
+    var body: some View {
+        content
+            .padding(padding)
+            .background(AppPalette.surface)
+            .clipShape(RoundedRectangle(cornerRadius: AppLayout.cardCornerRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: AppLayout.cardCornerRadius, style: .continuous)
+                    .stroke(AppPalette.separator, lineWidth: 1)
+            )
+    }
+}
+
+struct AppStatusBadge: View {
+    enum Kind { case neutral, info, success, warning, danger }
+
+    let text: String
+    let kind: Kind
+
+    private var color: Color {
+        switch kind {
+        case .neutral: return .secondary
+        case .info: return AppPalette.accent
+        case .success: return AppPalette.success
+        case .warning: return AppPalette.warning
+        case .danger: return AppPalette.danger
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(color).frame(width: 7, height: 7)
+            Text(text).lineLimit(1)
+        }
+        .font(.caption.weight(.semibold))
+        .foregroundColor(color)
+        .padding(.horizontal, 9)
+        .frame(minHeight: 26)
+        .background(color.opacity(0.10))
+        .clipShape(Capsule())
+        .accessibilityLabel(text)
+    }
+}
+
+private struct WidthPreferenceKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+struct ScrollingTextOnHover: View {
+    let text: String
+    var font: Font = .body
+    var foreground: Color = .primary
+
+    @State private var textWidth: CGFloat = 0
+    @State private var containerWidth: CGFloat = 0
+    @State private var offset: CGFloat = 0
+    @State private var isHovering = false
+    @State private var scrollTask: Task<Void, Never>?
+
+    private var overflow: CGFloat {
+        max(0, textWidth - containerWidth)
+    }
+
+    var body: some View {
+        GeometryReader { proxy in
+            ZStack(alignment: .leading) {
+                Text(text)
+                    .font(font)
+                    .foregroundColor(foreground)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .background(
+                        GeometryReader { textProxy in
+                            Color.clear.preference(key: WidthPreferenceKey.self, value: textProxy.size.width)
+                        }
+                    )
+                    .offset(x: offset)
+            }
+                // GeometryReader can receive a narrow proposal inside an HStack. Make that
+                // proposal the explicit clipping boundary so a long filename never paints
+                // over the status column or the adjacent split-view pane.
+                .frame(width: max(0, proxy.size.width), height: proxy.size.height, alignment: .leading)
+                .clipped()
+                .onPreferenceChange(WidthPreferenceKey.self) { textWidth = $0 }
+                .onAppear { containerWidth = proxy.size.width }
+                .onChange(of: proxy.size.width) { _, width in containerWidth = width }
+                .onHover { hover in
+                    isHovering = hover
+                    if hover {
+                        startScrolling()
+                    } else {
+                        stopScrolling()
+                    }
+                }
+        }
+        .frame(height: 20)
+    }
+
+    private func startScrolling() {
+        scrollTask?.cancel()
+        offset = 0
+        guard overflow > 4 else { return }
+        scrollTask = Task {
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            while !Task.isCancelled && isHovering {
+                let duration = max(1.2, Double(overflow) / 36)
+                await MainActor.run {
+                    withAnimation(.linear(duration: duration)) {
+                        offset = -overflow
+                    }
+                }
+                try? await Task.sleep(nanoseconds: UInt64((duration + 0.45) * 1_000_000_000))
+                await MainActor.run {
+                    withAnimation(.easeOut(duration: 0.15)) { offset = 0 }
+                }
+                try? await Task.sleep(nanoseconds: 450_000_000)
+            }
+        }
+    }
+
+    private func stopScrolling() {
+        scrollTask?.cancel()
+        scrollTask = nil
+        withAnimation(.easeOut(duration: 0.15)) { offset = 0 }
+    }
+}
+
+struct InventoryActionGrid<Content: View>: View {
+    let minColumnWidth: CGFloat
+    @ViewBuilder let content: Content
+
+    init(
+        minColumnWidth: CGFloat = AppLayout.inventoryActionMinWidth,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.minColumnWidth = minColumnWidth
+        self.content = content()
+    }
+
+    var body: some View {
+        LazyVGrid(
+            columns: [GridItem(.adaptive(minimum: minColumnWidth), spacing: AppLayout.actionSpacing)],
+            alignment: .trailing,
+            spacing: AppLayout.actionSpacing
+        ) {
+            content
+        }
+        .frame(maxWidth: .infinity, alignment: .trailing)
     }
 }
 
@@ -1445,29 +3723,24 @@ struct AppPageHeader<Trailing: View>: View {
     @ViewBuilder let trailing: Trailing
 
     var body: some View {
-        HStack(alignment: .center, spacing: 14) {
-            Image(systemName: systemImage)
-                .font(.system(size: 25)).foregroundColor(AppPalette.accent)
-                .frame(width: 32, height: 32, alignment: .center)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.title3).fontWeight(.semibold)
-                Text(subtitle).font(.caption).foregroundColor(.secondary)
-            }
-            Spacer()
-            trailing
-        }
-        .padding(.horizontal, 20)
-        .frame(height: AppLayout.headerHeight, alignment: .center)
+        Color.clear.frame(height: 0)
     }
 }
 
 struct OperationLogCard: View {
     let steps: [InventoryStep]
     let emptyText: String
+    let showsDuration: Bool
+
+    init(steps: [InventoryStep], emptyText: String, showsDuration: Bool = false) {
+        self.steps = steps
+        self.emptyText = emptyText
+        self.showsDuration = showsDuration
+    }
 
     var body: some View {
-        GroupBox(label: Label("操作记录", systemImage: "list.number")) {
-            SelectableOperationLogView(steps: steps, emptyText: emptyText)
+        GroupBox {
+            SelectableOperationLogView(steps: steps, emptyText: emptyText, showsDuration: showsDuration)
                 .padding(6)
         }
         .frame(height: AppLayout.operationLogHeight)
@@ -1483,26 +3756,32 @@ struct OrderWorkflowView: View {
             AppPageHeader(
                 systemImage: "folder.badge.gearshape",
                 title: "生产文件",
-                subtitle: "选择服务器订单，预检后生成一份 Traveler"
+                subtitle: "选择订单、预检材料并生成或更新 Traveler"
             ) {
-                Button("刷新订单文件夹") { model.loadOrderFolders() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(model.orderRunning)
+                AppStatusBadge(
+                    text: "服务器",
+                    kind: .success
+                )
+                if model.orderRunning { ProgressView().controlSize(.small) }
             }
             Divider()
-
             HSplitView {
                 VStack(alignment: .leading, spacing: 10) {
                     Text("服务器订单").font(.headline)
-                    Picker("订单类型", selection: $model.orderSourceKind) {
-                        Text("自有订单").tag("owned")
-                        Text("来料加工").tag("cutToSize")
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.segmented)
-                    .disabled(model.orderRunning)
-                    .onChange(of: model.orderSourceKind) { _ in
-                        model.loadOrderFolders()
+                    HStack {
+                        Spacer(minLength: 0)
+                        Picker("订单类型", selection: $model.orderSourceKind) {
+                            Text("自有订单").tag("owned")
+                            Text("来料加工").tag("cutToSize")
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 260)
+                        .disabled(model.orderRunning)
+                        .onChange(of: model.orderSourceKind) { _, _ in
+                            model.loadOrderFolders()
+                        }
+                        Spacer(minLength: 0)
                     }
                     Text("这里只读取文件夹名称；点击订单后才打开 Excel。")
                         .font(.caption).foregroundColor(.secondary)
@@ -1517,7 +3796,7 @@ struct OrderWorkflowView: View {
                                             .foregroundColor(.accentColor)
                                         VStack(alignment: .leading, spacing: 2) {
                                             Text(item.orderId).fontWeight(.semibold)
-                                            Text(item.modifiedAt).font(.caption2).foregroundColor(.secondary)
+                                            Text(appDisplayTimestamp(item.modifiedAt)).font(.caption2).foregroundColor(.secondary)
                                         }
                                         Spacer()
                                     }
@@ -1544,24 +3823,27 @@ struct OrderWorkflowView: View {
                         Circle()
                             .fill(model.orderError.isEmpty ? (model.orderPreviewReady ? AppPalette.success : Color.secondary) : AppPalette.danger)
                             .frame(width: 10, height: 10)
-                        Text(model.orderStatus).fontWeight(.semibold)
+                        Text(model.orderStatus)
+                            .fontWeight(.semibold)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                         Spacer()
-                        if model.orderRunning { ProgressView().controlSize(.small) }
-                        Button("打开 Traveler") {
-                            model.openSelectedOrderTraveler()
-                        }
-                        .disabled(model.orderExistingTravelerPath.isEmpty)
-                        Button(model.orderExistingTravelerPath.isEmpty ? "生成 Traveler" : "更新 Traveler") {
-                            model.generateSelectedOrder()
-                        }
-                            .buttonStyle(.borderedProminent)
+                        HStack(spacing: 6) {
+                            Button("查询材料库存") {
+                                model.checkSelectedOrderStock()
+                            }
+                            .buttonStyle(.bordered)
+                            .appActionButton(minWidth: 128)
                             .disabled(model.orderRunning || !model.orderPreviewReady)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .trailing)
                     }
                     .frame(height: AppLayout.statusHeight)
 
                     OperationLogCard(
                         steps: model.orderSteps,
-                        emptyText: "选择订单后，这里会显示读取、校验和生成过程。"
+                        emptyText: "选择订单后，这里会显示读取、校验和生成过程。",
+                        showsDuration: true
                     )
 
                     ScrollView {
@@ -1570,11 +3852,14 @@ struct OrderWorkflowView: View {
                                 GroupBox(label: centeredTitle("订单基本信息", systemImage: "doc.text")) {
                                     VStack(alignment: .leading, spacing: 14) {
                                         HStack(spacing: 12) {
+                                            let relatedOrderIDs = model.selectedOrderId.split(separator: "、")
+                                            let hasRelatedOrders = relatedOrderIDs.count > 1
                                             summaryCard(
-                                                title: "订单号",
+                                                title: hasRelatedOrders ? "关联订单（\(relatedOrderIDs.count) 个）" : "订单号",
                                                 value: model.selectedOrderId,
                                                 detail: URL(fileURLWithPath: model.orderMaterialsFile).lastPathComponent,
-                                                color: AppPalette.accent
+                                                color: hasRelatedOrders ? AppPalette.warning : AppPalette.accent,
+                                                warning: hasRelatedOrders
                                             )
                                             summaryCard(
                                                 title: "工厂单",
@@ -1626,7 +3911,7 @@ struct OrderWorkflowView: View {
                                                 alignment: .leading,
                                                 spacing: 9
                                             ) {
-                                                ForEach(model.orderMaterials) { row in
+                                                ForEach(orderedMaterialRows(model.orderMaterials)) { row in
                                                     let isColoredPanel = row.kind == "panel"
                                                     let normalizedColor = row.color.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                                                     let warnsAboutThickness = isColoredPanel && warningColors.contains(normalizedColor)
@@ -1672,7 +3957,7 @@ struct OrderWorkflowView: View {
                                                 alignment: .leading,
                                                 spacing: 9
                                             ) {
-                                                ForEach(model.orderEdgeBanding.keys.sorted(), id: \.self) { color in
+                                                ForEach(orderedEdgeColors(Array(model.orderEdgeBanding.keys), matching: orderedMaterialRows(model.orderMaterials)), id: \.self) { color in
                                                     HStack {
                                                         VStack(alignment: .leading, spacing: 4) {
                                                             Text(color)
@@ -1697,6 +3982,45 @@ struct OrderWorkflowView: View {
                                     }
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding(10)
+                                }
+                            }
+
+                            if !model.orderStockRows.isEmpty {
+                                GroupBox(label: centeredTitle("所需材料与实时库存", systemImage: "shippingbox.and.arrow.backward")) {
+                                    VStack(spacing: 0) {
+                                        HStack(spacing: 10) {
+                                            Text("商品").frame(maxWidth: .infinity, alignment: .leading)
+                                            Text("编号").frame(width: 86, alignment: .leading)
+                                            Text("单位").frame(width: 50, alignment: .center)
+                                            Text("所需").frame(width: 72, alignment: .trailing)
+                                            Text("库存").frame(width: 72, alignment: .trailing)
+                                            Text("结果").frame(width: 90, alignment: .trailing)
+                                        }
+                                        .font(.caption).foregroundColor(.secondary)
+                                        .padding(.horizontal, 10).padding(.vertical, 7)
+                                        Divider()
+                                        ForEach(model.orderStockRows) { row in
+                                            HStack(spacing: 10) {
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(row.productName).fontWeight(.medium).lineLimit(1)
+                                                    Text(row.travelerNames.joined(separator: "、"))
+                                                        .font(.caption2).foregroundColor(.secondary).lineLimit(1)
+                                                }
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                Text(row.productCode).frame(width: 86, alignment: .leading)
+                                                Text(row.unit.isEmpty ? "—" : row.unit).frame(width: 50, alignment: .center)
+                                                Text(row.required.formatted()).frame(width: 72, alignment: .trailing)
+                                                Text(row.available.formatted()).frame(width: 72, alignment: .trailing)
+                                                Text(row.sufficient ? "充足" : "缺 \(row.shortage.formatted())")
+                                                    .fontWeight(.semibold)
+                                                    .foregroundColor(row.sufficient ? AppPalette.success : AppPalette.warning)
+                                                    .frame(width: 90, alignment: .trailing)
+                                            }
+                                            .padding(.horizontal, 10).padding(.vertical, 8)
+                                            Divider()
+                                        }
+                                    }
+                                    .padding(8)
                                 }
                             }
 
@@ -1794,27 +4118,43 @@ struct OrderWorkflowView: View {
                     }
                 }
                 .padding(AppLayout.contentPadding)
-                .frame(minWidth: AppLayout.contentMinWidth)
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
             }
         }
         .appPageFrame()
         .onAppear {
             if model.orderFolders.isEmpty { model.loadOrderFolders() }
         }
-        .onChange(of: model.selectedOrderPath) { _ in
+        .onChange(of: model.selectedOrderPath) { _, _ in
             selectedFittingIDs.removeAll()
+        }
+        .alert("未找到 material 文件", isPresented: $model.showMaterialGenerationPrompt) {
+            Button("自动生成") {
+                model.generateMissingMaterial()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("当前订单没有 material 文件。是否从 Report 文件夹的板材清单和封边统计自动生成？如果目录结构过于复杂无法读取，系统会提示你手动生成。")
         }
     }
 
-    private func summaryCard(title: String, value: String, detail: String, color: Color) -> some View {
+    private func summaryCard(title: String, value: String, detail: String, color: Color, warning: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title).font(.caption).foregroundColor(.secondary)
-            Text(value).font(.title3).fontWeight(.bold).foregroundColor(color)
+            HStack(alignment: .top, spacing: 5) {
+                if warning { Image(systemName: "exclamationmark.triangle.fill").foregroundColor(color) }
+                Text(value)
+                    .font(.title3)
+                    .fontWeight(.bold)
+                    .foregroundColor(color)
+                    .lineLimit(2)
+                    .frame(height: 44, alignment: .top)
+            }
             Text(detail.isEmpty ? "—" : detail)
                 .font(.caption2).foregroundColor(.secondary).lineLimit(1)
         }
         .padding(11)
-        .frame(maxWidth: .infinity, minHeight: 76, alignment: .leading)
+        .frame(maxWidth: .infinity, minHeight: 112, maxHeight: 112, alignment: .leading)
         .background(color.opacity(0.07))
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).stroke(color.opacity(0.16), lineWidth: 1))
@@ -1837,98 +4177,9 @@ struct OrderWorkflowView: View {
     }
 }
 
-struct ContentView: View {
-    @ObservedObject var model: AppModel
-
-    var body: some View {
-        VStack(spacing: 0) {
-            AppPageHeader(
-                systemImage: "doc.text.magnifyingglass",
-                title: "旧版扫描",
-                subtitle: "生产订单与 Traveler 历史扫描"
-            ) {
-                Button("打开订单文件夹") { model.openOrders() }
-            }
-            Divider()
-
-            HSplitView {
-                AnyView(VStack(alignment: .leading, spacing: 12) {
-                    GroupBox(label: Label("查询与扫描", systemImage: "magnifyingglass")) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("支持 PP0047、F2607020183 或 PP0047-KITCHEN")
-                                .font(.caption).foregroundColor(.secondary)
-                            TextField("输入订单号、工厂单号或 PP 空间名称", text: $model.query)
-                                .textFieldStyle(.roundedBorder)
-                            HStack {
-                                Button("查询") { model.execute("preview", history: true, query: model.query) }
-                                    .disabled(model.running || model.query.isEmpty)
-                                Button("预览新变化") { model.execute("preview") }.disabled(model.running)
-                            }
-                            HStack {
-                                Button("扫描并生成新订单") {
-                                    let targeted = !model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                    model.execute("scan", history: targeted, query: targeted ? model.query : nil)
-                                }
-                                .buttonStyle(.borderedProminent).disabled(model.running)
-                                if model.running { ProgressView().controlSize(.small) }
-                            }
-                            if let pending = model.pendingOrder {
-                                Divider()
-                                Text("\(pending) 有版本差异，请确认后选择更新方式。")
-                                    .font(.caption).foregroundColor(AppPalette.warning)
-                                Button("更新自动字段") { model.execute("update", history: true, query: pending) }
-                                    .disabled(model.running)
-                                Button("按模板重新生成") { model.execute("rebuild", history: true, query: pending) }
-                                    .disabled(model.running)
-                            }
-                        }
-                        .padding(8)
-                    }
-                    Spacer()
-                }
-                .padding(AppLayout.contentPadding)
-                .frame(
-                    minWidth: AppLayout.sidebarMinWidth,
-                    idealWidth: AppLayout.sidebarIdealWidth,
-                    maxWidth: AppLayout.sidebarMaxWidth
-                ))
-
-                AnyView(VStack(alignment: .leading, spacing: 12) {
-                    HStack {
-                        Circle().fill(model.hasError ? AppPalette.danger : AppPalette.success).frame(width: 10, height: 10)
-                        Text(model.status).fontWeight(.semibold)
-                        Spacer()
-                        if model.running { ProgressView().controlSize(.small) }
-                    }
-                    .padding(.horizontal, 14)
-                    .frame(height: AppLayout.statusHeight)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .cornerRadius(10)
-
-                    OperationLogCard(
-                        steps: model.legacySteps,
-                        emptyText: "运行旧版扫描后，这里会保留可整行选择和复制的操作记录。"
-                    )
-
-                    GroupBox(label: Label("运行结果", systemImage: model.hasError ? "exclamationmark.triangle" : "list.bullet.rectangle")) {
-                        ScrollView {
-                            Text(model.details).frame(maxWidth: .infinity, alignment: .leading)
-                                .textSelection(.enabled).padding(10)
-                        }
-                    }
-                }
-                .padding(AppLayout.contentPadding)
-                .frame(minWidth: AppLayout.contentMinWidth))
-            }
-        }
-        .appPageFrame()
-    }
-}
-
 struct SettingsCard<Content: View>: View {
     let title: String
     let symbol: String
-    let minHeight: CGFloat
     @ViewBuilder let content: Content
 
     var body: some View {
@@ -1939,37 +4190,25 @@ struct SettingsCard<Content: View>: View {
             Divider()
             content
         }
-        .padding(18)
-        .frame(maxWidth: .infinity, minHeight: minHeight, maxHeight: .infinity, alignment: .topLeading)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
+        .background(AppPalette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: AppLayout.cardCornerRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+            RoundedRectangle(cornerRadius: AppLayout.cardCornerRadius, style: .continuous)
+                .stroke(AppPalette.separator, lineWidth: 1)
         )
-    }
-}
-
-struct RuleNumberRow: View {
-    let label: String
-    @Binding var value: Double
-    var unit = "mm"
-
-    var body: some View {
-        HStack {
-            Text(label)
-            Spacer()
-            TextField("", value: $value, format: .number)
-                .multilineTextAlignment(.trailing)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 90)
-            Text(unit).foregroundColor(.secondary).frame(width: 28, alignment: .leading)
-        }
     }
 }
 
 struct InventoryStepRowView: View {
     let step: InventoryStep
+    let showsDuration: Bool
+
+    init(step: InventoryStep, showsDuration: Bool = false) {
+        self.step = step
+        self.showsDuration = showsDuration
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 9) {
@@ -1980,7 +4219,7 @@ struct InventoryStepRowView: View {
                     Spacer()
                     Text(step.time).font(.caption2).foregroundColor(.secondary)
                 }
-                Text(step.detail)
+                Text(detailText)
                     .font(.caption)
                     .foregroundColor(step.state == "failure" ? .red : .secondary)
                     .lineLimit(2)
@@ -1992,11 +4231,17 @@ struct InventoryStepRowView: View {
             Button("复制整条记录") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(
-                    "[\(step.time)] \(step.title)\n\(step.detail)",
+                    "[\(step.time)] \(step.title)\n\(detailText)",
                     forType: .string
                 )
             }
         }
+    }
+
+    private var detailText: String {
+        guard showsDuration else { return step.detail }
+        let elapsed = step.duration ?? step.startedAt.map { max(0, Date().timeIntervalSince($0)) } ?? 0
+        return "\(step.detail)（用时 \(operationDurationText(elapsed))）"
     }
 
     @ViewBuilder
@@ -2051,7 +4296,14 @@ struct OperationLogAutoScroller: NSViewRepresentable {
 struct SelectableOperationLogView: View {
     let steps: [InventoryStep]
     let emptyText: String
+    let showsDuration: Bool
     @State private var selectedIDs: Set<UUID> = []
+
+    init(steps: [InventoryStep], emptyText: String, showsDuration: Bool = false) {
+        self.steps = steps
+        self.emptyText = emptyText
+        self.showsDuration = showsDuration
+    }
 
     var body: some View {
         VStack(spacing: 6) {
@@ -2082,7 +4334,7 @@ struct SelectableOperationLogView: View {
                             Button {
                                 select(step.id)
                             } label: {
-                                InventoryStepRowView(step: step)
+                                InventoryStepRowView(step: step, showsDuration: showsDuration)
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .contentShape(Rectangle())
                             }
@@ -2107,13 +4359,13 @@ struct SelectableOperationLogView: View {
                 )
             }
         }
-        .onChange(of: steps.map(\.id)) { ids in
+        .onChange(of: steps.map(\.id)) { _, ids in
             selectedIDs = selectedIDs.intersection(Set(ids))
         }
     }
 
     private var scrollRevision: String {
-        steps.map { "\($0.id.uuidString)|\($0.state)|\($0.title)|\($0.detail)" }
+        steps.map { "\($0.id.uuidString)|\($0.state)|\($0.title)|\($0.detail)|\($0.duration ?? -1)" }
             .joined(separator: "\n")
     }
 
@@ -2132,7 +4384,16 @@ struct SelectableOperationLogView: View {
     private func copySelected() {
         let text = steps
             .filter { selectedIDs.contains($0.id) }
-            .map { "[\($0.time)] \($0.title)\n\($0.detail)" }
+            .map { step in
+                let detail: String
+                if showsDuration {
+                    let elapsed = step.duration ?? step.startedAt.map { max(0, Date().timeIntervalSince($0)) } ?? 0
+                    detail = "\(step.detail)（用时 \(operationDurationText(elapsed))）"
+                } else {
+                    detail = step.detail
+                }
+                return "[\(step.time)] \(step.title)\n\(detail)"
+            }
             .joined(separator: "\n\n")
         guard !text.isEmpty else { return }
         NSPasteboard.general.clearContents()
@@ -2153,17 +4414,19 @@ struct InventoryTravelerRowView: View {
                     .foregroundColor(selected ? .accentColor : .secondary)
                     .frame(width: 18)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(item.fileName).lineLimit(1)
+                    ScrollingTextOnHover(text: item.fileName)
                     if !item.orderName.isEmpty {
-                        Text(item.orderName)
-                            .font(.caption).foregroundColor(.secondary).lineLimit(1)
+                        ScrollingTextOnHover(text: item.orderName, font: .caption, foreground: .secondary)
                     }
                 }
-                .frame(minHeight: 22, alignment: .center)
-                Spacer()
+                .frame(minWidth: 0, maxWidth: .infinity, minHeight: 22, alignment: .center)
+                Spacer(minLength: 4)
                 Text(item.status)
                     .font(.caption)
                     .foregroundColor(statusColor)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .layoutPriority(1)
             }
             .padding(.leading, 24).padding(.trailing, 8).padding(.vertical, 7)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -2204,9 +4467,11 @@ struct InventoryMappingSheet: View {
             HStack {
                 TextField("输入商品编号、名称或规格", text: $query)
                     .textFieldStyle(.roundedBorder)
+                    .appInputField()
                     .onSubmit { model.searchInventoryProducts(query) }
                 Button("搜索") { model.searchInventoryProducts(query) }
                     .buttonStyle(.borderedProminent)
+                    .appActionButton(minWidth: 72)
                     .disabled(model.inventoryRunning)
             }
             Text(model.inventoryProductSearchStatus)
@@ -2254,39 +4519,129 @@ struct InventoryMappingSheet: View {
 
 struct InventoryView: View {
     @ObservedObject var model: AppModel
+    let onClose: (() -> Void)?
+    let orderContextID: String
+    let orderContextFactoryNames: [String]
+    let orderContextFactoryOrders: [String]
     @State private var expandedFolders: Set<String> = []
     @State private var confirmRealSave = false
+    @State private var acknowledgedRealSave = false
     @State private var selectedPreviewRows: Set<UUID> = []
     @State private var showMappingSheet = false
     @State private var mappingTravelerName = ""
 
+    init(
+        model: AppModel,
+        onClose: (() -> Void)? = nil,
+        orderContextID: String = "",
+        orderContextFactoryNames: [String] = [],
+        orderContextFactoryOrders: [String] = []
+    ) {
+        self.model = model
+        self.onClose = onClose
+        self.orderContextID = orderContextID
+        self.orderContextFactoryNames = orderContextFactoryNames
+        self.orderContextFactoryOrders = orderContextFactoryOrders
+    }
+
+    private var isOrderContext: Bool { !orderContextID.isEmpty }
+
     private var selectedRows: [InventoryTraveler] {
         model.inventoryTravelers.filter { model.selectedInventoryPaths.contains($0.id) }
+    }
+
+    private var selectedTravelerCount: Int {
+        isOrderContext
+            ? (model.selectedInventoryOrderID.isEmpty ? 0 : 1)
+            : model.selectedInventoryPaths.count
+    }
+
+    private var hasMappedOutboundRows: Bool {
+        model.inventoryPreviewRows.contains { $0.status == "已映射" }
+    }
+
+    private var hasConfirmedNoOutboundRows: Bool {
+        model.inventoryPreviewRows.contains {
+            ["客户提供", "余料生产", "不需要出库", "不出库"].contains($0.status)
+        }
+    }
+
+    private var confirmationTitle: String {
+        hasMappedOutboundRows ? "确认出库" : "确认无需出库"
+    }
+
+    private var selectedTravelerDisplayName: String {
+        if let row = selectedRows.first { return row.fileName }
+        return orderContextID.isEmpty ? "当前订单" : orderContextID
     }
 
     private var groupedTravelers: [(String, [InventoryTraveler])] {
         groupInventoryTravelersByNewest(model.inventoryTravelers)
     }
 
+    @ViewBuilder
+    private func inventoryContentContainer<Content: View>(
+        @ViewBuilder _ content: () -> Content
+    ) -> some View {
+        content()
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private func togglePreviewRow(_ id: UUID) {
+        guard !model.inventoryRunning else { return }
+        if selectedPreviewRows.contains(id) {
+            selectedPreviewRows.remove(id)
+        } else {
+            selectedPreviewRows.insert(id)
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            AppPageHeader(
-                systemImage: "shippingbox.fill",
-                title: "出库",
-                subtitle: "点击 Traveler 自动预检材料，再写入其他出库单"
+                AppPageHeader(
+                    systemImage: "shippingbox.fill",
+                    title: "出库",
+                    subtitle: isOrderContext
+                    ? "订单 \(model.selectedOrderId)"
+                    : "Traveler 材料映射、库存预检与确认写入"
             ) {
-                Text(model.inventoryCatalogStatus)
-                    .font(.caption).foregroundColor(.secondary)
-                Button("更新商品资料") {
-                    model.updateInventoryCatalog()
-                }
-                .disabled(model.inventoryRunning)
-                Button("刷新列表") { model.loadInventory() }
-                    .buttonStyle(.borderedProminent)
+                AppStatusBadge(
+                    text: model.inventoryWriteCompleted
+                        ? "已出库"
+                        : (model.inventoryErrors.isEmpty ? "库存工作台就绪" : "需要处理错误"),
+                    kind: model.inventoryWriteCompleted || model.inventoryErrors.isEmpty ? .success : .danger
+                )
+                if model.inventoryRunning { ProgressView().controlSize(.small) }
             }
             Divider()
-
+            HStack(spacing: 10) {
+                outboundStep(1, isOrderContext ? "选择工厂单" : "选择文件", active: selectedTravelerCount == 0)
+                Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
+                outboundStep(2, isOrderContext ? "数据预检" : "材料预检", active: selectedTravelerCount > 0 && !model.inventoryPreviewRows.isEmpty && !model.inventoryWriteCompleted)
+                Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
+                outboundStep(3, "确认出库", active: confirmRealSave || model.inventoryWriteCompleted)
+                Spacer()
+                if model.inventoryPreviewRows.contains(where: { $0.status == "未映射" }) {
+                    AppStatusBadge(text: "映射阻断", kind: .danger)
+                } else if !model.inventoryPreviewRows.isEmpty {
+                    AppStatusBadge(text: "预检完成", kind: .success)
+                }
+                if let onClose {
+                    Button("关闭", systemImage: "xmark") {
+                        onClose()
+                    }
+                    .buttonStyle(.bordered)
+                    .appActionButton(minWidth: 84)
+                    .disabled(model.inventoryRunning)
+                    .help(model.inventoryRunning ? "库存操作进行中，暂不能关闭" : "关闭出库界面")
+                }
+            }
+            .padding(.horizontal, AppLayout.contentPadding)
+            .frame(height: 54)
+            .background(AppPalette.surface)
+            .overlay(Divider(), alignment: .bottom)
             HSplitView {
+                if !isOrderContext {
                 AnyView(VStack(alignment: .leading, spacing: 10) {
                     HStack {
                         Text("Traveler 文件").font(.headline)
@@ -2359,89 +4714,91 @@ struct InventoryView: View {
                     idealWidth: AppLayout.sidebarIdealWidth,
                     maxWidth: AppLayout.sidebarMaxWidth
                 ))
+                }
 
-                AnyView(VStack(alignment: .leading, spacing: 12) {
-                    HStack {
-                        Circle()
-                            .fill(model.inventoryErrors.isEmpty ? AppPalette.success : AppPalette.danger)
-                            .frame(width: 10, height: 10)
-                        Text(model.inventorySuccessMessage.isEmpty ? model.inventoryStatus : model.inventorySuccessMessage)
-                            .fontWeight(.semibold)
-                            .foregroundColor(model.inventorySuccessMessage.isEmpty ? .primary : AppPalette.success)
-                            .lineLimit(1)
-                        Spacer()
-                        if model.inventoryRunning { ProgressView().controlSize(.small) }
-                    }
-                    .frame(height: AppLayout.statusHeight)
-
+                AnyView(inventoryContentContainer {
+                VStack(alignment: .leading, spacing: 12) {
                     OperationLogCard(
                         steps: model.inventorySteps,
-                        emptyText: "点击“刷新列表”或左侧 Traveler 后，这里会逐步显示正在做什么。"
+                        emptyText: isOrderContext
+                            ? "正在读取订单选择并执行材料、商品映射校验。"
+                            : "点击左侧 Traveler 后，这里会逐步显示正在做什么。"
                     )
 
-                    GroupBox(label: centeredTitle("Traveler 全材料预览", systemImage: "tablecells")) {
+                    GroupBox(label: centeredTitle(
+                        isOrderContext ? "本次出库预览" : "Traveler 全材料预览",
+                        systemImage: "tablecells"
+                    )) {
                         VStack(alignment: .leading, spacing: 10) {
-                        Text("\(model.inventoryPreviewRows.count) 行 · 已选 \(selectedPreviewRows.count)")
-                            .font(.caption).foregroundColor(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .center)
                         if model.inventoryPreviewRows.isEmpty {
                             VStack(spacing: 10) {
                                 Image(systemName: "checklist")
                                     .font(.system(size: 36)).foregroundColor(.secondary)
-                                Text("点击左侧 Traveler 即可自动预检")
-                                Text("所有材料都会显示；未映射项目需补充映射或选择忽略。")
+                                Text(isOrderContext ? "正在载入本次出库选择" : "点击左侧 Traveler 即可自动预检")
+                                Text(isOrderContext ? "数量为 0 的项目不显示；未映射问题请返回订单文件读取阶段处理。" : "数量为 0 的项目不显示；未映射项目可在订单文件读取阶段补充映射或选择忽略。")
                                     .font(.caption).foregroundColor(.secondary)
-                            }.frame(maxWidth: .infinity, minHeight: 150)
+                            }.frame(maxWidth: .infinity, minHeight: isOrderContext ? 220 : AppLayout.inventoryPreviewMinHeight)
                         } else {
                             HStack {
                                 Text("").frame(width: 22)
-                                Text("Traveler 材料").frame(maxWidth: .infinity, alignment: .leading)
+                                Text(isOrderContext ? "订单材料" : "Traveler 材料").frame(maxWidth: .infinity, alignment: .leading)
                                 Text("状态").frame(width: 58, alignment: .leading)
                                 Text("商品编号").frame(width: 82, alignment: .leading)
-                                Text("库存商品／说明").frame(width: 190, alignment: .leading)
+                                Text("本地映射商品／说明").frame(width: 250, alignment: .leading)
                                 Text("数量").frame(width: 58, alignment: .trailing)
                             }.font(.caption).foregroundColor(.secondary)
                             Divider()
-                            ScrollView {
-                                LazyVStack(spacing: 0) {
+                            ScrollView(.vertical) {
+                            LazyVStack(spacing: 0) {
                                     ForEach(model.inventoryPreviewRows) { row in
-                                        HStack(spacing: 8) {
-                                            Toggle("", isOn: Binding(
-                                                get: { selectedPreviewRows.contains(row.id) },
-                                                set: { checked in
-                                                    if checked { selectedPreviewRows.insert(row.id) }
-                                                    else { selectedPreviewRows.remove(row.id) }
+                                        Button {
+                                            togglePreviewRow(row.id)
+                                        } label: {
+                                            HStack(spacing: 8) {
+                                                Image(systemName: selectedPreviewRows.contains(row.id)
+                                                    ? "checkmark.square.fill" : "square")
+                                                    .foregroundColor(selectedPreviewRows.contains(row.id)
+                                                        ? AppPalette.accent : .secondary)
+                                                    .frame(width: 22)
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(row.travelerName).lineLimit(1)
+                                                    Text(row.section).font(.caption2).foregroundColor(.secondary)
                                                 }
-                                            ))
-                                            .labelsHidden()
-                                            .frame(width: 22)
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text(row.travelerName).lineLimit(1)
-                                                Text(row.section).font(.caption2).foregroundColor(.secondary)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                Text(row.status)
+                                                    .font(.caption).fontWeight(.medium)
+                                                    .foregroundColor(previewStatusColor(row.status))
+                                                    .frame(width: 58, alignment: .leading)
+                                                Text(row.productCode).frame(width: 82, alignment: .leading)
+                                                VStack(alignment: .leading, spacing: 2) {
+                                                    Text(row.productName).lineLimit(1)
+                                                    Text(row.source).font(.caption2).foregroundColor(.secondary).lineLimit(2)
+                                                }
+                                                .frame(width: 250, alignment: .leading)
+                                                Text(row.quantity.formatted())
+                                                    .frame(width: 58, alignment: .trailing)
                                             }
+                                            .padding(.horizontal, 6).padding(.vertical, 7)
                                             .frame(maxWidth: .infinity, alignment: .leading)
-                                            Text(row.status)
-                                                .font(.caption).fontWeight(.medium)
-                                                .foregroundColor(previewStatusColor(row.status))
-                                                .frame(width: 58, alignment: .leading)
-                                            Text(row.productCode).frame(width: 82, alignment: .leading)
-                                            VStack(alignment: .leading, spacing: 2) {
-                                                Text(row.productName).lineLimit(1)
-                                                Text(row.source).font(.caption2).foregroundColor(.secondary).lineLimit(2)
-                                            }
-                                            .frame(width: 190, alignment: .leading)
-                                            Text(row.quantity.formatted())
-                                                .frame(width: 58, alignment: .trailing)
+                                            .contentShape(Rectangle())
+                                            .background(row.status == "未映射" ? AppPalette.warning.opacity(0.16) :
+                                                        row.status == "已忽略" ? Color.gray.opacity(0.10) : Color.clear)
                                         }
-                                        .padding(.horizontal, 6).padding(.vertical, 7)
-                                        .background(row.status == "未映射" ? AppPalette.warning.opacity(0.16) :
-                                                    row.status == "已忽略" ? Color.gray.opacity(0.10) : Color.clear)
-                                        Divider()
+                                        .buttonStyle(.plain)
+                                        .disabled(model.inventoryRunning || model.inventoryWriteCompleted)
+                                        .overlay(Divider(), alignment: .bottom)
                                     }
-                                }
                             }
+                            .frame(maxWidth: .infinity, alignment: .top)
+                            }
+                            .scrollIndicators(.automatic)
+                            .frame(minHeight: isOrderContext ? 0 : AppLayout.inventoryPreviewMinHeight,
+                                   maxHeight: .infinity,
+                                   alignment: .top)
+                            .layoutPriority(1)
                         }
-                        HStack {
+                        InventoryActionGrid(minColumnWidth: 156) {
+                            if !isOrderContext {
                             Button("忽略选中材料") {
                                 let names = model.inventoryPreviewRows
                                     .filter { selectedPreviewRows.contains($0.id) && $0.status != "零数量" }
@@ -2449,6 +4806,9 @@ struct InventoryView: View {
                                 model.setInventoryItemsIgnored(names, ignored: true)
                                 selectedPreviewRows.removeAll()
                             }
+                            .buttonStyle(.bordered)
+                            .inventoryActionButton()
+                            .disabled(model.inventoryRunning || model.inventoryWriteCompleted || selectedPreviewRows.isEmpty)
                             Button("恢复选中材料") {
                                 let names = model.inventoryPreviewRows
                                     .filter { selectedPreviewRows.contains($0.id) && $0.status == "已忽略" }
@@ -2456,6 +4816,9 @@ struct InventoryView: View {
                                 model.setInventoryItemsIgnored(names, ignored: false)
                                 selectedPreviewRows.removeAll()
                             }
+                            .buttonStyle(.bordered)
+                            .inventoryActionButton()
+                            .disabled(model.inventoryRunning || model.inventoryWriteCompleted || selectedPreviewRows.isEmpty)
                             Button("设置映射") {
                                 let rows = model.inventoryPreviewRows.filter {
                                     selectedPreviewRows.contains($0.id) && $0.status == "未映射"
@@ -2467,45 +4830,112 @@ struct InventoryView: View {
                                     model.inventoryStatus = "请只选择一条“未映射”材料"
                                 }
                             }
-                            Spacer()
-                            if model.inventoryPreviewRows.contains(where: { $0.status == "未映射" }) {
-                                Label("未映射材料必须处理后才能出库", systemImage: "exclamationmark.triangle.fill")
-                                    .font(.caption).foregroundColor(AppPalette.warning)
+                            .buttonStyle(.bordered)
+                            .inventoryActionButton()
+                            .disabled(model.inventoryRunning || model.inventoryWriteCompleted || selectedPreviewRows.isEmpty)
                             }
-                        }
-                        .disabled(model.inventoryRunning || selectedPreviewRows.isEmpty)
-                        HStack {
-                            Button("后台模拟填写") { model.openAndFillSelectedInventory() }
-                            Button("确认写入库存系统") { confirmRealSave = true }
+                            Button(confirmationTitle) { confirmRealSave = true }
                                 .buttonStyle(.borderedProminent)
+                                .inventoryActionButton(minWidth: 156)
+                                .disabled(model.inventoryRunning || selectedTravelerCount != 1 ||
+                                          (!hasMappedOutboundRows && !hasConfirmedNoOutboundRows) ||
+                                          !model.inventoryErrors.isEmpty || model.inventoryWriteBlocked ||
+                                          model.inventoryWriteCompleted)
                         }
-                        .frame(maxWidth: .infinity)
-                        .disabled(model.inventoryRunning || selectedRows.count != 1 ||
-                                  !model.inventoryPreviewRows.contains(where: { $0.status == "已映射" }) ||
-                                  !model.inventoryErrors.isEmpty)
-                        Text("真实写入会创建库存出库单，并保存本机同步记录。")
-                            .font(.caption).foregroundColor(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .center)
+                        if model.inventoryPreviewRows.contains(where: { $0.status == "未映射" }) {
+                            Label(isOrderContext ? "未映射问题请返回订单文件读取阶段处理" : "未映射材料必须在订单文件读取阶段处理后才能出库", systemImage: "exclamationmark.triangle.fill")
+                                .font(.caption).foregroundColor(AppPalette.warning)
+                                .frame(maxWidth: .infinity, alignment: .trailing)
+                        }
                         }
                         .padding(8)
                     }
+                    .frame(maxHeight: .infinity, alignment: .top)
                 }
                 .padding(AppLayout.contentPadding)
-                .frame(minWidth: AppLayout.contentMinWidth))
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+                })
             }
         }
-        .appPageFrame()
-        .onAppear { if model.inventoryTravelers.isEmpty { model.loadInventory() } }
-        .onChange(of: model.inventoryPreviewRows.map(\.id)) { _ in
+        .frame(
+            minHeight: isOrderContext ? 0 : AppLayout.windowMinHeight - AppLayout.topNavHeight,
+            alignment: .top
+        )
+        .onAppear {
+            if isOrderContext {
+                model.previewOrderInventory(
+                    orderID: orderContextID,
+                    factoryOrderNames: orderContextFactoryNames,
+                    factoryOrders: orderContextFactoryOrders
+                )
+            } else if model.inventoryTravelers.isEmpty {
+                model.loadInventory()
+            }
+        }
+        .onChange(of: model.inventoryPreviewRows.map(\.id)) { _, _ in
             selectedPreviewRows = selectedPreviewRows.intersection(Set(model.inventoryPreviewRows.map(\.id)))
         }
-        .alert("确认真实写入库存系统？", isPresented: $confirmRealSave) {
-            Button("取消", role: .cancel) {}
-            Button("确认保存", role: .destructive) {
-                model.openAndFillSelectedInventory(confirmSave: true)
+        .sheet(isPresented: $confirmRealSave, onDismiss: { acknowledgedRealSave = false }) {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(confirmationTitle).font(.title2).fontWeight(.semibold)
+                        Text(hasMappedOutboundRows ? "保存后会影响库存，写入开始后不可取消。" : "本次只记录无需出库决定，不会打开库存系统。")
+                            .font(.caption).foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    AppStatusBadge(text: "高风险操作", kind: .danger)
+                }
+
+                AppSurfaceCard {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label(hasMappedOutboundRows ? "请再次核对材料映射和库存警告" : "请再次核对无需出库原因", systemImage: "exclamationmark.triangle.fill")
+                            .font(.headline).foregroundColor(AppPalette.warning)
+                        Text(!hasMappedOutboundRows
+                            ? "系统不会创建库存出库单，只会保存当前已确认的出库范围决定和原因。"
+                            : (isOrderContext
+                            ? "系统会按当前订单数据库事实和所选工厂单创建真实的“其他出库单”。库存不足允许继续，但相关警告会写入本机操作记录。"
+                            : "系统会为当前选择的 1 份 Traveler 创建真实的“其他出库单”。库存不足允许继续，但相关警告会写入本机操作记录。"))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+
+                VStack(spacing: 0) {
+                    confirmationRow(isOrderContext ? "订单" : "Traveler", selectedTravelerDisplayName)
+                    Divider()
+                    confirmationRow("材料行", "\(model.inventoryPreviewRows.count)")
+                    Divider()
+                    confirmationRow("操作性质", hasMappedOutboundRows ? "真实写入 · 不可取消" : "保存范围决定 · 不写库存", valueColor: hasMappedOutboundRows ? AppPalette.danger : AppPalette.accent)
+                }
+                .padding(.horizontal, 14)
+                .background(AppPalette.surface)
+                .clipShape(RoundedRectangle(cornerRadius: 9))
+                .overlay(RoundedRectangle(cornerRadius: 9).stroke(AppPalette.separator))
+
+                Toggle(
+                    "我已核对材料映射与库存警告，并理解写入开始后不可取消。",
+                    isOn: $acknowledgedRealSave
+                )
+                .toggleStyle(.checkbox)
+
+                HStack {
+                    Spacer()
+                    Button("取消") { confirmRealSave = false }
+                        .appActionButton(minWidth: 80)
+                    Button("确认出库") {
+                        confirmRealSave = false
+                        model.openAndFillSelectedInventory()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(AppPalette.danger)
+                    .appActionButton(minWidth: 156)
+                    .disabled(!acknowledgedRealSave)
+                }
             }
-        } message: {
-            Text("将为当前选择的 1 份 Traveler 创建真实的“其他出库单”。保存后会影响库存，且每项网页警告仍会停止任务。")
+            .padding(24)
+            .frame(width: 560)
+            .background(AppPalette.background)
         }
         .sheet(isPresented: $showMappingSheet) {
             InventoryMappingSheet(
@@ -2523,6 +4953,29 @@ struct InventoryView: View {
         case "失败", "结果未知", "原单据不可编辑": return AppPalette.danger
         default: return .secondary
         }
+    }
+
+    private func outboundStep(_ number: Int, _ title: String, active: Bool) -> some View {
+        HStack(spacing: 7) {
+            Text("\(number)")
+                .font(.caption.monospacedDigit().weight(.bold))
+                .foregroundColor(active ? .white : .secondary)
+                .frame(width: 26, height: 26)
+                .background(active ? AppPalette.accent : AppPalette.subtleSurface)
+                .clipShape(Circle())
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundColor(active ? AppPalette.accent : .secondary)
+        }
+    }
+
+    private func confirmationRow(_ label: String, _ value: String, valueColor: Color = .primary) -> some View {
+        HStack {
+            Text(label).foregroundColor(.secondary)
+            Spacer()
+            Text(value).fontWeight(.semibold).foregroundColor(valueColor).lineLimit(1)
+        }
+        .frame(minHeight: 44)
     }
 
     private func previewStatusColor(_ status: String) -> Color {
@@ -2601,14 +5054,12 @@ struct TodoView: View {
         VStack(spacing: 0) {
             AppPageHeader(
                 systemImage: "checkmark.square.fill",
-                title: "待办事项",
-                subtitle: "记录需要处理的工作，完成后自动保存完成时间"
+                title: "待办",
+                subtitle: "按截止时间和阻断程度安排需要处理的工作"
             ) {
-                Label("\(openCount) 项未完成", systemImage: "circle.dashed")
-                    .font(.callout).foregroundColor(.secondary)
+                AppStatusBadge(text: "\(openCount) 项未完成", kind: openCount > 0 ? .warning : .success)
             }
             Divider()
-
             VStack(alignment: .leading, spacing: 14) {
                 GroupBox {
                     VStack(spacing: 0) {
@@ -2652,16 +5103,19 @@ struct TodoView: View {
                         if let selectedItem { model.toggleTodoCompletion(selectedItem) }
                     }
                     .buttonStyle(.borderedProminent)
+                    .appActionButton()
                     .disabled(selectedItem == nil)
 
                     Button("编辑") {
                         editingItem = selectedItem
                     }
+                    .appActionButton(minWidth: 72)
                     .disabled(selectedItem == nil)
 
                     Button("删除", role: .destructive) {
                         pendingDelete = selectedItem
                     }
+                    .appActionButton(minWidth: 72)
                     .disabled(selectedItem == nil)
 
                     Spacer()
@@ -2686,7 +5140,7 @@ struct TodoView: View {
                                 displayedComponents: [.date, .hourAndMinute]
                             )
                             .labelsHidden()
-                            .frame(width: 190)
+                            .frame(width: 190, height: AppLayout.controlHeight)
                             .disabled(!hasDeadline)
                             .opacity(hasDeadline ? 1 : 0.45)
                         }
@@ -2708,9 +5162,8 @@ struct TodoView: View {
                                 addTodo()
                             } label: {
                                 Label("添加待办事项", systemImage: "plus")
-                                    .frame(minWidth: 118)
                             }
-                            .controlSize(.large)
+                            .appActionButton(minWidth: 132)
                             .buttonStyle(.borderedProminent)
                             .disabled(newContent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                         }
@@ -2874,6 +5327,7 @@ struct TodoEditorSheet: View {
             Text("编辑待办事项").font(.title2).fontWeight(.semibold)
             TextField("任务内容", text: $content)
                 .textFieldStyle(.roundedBorder)
+                .appInputField()
             Toggle("设置截止时间", isOn: $hasDeadline)
                 .toggleStyle(.checkbox)
             DatePicker(
@@ -2885,12 +5339,14 @@ struct TodoEditorSheet: View {
             .opacity(hasDeadline ? 1 : 0.45)
             HStack {
                 Spacer()
-                Button("取消") { dismiss() }
+            Button("取消") { dismiss() }
+                .appActionButton(minWidth: 72)
                 Button("保存") {
                     model.updateTodo(item, content: content, deadline: hasDeadline ? deadline : nil)
                     if model.todoStatus.isEmpty { dismiss() }
                 }
                 .buttonStyle(.borderedProminent)
+                .appActionButton()
                 .disabled(content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
@@ -2901,205 +5357,790 @@ struct TodoEditorSheet: View {
 
 struct SettingsView: View {
     @ObservedObject var model: AppModel
+    @State private var showOperationLog = false
+    @State private var showIgnoredHardwareList = false
+    @State private var showManualMappingList = false
 
     var body: some View {
         VStack(spacing: 0) {
             AppPageHeader(
                 systemImage: "gearshape",
-                title: "配置中心",
-                subtitle: "常规设置与业务规则保存在本机，不写入项目源码"
+                title: "设置",
+                subtitle: "连接、数据来源与安全边界"
             ) {
-                Button {
-                    model.loadSettings()
-                    model.loadBusinessRules()
-                    model.settingsStatus = "已重新载入本机设置和业务规则。"
-                } label: {
-                    Label("重新载入", systemImage: "arrow.clockwise")
-                }
+                AppStatusBadge(
+                    text: "生产数据源",
+                    kind: .success
+                )
             }
             Divider()
-
             ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                VStack(spacing: 18) {
-                    HStack(alignment: .top, spacing: 18) {
-                    SettingsCard(title: "运行范围", symbol: "slider.horizontal.3", minHeight: 350) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            DatePicker("初始扫描日期", selection: $model.initialDate, displayedComponents: .date)
-                            TextField("公司 Wi-Fi", text: $model.companyWiFi)
-                                .textFieldStyle(.roundedBorder)
-                            RuleNumberRow(label: "可疑尺寸容差", value: $model.leftoverThreshold)
-                            Text("程序只在你手工点击运行后执行。")
-                                .font(.caption).foregroundColor(.secondary)
-                        }
-                    }
-
-                    SettingsCard(title: "系统账户", symbol: "lock.shield", minHeight: 350) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("AIMES").font(.subheadline).fontWeight(.semibold)
-                            TextField("用户名", text: $model.aimesUsername)
-                                .textFieldStyle(.roundedBorder)
-                            SecureField("输入新密码", text: $model.aimesPassword)
-                                .textFieldStyle(.roundedBorder)
-                            Button("更新钥匙串密码") { model.saveAimesPassword() }
-                                .disabled(model.aimesPassword.isEmpty)
-                            Text("用户名保存在本机设置；密码只保存在macOS钥匙串。")
-                                .font(.caption).foregroundColor(.secondary)
-                            Divider()
-                            Text("库存系统").font(.subheadline).fontWeight(.semibold)
-                            TextField("用户名", text: $model.jdyUsername)
-                                .textFieldStyle(.roundedBorder)
-                            SecureField("输入新密码", text: $model.jdyPassword)
-                                .textFieldStyle(.roundedBorder)
-                            Button("更新库存系统钥匙串密码") { model.saveJdyPassword() }
-                                .disabled(model.jdyPassword.isEmpty)
-                        }
-                    }
-                    }
-
-                    HStack(alignment: .top, spacing: 18) {
-                    SettingsCard(title: "文件位置", symbol: "folder", minHeight: 405) {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("服务器目录").font(.caption).foregroundColor(.secondary)
-                            TextField("", text: $model.sourceRoot).textFieldStyle(.roundedBorder)
-                            Text("订单目录").font(.caption).foregroundColor(.secondary)
-                            TextField("", text: $model.orderRoot).textFieldStyle(.roundedBorder)
-                            Text("Traveler模板").font(.caption).foregroundColor(.secondary)
-                            TextField("", text: $model.templatePath).textFieldStyle(.roundedBorder)
-                            Text("备份目录").font(.caption).foregroundColor(.secondary)
-                            TextField("", text: $model.backupRoot).textFieldStyle(.roundedBorder)
-                        }
-                    }
-
-                    SettingsCard(title: "板材规则", symbol: "square.3.layers.3d", minHeight: 405) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("允许厚度，使用英文逗号分隔")
-                                    .font(.caption).foregroundColor(.secondary)
-                                TextField("Plywood厚度", text: $model.plywoodThicknesses)
-                                    .textFieldStyle(.roundedBorder)
-                                TextField("Panel厚度", text: $model.panelThicknesses)
-                                    .textFieldStyle(.roundedBorder)
-                            }
-                            Divider()
-                            VStack(alignment: .leading, spacing: 8) {
-                                RuleNumberRow(label: "Plywood长度", value: $model.plywoodLength)
-                                RuleNumberRow(label: "Plywood宽度", value: $model.plywoodWidth)
-                                RuleNumberRow(label: "Panel长度", value: $model.panelLength)
-                                RuleNumberRow(label: "Panel宽度", value: $model.panelWidth)
-                            }
-                            Divider()
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack {
-                                    Text("厚度别名")
-                                    Spacer()
-                                    TextField("", value: $model.aliasSource, format: .number)
-                                        .textFieldStyle(.roundedBorder).frame(width: 70)
-                                    Image(systemName: "arrow.right")
-                                    TextField("", value: $model.aliasTarget, format: .number)
-                                        .textFieldStyle(.roundedBorder).frame(width: 70)
+                VStack(alignment: .leading, spacing: AppLayout.sectionSpacing) {
+                    HStack(alignment: .top, spacing: AppLayout.sectionSpacing) {
+                        VStack(alignment: .leading, spacing: AppLayout.sectionSpacing) {
+                            SettingsCard(title: "运行范围", symbol: "slider.horizontal.3") {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    DatePicker("初始扫描日期", selection: $model.initialDate, displayedComponents: .date)
+                                        .appInputField(maxWidth: 300)
+                                    Text("程序只在你手工点击运行后执行。")
+                                        .font(.caption).foregroundColor(.secondary)
                                 }
-                                HStack {
-                                    Text("封边小数位数")
-                                    Spacer()
-                                    Button {
-                                        model.edgeDecimals = max(0, model.edgeDecimals - 1)
-                                    } label: {
-                                        Image(systemName: "minus")
-                                    }
-                                    Text("\(model.edgeDecimals)")
-                                        .monospacedDigit()
-                                        .frame(width: 24)
-                                    Button {
-                                        model.edgeDecimals = min(4, model.edgeDecimals + 1)
-                                    } label: {
-                                        Image(systemName: "plus")
-                                    }
+                            }
+
+                            SettingsCard(title: "文件位置", symbol: "folder") {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    Text("服务器目录").font(.caption).foregroundColor(.secondary)
+                                    TextField("服务器订单目录", text: $model.sourceRoot)
+                                        .textFieldStyle(.roundedBorder).appInputField()
+                                    Text("订单目录").font(.caption).foregroundColor(.secondary)
+                                    TextField("Traveler 保存目录", text: $model.orderRoot)
+                                        .textFieldStyle(.roundedBorder).appInputField()
+                                    Text("Traveler 文件备份目录").font(.caption).foregroundColor(.secondary)
+                                    TextField("Traveler 备份目录", text: $model.backupRoot)
+                                        .textFieldStyle(.roundedBorder).appInputField()
                                 }
                             }
                         }
-                    }
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+
+                        SettingsCard(title: "系统账户", symbol: "lock.shield") {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack(alignment: .top, spacing: 12) {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text("库存系统").font(.subheadline).fontWeight(.semibold)
+                                        TextField("用户名", text: $model.jdyUsername)
+                                            .textFieldStyle(.roundedBorder)
+                                            .appInputField()
+                                        SecureField("输入新密码", text: $model.jdyPassword)
+                                            .textFieldStyle(.roundedBorder)
+                                            .appInputField()
+                                        Button("更新库存系统钥匙串密码") { model.saveJdyPassword() }
+                                            .buttonStyle(.bordered)
+                                            .appActionButton(minWidth: 0)
+                                            .frame(maxWidth: .infinity)
+                                            .disabled(model.jdyPassword.isEmpty)
+                                        Button("打开库存专用 Chrome") { model.openInventoryChrome() }
+                                            .buttonStyle(.bordered)
+                                            .appActionButton(minWidth: 0)
+                                            .frame(maxWidth: .infinity)
+                                            .disabled(model.inventoryRunning)
+                                        if model.inventoryChromeStatus.hasPrefix("❌") {
+                                            Text(model.inventoryChromeStatus)
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                        }
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .topLeading)
+
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        Text("AIMES").font(.subheadline).fontWeight(.semibold)
+                                        TextField("用户名", text: $model.aimesUsername)
+                                            .textFieldStyle(.roundedBorder).appInputField()
+                                        SecureField("输入新密码", text: $model.aimesPassword)
+                                            .textFieldStyle(.roundedBorder).appInputField()
+                                        Button("保存 AIMES 密码") { model.saveAimesPassword() }
+                                            .buttonStyle(.bordered)
+                                            .appActionButton(minWidth: 0)
+                                            .frame(maxWidth: .infinity)
+                                            .disabled(model.aimesPassword.isEmpty)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                                }
+                                Button("管理 AIMES 待确认与忽略记录") {
+                                    model.showPendingCenterPrompt = true
+                                }
+                                .buttonStyle(.bordered).appActionButton(minWidth: 176)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
+
+                        SettingsCard(title: "库存商品资料与全局忽略", symbol: "shippingbox") {
+                            VStack(alignment: .leading, spacing: 10) {
+                                Text("从库存系统更新商品名称、SKU、规格、类别和单位等资料。")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                VStack(alignment: .leading, spacing: 8) {
+                                    SettingsStatusBanner(status: model.inventoryCatalogStatus)
+                                    HStack(spacing: 10) {
+                                        Spacer(minLength: 0)
+                                        if model.inventoryRunning {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                        }
+                                        Button("更新商品资料") {
+                                            model.updateInventoryCatalog()
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .appActionButton(minWidth: 112)
+                                        .disabled(model.inventoryRunning)
+                                    }
+                                }
+                                Divider()
+                                HStack(alignment: .center, spacing: 10) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("材料映射")
+                                            .font(.subheadline)
+                                            .fontWeight(.semibold)
+                                        Text("将订单材料名称对应到商品资料中的启用 SKU。")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer(minLength: 0)
+                                    Text("\(model.inventoryManualMappings.count) 项")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    Button("查看") { showManualMappingList = true }
+                                        .buttonStyle(.bordered)
+                                        .appActionButton(minWidth: 72)
+                                }
+                                Divider()
+                                HStack(alignment: .center, spacing: 10) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("五金全局忽略列表")
+                                            .font(.subheadline)
+                                            .fontWeight(.semibold)
+                                        Text("列表中的名称或来源编码会对所有订单生效；命中后不写入有效数据库，也不参与出库。")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer(minLength: 0)
+                                    Text("\(model.inventoryIgnoredMappings.count) 项")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    Button("查看") { showIgnoredHardwareList = true }
+                                        .buttonStyle(.bordered)
+                                        .appActionButton(minWidth: 72)
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .topLeading)
                     }
 
-                    HStack(alignment: .top, spacing: 18) {
-                    SettingsCard(title: "Materials换算", symbol: "tablecells", minHeight: 285) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("Plywood Total Qty").font(.subheadline).fontWeight(.medium)
-                            RuleNumberRow(label: "3/4 Plywood", value: $model.materialPlywood34)
-                            RuleNumberRow(label: "5/8 Plywood", value: $model.materialPlywood58)
-                            RuleNumberRow(label: "1/4 Plywood", value: $model.materialPlywood14)
-                            Divider()
-                            Text("Panel Color Table").font(.subheadline).fontWeight(.medium)
-                            RuleNumberRow(label: "3/4 Finish Panel", value: $model.materialPanel34)
-                            RuleNumberRow(label: "1/4 Finish Panel", value: $model.materialPanel14)
+                    SettingsCard(title: "数据库备份", symbol: "externaldrive.badge.timemachine") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("本机数据库备份目录")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Text(model.databaseBackupRoot)
+                                .font(.caption.monospaced())
+                                .textSelection(.enabled)
+                            Text("App 每天首次启动时，在本地订单缓存读取完成后自动备份；只保留最近三天每日备份，以及最近 30 天内每周一份。")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            HStack(spacing: 10) {
+                                if !model.backupStatus.isEmpty {
+                                    Text(model.backupStatus)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(2)
+                                }
+                                Spacer(minLength: 0)
+                                Button("立即备份") { model.performBackup() }
+                                    .buttonStyle(.bordered)
+                                    .appActionButton(minWidth: 96)
+                                    .disabled(model.orderRunning)
+                            }
                         }
                     }
 
-                    SettingsCard(title: "五金映射", symbol: "shippingbox", minHeight: 285) {
-                        VStack(alignment: .leading, spacing: 10) {
-                            fittingRow("Shelf Holder", text: $model.shelfHolderCode)
-                            fittingRow("Hinge", text: $model.hingeCode)
-                            fittingRow("H-Rail（成对）", text: $model.hRailCode)
-                            fittingRow("L-Rail（成对）", text: $model.lRailCode)
-                            Text("未列出的五金仍不写入Traveler，并按首次出现或变化提醒。")
-                                .font(.caption).foregroundColor(.secondary)
+                    SettingsCard(title: "操作日志", symbol: "list.bullet.rectangle") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(alignment: .center, spacing: 12) {
+                                Toggle(
+                                    "记录用户操作和后台执行步骤",
+                                    isOn: Binding(
+                                        get: { model.operationLogEnabled },
+                                        set: { model.setOperationLogEnabled($0) }
+                                    )
+                                )
+                                .toggleStyle(.checkbox)
+                                Spacer(minLength: 0)
+                                Button("查看") {
+                                    model.logUserAction("查看操作日志")
+                                    showOperationLog = true
+                                }
+                                .buttonStyle(.bordered)
+                                .appActionButton(minWidth: 72)
+                            }
+                            Text("用于发生错误时按时间顺序回溯。不会记录密码、用户名、备注、语音原文或网页输入内容。")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Text("文件：\(model.operationLogURL.path)")
+                                .font(.caption.monospaced())
+                                .foregroundColor(.secondary)
+                                .textSelection(.enabled)
                         }
                     }
-                    }
-                }
 
-                HStack(spacing: 12) {
-                    if !model.settingsStatus.isEmpty {
-                        Text(model.settingsStatus)
-                            .font(.callout)
-                            .foregroundColor(model.settingsStatus.hasPrefix("❌") ? .red : .secondary)
+                    HStack(spacing: 12) {
+                        SettingsStatusBanner(status: model.settingsStatus)
+                        Spacer(minLength: 0)
+                        Button("保存全部配置") { model.saveAllSettings() }
+                            .buttonStyle(.borderedProminent)
+                            .appActionButton(minWidth: 132)
                     }
-                    Spacer()
-                    Button("保存全部配置") { model.saveAllSettings() }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.large)
-                }
-                .padding(.top, 2)
                 }
                 .padding(AppLayout.contentPadding)
+                .frame(maxWidth: 1220)
+                .frame(maxWidth: .infinity, alignment: .top)
             }
         }
         .appPageFrame()
+        .onAppear {
+            model.refreshInventoryCatalogStatus()
+            model.refreshInventoryMappings()
+        }
+        .sheet(isPresented: $showOperationLog) {
+            OperationLogViewerView(url: model.operationLogURL)
+        }
+        .sheet(isPresented: $showIgnoredHardwareList) {
+            InventoryIgnoredMappingsSheet(model: model)
+        }
+        .sheet(isPresented: $showManualMappingList) {
+            InventoryManualMappingsSheet(model: model)
+        }
     }
 
-    private func fittingRow(_ label: String, text: Binding<String>) -> some View {
-        HStack {
-            Text(label)
-            Spacer()
-            TextField("代码", text: text)
-                .multilineTextAlignment(.trailing)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 150)
+}
+
+struct InventoryIgnoredMappingsSheet: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var reason = ""
+    @State private var editingName = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("五金全局忽略列表")
+                        .font(.title2)
+                        .fontWeight(.semibold)
+                    Text("统一管理所有订单生效的忽略项目")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button("关闭") { dismiss() }
+                    .appActionButton(minWidth: 72)
+            }
+            Divider()
+            HStack(spacing: 8) {
+                TextField("五金名称或来源编码", text: $name)
+                    .textFieldStyle(.roundedBorder)
+                    .appInputField()
+                TextField("忽略原因", text: $reason)
+                    .textFieldStyle(.roundedBorder)
+                    .appInputField()
+                Button(editingName.isEmpty ? "增加" : "保存修改") {
+                    if editingName.isEmpty {
+                        model.saveInventoryIgnoredMapping(name: name, reason: reason)
+                    } else {
+                        model.updateInventoryIgnoredMapping(oldName: editingName, name: name, reason: reason)
+                    }
+                    clearEditor()
+                }
+                .buttonStyle(.bordered)
+                .appActionButton(minWidth: 76)
+                .disabled(model.inventoryRunning || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if !editingName.isEmpty {
+                    Button("取消") { clearEditor() }
+                        .appActionButton(minWidth: 56)
+                }
+            }
+            if model.inventoryIgnoredMappings.isEmpty {
+                ContentUnavailableView("当前没有全局忽略项目", systemImage: "checkmark.circle")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(model.inventoryIgnoredMappings) { item in
+                            HStack(spacing: 10) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(item.name).fontWeight(.medium)
+                                    Text(item.reason.isEmpty ? "未填写原因" : item.reason)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer(minLength: 0)
+                                Button("修改") {
+                                    editingName = item.name
+                                    name = item.name
+                                    reason = item.reason
+                                }
+                                .appActionButton(minWidth: 56)
+                                .disabled(model.inventoryRunning)
+                                Button("删除") { model.removeInventoryIgnoredMapping(name: item.name) }
+                                    .appActionButton(minWidth: 56)
+                                    .disabled(model.inventoryRunning)
+                            }
+                            .padding(.vertical, 8)
+                            Divider()
+                        }
+                    }
+                }
+            }
         }
+        .padding(22)
+        .frame(minWidth: 640, minHeight: 400)
+        .onAppear { model.refreshInventoryMappings() }
+    }
+
+    private func clearEditor() {
+        name = ""
+        reason = ""
+        editingName = ""
     }
 }
 
+struct InventoryManualMappingsSheet: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var productCode = ""
+    @State private var editingName = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("材料映射")
+                        .font(.title2)
+                        .fontWeight(.semibold)
+                    Text("统一管理订单材料名称与商品 SKU 的对应关系")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button("关闭") { dismiss() }
+                    .appActionButton(minWidth: 72)
+            }
+            Divider()
+            HStack(spacing: 8) {
+                TextField("材料名称", text: $name)
+                    .textFieldStyle(.roundedBorder)
+                    .appInputField()
+                TextField("商品 SKU", text: $productCode)
+                    .textFieldStyle(.roundedBorder)
+                    .appInputField()
+                Button(editingName.isEmpty ? "增加" : "保存修改") {
+                    if editingName.isEmpty {
+                        model.saveSettingsManualMapping(name: name, productCode: productCode)
+                    } else {
+                        model.updateSettingsManualMapping(
+                            oldName: editingName,
+                            name: name,
+                            productCode: productCode
+                        )
+                    }
+                    clearEditor()
+                }
+                .buttonStyle(.bordered)
+                .appActionButton(minWidth: 76)
+                .disabled(model.inventoryRunning || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                          productCode.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if !editingName.isEmpty {
+                    Button("取消") { clearEditor() }
+                        .appActionButton(minWidth: 56)
+                }
+            }
+            if model.inventoryManualMappings.isEmpty {
+                ContentUnavailableView("当前没有材料映射", systemImage: "arrow.left.arrow.right")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(model.inventoryManualMappings) { item in
+                            HStack(spacing: 10) {
+                                Text(item.name)
+                                    .fontWeight(.medium)
+                                Spacer(minLength: 0)
+                                Text(item.productCode)
+                                    .font(.body.monospaced())
+                                    .foregroundColor(AppPalette.accent)
+                                Button("修改") {
+                                    editingName = item.name
+                                    name = item.name
+                                    productCode = item.productCode
+                                }
+                                .appActionButton(minWidth: 56)
+                                .disabled(model.inventoryRunning)
+                                Button("删除") { model.removeSettingsManualMapping(name: item.name) }
+                                    .appActionButton(minWidth: 56)
+                                    .disabled(model.inventoryRunning)
+                            }
+                            .padding(.vertical, 8)
+                            Divider()
+                        }
+                    }
+                }
+            }
+        }
+        .padding(22)
+        .frame(minWidth: 680, minHeight: 440)
+        .onAppear { model.refreshInventoryMappings() }
+    }
+
+    private func clearEditor() {
+        name = ""
+        productCode = ""
+        editingName = ""
+    }
+}
+
+struct OperationLogViewerView: View {
+    let url: URL
+    @Environment(\.dismiss) private var dismiss
+    @State private var entries: [OperationLogEntry] = []
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("操作日志").font(.title2).fontWeight(.semibold)
+                    Text("按时间查看工作流程助手执行过的操作")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button("关闭") { dismiss() }
+                    .buttonStyle(.borderedProminent)
+                    .appActionButton(minWidth: 72)
+            }
+            Divider()
+            if entries.isEmpty {
+                ContentUnavailableView(
+                    "暂无操作日志",
+                    systemImage: "list.bullet.rectangle",
+                    description: Text("完成一次操作后，记录会显示在这里。")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                HStack(spacing: 14) {
+                    Text("时间")
+                        .frame(width: 150, alignment: .leading)
+                    Text("操作内容")
+                    Spacer()
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(entries.reversed()) { entry in
+                            HStack(alignment: .top, spacing: 14) {
+                                Text(entry.displayTime)
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundColor(.secondary)
+                                    .frame(width: 150, alignment: .leading)
+                                Text(entry.operation)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .textSelection(.enabled)
+                            }
+                            .padding(.vertical, 10)
+                            Divider()
+                        }
+                    }
+                }
+                .background(Color(nsColor: .controlBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(Color.primary.opacity(0.08), lineWidth: 1)
+                )
+            }
+        }
+        .padding(20)
+        .frame(minWidth: 760, minHeight: 520)
+        .onAppear { entries = OperationLogReader.entries(from: url) }
+    }
+}
+
+func appSectionShowsInTopNavigation(_ rawValue: String) -> Bool {
+    rawValue != "inventory"
+}
+
+let appDefaultSectionRawValue = "orders"
+
 #if !TESTING
+enum AppSection: String, CaseIterable, Identifiable {
+    case assistant
+    case orders
+    case inventory
+    case todo
+    case settings
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .assistant: return "助手"
+        case .orders: return "订单中心"
+        case .inventory: return "出库"
+        case .todo: return "待办"
+        case .settings: return "设置"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .assistant: return "waveform.and.mic"
+        case .orders: return "rectangle.3.group"
+        case .inventory: return "shippingbox.fill"
+        case .todo: return "checklist"
+        case .settings: return "gearshape"
+        }
+    }
+
+    var pageTitle: String {
+        switch self {
+        case .assistant: return "PP FlowHub"
+        case .orders: return "订单中心"
+        case .inventory: return "出库"
+        case .todo: return "待办事项"
+        case .settings: return "配置中心"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .assistant: return "文字、语音与本地优先助手"
+        case .orders: return "查看订单、工厂单、材料、库存与出货状态"
+        case .inventory: return "点击 Traveler 预检材料，再写入其他出库单"
+        case .todo: return "记录需要处理的工作"
+        case .settings: return "当前运行所需的本机设置"
+        }
+    }
+
+    var isWorkSection: Bool {
+        switch self {
+        case .settings: return false
+        default: return true
+        }
+    }
+
+    var showsInTopNavigation: Bool {
+        appSectionShowsInTopNavigation(rawValue)
+    }
+}
+
+struct TopNavigationBar: View {
+    @Binding var selection: AppSection
+    @ObservedObject var model: AppModel
+    @State private var showDesignNotes = false
+
+    var body: some View {
+        HStack(spacing: 26) {
+            HStack(spacing: 10) {
+                Image(systemName: selection.symbol)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundColor(AppPalette.accent)
+                    .frame(width: 34, height: 34)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(selection.pageTitle)
+                        .font(.system(size: AppLayout.topPageTitleFontSize, weight: .semibold))
+                        .lineLimit(1)
+                    Text(selection.subtitle)
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(minWidth: 220, idealWidth: 330, maxWidth: 390, alignment: .leading)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 2) {
+                    ForEach(AppSection.allCases.filter(\.showsInTopNavigation)) { section in
+                        navButton(section)
+                    }
+                }
+            }
+            .frame(minWidth: 0, maxWidth: .infinity)
+
+            Spacer(minLength: 12)
+            contextualStatus
+            if selection == .orders && !model.pendingCenterItems.isEmpty {
+                Button {
+                    model.showPendingCenterPrompt = true
+                } label: {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(AppPalette.warning)
+                        .frame(width: AppLayout.headerActionSize, height: AppLayout.headerActionSize)
+                        .background(AppPalette.surface)
+                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(AppPalette.separator))
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("有 \(model.pendingCenterItems.count) 个待处理项目")
+                .help("打开待处理中心，查看 Server 文件夹和需要人工确认的问题")
+            }
+            Button { showDesignNotes = true } label: {
+                Image(systemName: "info.circle")
+                    .font(.system(size: 16, weight: .semibold))
+                    .frame(width: AppLayout.headerActionSize, height: AppLayout.headerActionSize)
+                    .background(AppPalette.surface)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(AppPalette.separator))
+            }
+            .buttonStyle(.plain)
+            .help("界面设计说明")
+        }
+        .padding(.horizontal, 24)
+        .frame(height: AppLayout.headerHeight)
+        .background(AppPalette.surface.opacity(0.97))
+        .overlay(Divider(), alignment: .bottom)
+        .sheet(isPresented: $showDesignNotes) {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack {
+                    Text("界面设计说明").font(.title2).fontWeight(.semibold)
+                    Spacer()
+                    Button("关闭") { showDesignNotes = false }.appActionButton(minWidth: 72)
+                }
+                designNote("信息架构", "助手页面显示订单统计和文字、语音操作入口；订单中心保留筛选、详情和业务操作；待办与设置保留独立导航。")
+                designNote("响应式策略", "桌面保留高信息密度的列表与详情工作台；窗口变窄时优先保留主任务区域并允许内容滚动。")
+                designNote("安全处理", "映射缺失继续作为阻断错误，库存不足继续明确警告；写文件与写库存仍使用原有本机确认边界。")
+                designNote("视觉语言", "温暖浅灰背景、白色细边框卡片、冷蓝主操作色；琥珀与红色只用于风险和不可逆操作。")
+            }
+            .padding(24)
+            .frame(width: 560)
+            .background(AppPalette.background)
+        }
+        .sheet(isPresented: $model.showPendingCenterPrompt) {
+            PendingCenterSheet(model: model)
+                .frame(minWidth: 900, minHeight: 640)
+        }
+        .sheet(isPresented: $model.showAimesReviewPrompt) {
+            AimesReviewSheet(model: model)
+                .frame(minWidth: 900, minHeight: 620)
+        }
+    }
+
+    @ViewBuilder
+    private var contextualStatus: some View {
+        switch selection {
+        case .assistant:
+            AppStatusBadge(
+                text: model.assistantRunning ? "任务执行中" : "助手就绪",
+                kind: model.assistantRunning ? .info : .success
+            )
+        case .orders:
+            EmptyView()
+        case .inventory:
+            if model.inventoryRunning {
+                EmptyView()
+            } else {
+                AppStatusBadge(
+                    text: "库存工作台",
+                    kind: model.inventoryErrors.isEmpty ? .success : .danger
+                )
+            }
+        case .todo:
+            AppStatusBadge(
+                text: "\(model.todoItems.filter { $0.completedAt == nil }.count) 项未完成",
+                kind: .warning
+            )
+        case .settings:
+            Button {
+                model.loadSettings()
+                model.settingsStatus = "已重新载入本机设置。"
+            } label: {
+                Label("重新载入", systemImage: "arrow.clockwise")
+            }
+            .buttonStyle(.bordered)
+            .appActionButton(minWidth: 96)
+        }
+    }
+
+    @ViewBuilder
+    private func navButton(_ section: AppSection) -> some View {
+        Button { selection = section } label: {
+            VStack(spacing: 0) {
+                HStack(spacing: 5) {
+                    Text(section.title).lineLimit(1).fixedSize(horizontal: true, vertical: false)
+                    if section == .todo {
+                        Text("\(model.todoItems.filter { $0.completedAt == nil }.count)")
+                            .font(.caption2.monospacedDigit().weight(.bold))
+                            .foregroundColor(selection == section ? AppPalette.accent : .secondary)
+                    }
+                }
+                .font(.callout.weight(.semibold))
+                .padding(.horizontal, 14)
+                .frame(height: AppLayout.headerHeight - 2)
+                Rectangle()
+                    .fill(selection == section ? AppPalette.accent : Color.clear)
+                    .frame(height: 2)
+            }
+            .foregroundColor(selection == section ? .primary : .secondary)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func designNote(_ title: String, _ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.headline)
+            Text(text).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 @main
 struct TravelerAssistantApp: App {
     @StateObject private var model = AppModel()
+    @State private var selection = AppSection(rawValue: appDefaultSectionRawValue) ?? .orders
 
     var body: some Scene {
         WindowGroup {
-            TabView {
-                OrderWorkflowView(model: model)
-                    .tabItem { Label("生产文件", systemImage: "folder.badge.gearshape") }
-                // TODO(legacy-ui-removal): 旧版扫描入口暂时隐藏。业务逻辑继续备用，
-                // 待新版流程稳定并由用户确认后，再删除 ContentView 及旧版界面代码。
-                InventoryView(model: model)
-                    .tabItem { Label("出库", systemImage: "shippingbox.fill") }
-                TodoView(model: model)
-                    .tabItem { Label("待办事项", systemImage: "checkmark.square.fill") }
-                SettingsView(model: model)
-                    .tabItem { Label("设置", systemImage: "gearshape") }
+            VStack(spacing: 0) {
+                TopNavigationBar(selection: $selection, model: model)
+                Divider()
+                switch selection {
+                case .assistant: AssistantView(model: model)
+                case .orders: OrderDashboardView(model: model)
+                case .inventory: InventoryView(model: model) { selection = .orders }
+                case .todo: TodoView(model: model)
+                case .settings: SettingsView(model: model)
+                }
+            }
+            .controlSize(.regular)
+            .tint(AppPalette.accent)
+            // The approved design is a light workspace with fixed white surfaces.
+            // Keep semantic primary/secondary text in the matching light palette;
+            // otherwise macOS dark mode produces white text on these white cards.
+            .preferredColorScheme(AppPalette.interfaceColorScheme)
+            .background(AppPalette.background)
+            .frame(
+                minWidth: AppLayout.windowMinWidth,
+                idealWidth: AppLayout.windowIdealWidth,
+                minHeight: AppLayout.windowMinHeight,
+                idealHeight: AppLayout.windowIdealHeight
+            )
+            .onChange(of: model.inventoryMappingRequestPath) { _, path in
+                guard !path.isEmpty else { return }
+                selection = .inventory
+                model.activatePendingInventoryMapping()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+                model.closeInventoryChromeOnQuit()
+            }
+            .alert("今日未完成数据库备份", isPresented: $model.showBackupReminder) {
+                Button("立即备份") { model.performBackup() }
+                Button("稍后提醒", role: .cancel) {}
+            } message: {
+                Text(model.backupReminderStatus)
             }
         }
-            .commands { CommandGroup(replacing: .newItem) {} }
+        .defaultSize(width: AppLayout.windowIdealWidth, height: AppLayout.windowIdealHeight)
+        .commands { CommandGroup(replacing: .newItem) {} }
     }
+}
+#endif
+#if DEBUG && !TESTING
+#Preview {
+    OrderWorkflowView(model: AppModel())
 }
 #endif

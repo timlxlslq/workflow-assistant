@@ -1,50 +1,54 @@
-# 工作流程助手
+# PP FlowHub
 
-本项目用于在 macOS 上扫描公司服务器中的 AICNC 报表，校验并配对板材清单与五金清单，然后依据既有模板生成 Work Order Traveler。
+这是一个本地优先、Agent 辅助的 macOS 生产工作流应用。它从服务器发现订单，生成或更新 Work Order Traveler，查询库存，并在用户确认后执行出库。
 
-当前实现范围：
+## 架构
 
-- 只处理正式启用时间之后出现或更新的 `PP` + 四位数字订单。
-- 支持全量查询、`PP####`、`F...` 工厂单号及带 PP 前缀的空间名称查询。
-- 校验报表文件名、工作表结构、工厂单号映射、板材厚度/规格、封边及轨道左右数量。
-- 新工厂单校验通过后生成 Traveler；已有 Traveler 有变化时只生成差异，等待人工决定。
-- 保存运行记录、提醒状态和忽略五金状态。
-- 提供 macOS SwiftUI 界面，所有任务由用户手工打开应用后启动。
-- 库存出库页可选择 Traveler、执行全量预检、显示商品映射和异常，并在后台模拟填写到保存前。
-- 真实保存已启用；每次只允许选择一份 Traveler，且必须在独立确认弹窗中再次确认。
-
-详细业务规则见 [docs/business-rules.md](docs/business-rules.md)。
-程序实际读取的可量化规则见 [config/business-rules.json](config/business-rules.json)。
-
-规则文件分工：
-
-- `config/business-rules.json`：厚度、尺寸、五金代码等机器可执行规则；保存后下次启动程序生效。
-- `docs/business-rules.md`：解释业务原因、复杂流程、异常处理和人工决定，供检查、讨论及修改审批使用。
-- `docs/inventory-outbound-rules.md`：库存商品匹配、其他出库单、同步状态和异常处理的完整业务流程。
-- 修改 JSON 后必须运行完整测试；修改复杂流程说明后，仍需同步修改代码和测试。
-
-## 开发运行
-
-```bash
-./scripts/traveler-assistant preview --include-history --query PP0047
-./scripts/traveler-assistant scan
+```text
+SwiftUI App
+  → 本地命令解析器（常用命令零 Token）
+  → Workflow Agent（仅模糊表达）
+  → order / traveler / inventory Skills
+  → Typed Tool Gateway + 本地审批
+  → Python 确定性引擎
+  → Excel / SMB / Playwright / SQLite
 ```
 
-`preview` 永不写入 Traveler；`scan` 只会自动创建全新且校验通过的 Traveler，不覆盖已有文件。
+Agent 不直接修改 Excel、服务器或库存系统。Agent 不可用时，App 和 CLI 仍可执行本地可确定流程。模糊语句由官方 OpenAI Agents SDK 路由，当前使用面向成本敏感任务的 `gpt-5.6-luna`；成功路由会按完全相同的规范化语句记入本地 SQLite，下次零 Token 执行。
 
-新版按订单工作流使用独立入口，旧命令继续保留：
+## Agent 开发环境
+
+Agent 使用 Python 3.10+，macOS App 的最低系统版本为 14.0。新电脑不要复制旧 `.venv`；请在本机重建环境，以免 Intel/Apple Silicon 原生扩展混用：
 
 ```bash
-./scripts/traveler-assistant order list
-./scripts/traveler-assistant order preview --folder "/Volumes/server-1/Optimized Orders/pp0068"
-./scripts/traveler-assistant order generate --folder "/Volumes/server-1/Optimized Orders/pp0068"
+python3 -m venv .venv
+.venv/bin/python3 -m pip install "openpyxl==3.1.5" "openai-agents==0.19.2"
 ```
 
-应用中的“Traveler生成”页会先列文件夹，点击后预览并校验。旧版扫描入口目前已隐藏，
-其业务逻辑暂时保留备用；待新版流程稳定后，应提醒用户确认并删除旧版界面代码。
+API Key 保存在被 Git 忽略的 `.env.local`，不会写入源码或 SQLite。构建脚本会从 `.venv` 自动发现 Python 基础运行时，并从 PATH 或项目 `node_modules` 链接自动发现 Node/Playwright；必要时可用 `TRAVELER_PYTHON_BASE`、`TRAVELER_NODE` 和 `TRAVELER_NODE_MODULES` 覆盖。
 
-## 凭据安全
+库存系统的 Playwright 操作默认使用后台无头浏览器，不会弹出 Chrome 或抢占键盘、鼠标焦点。只有在处理登录、验证码或排查网页结构时，才临时设置 `TRAVELER_BROWSER_VISIBLE=1` 使用可见浏览器。
 
-- AIMES 用户名只保存在本机应用设置中，不在源码中提供真实默认值。
-- AIMES 密码只保存在 macOS 钥匙串中，不写入设置文件、日志或 Git。
-- 提交代码前运行 `python3 -m unittest tests.test_security` 检查常见凭据格式和敏感文件。
+库存页面也支持在设置页点击“打开库存专用 Chrome”，打开 `https://www.jdy.com/login/`，由用户手工登录并完成安全验证。后续库存操作会优先复用该 Chrome 中已登录的 `www.jdy.com` 或 `service.jdy.com` 工作台页面；没有可复用页面时，才回退到原有 Playwright 登录流程。普通用户直接打开且没有 CDP 端口的 Chrome 不会被强行接管。
+
+## CLI
+
+```bash
+./scripts/pp-flowhub assistant "在服务器上找一下 PP0063"
+./scripts/pp-flowhub assistant "给 PP1234-2-LAUNDRY 添加人工五金 M0144 数量 2 备注现场增加"
+./scripts/pp-flowhub order list
+./scripts/pp-flowhub order preview --folder "/Volumes/server/Optimized Orders/PP0063"
+./scripts/pp-flowhub inventory preview --traveler "/path/to/Work Order Traveler(PP0063).xlsx"
+```
+
+写入类助手命令首先返回 `approval_required`；确认后用同一命令加 `--approve`。人工五金命令只读取本地商品资料取得名称和规格，不连接实时库存。商品主资料运行时从 `data/workflow.sqlite3` 的 `products` 表查询；库存系统导出的最新原始 XLSX 仅保留为 `data/inventory/current-products.xlsx` 备份。本地解析失败时才转交 Agent。
+
+## 开发验证
+
+```bash
+PYTHONPATH=".:vendor" .venv/bin/python3 -m unittest discover -s tests -v
+./scripts/test-macos-ui
+./scripts/build-app
+```
+
+正式业务规则见 [docs/business-rules.md](docs/business-rules.md)，系统分层见 [docs/architecture/system-architecture.md](docs/architecture/system-architecture.md)。

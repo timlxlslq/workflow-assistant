@@ -1,0 +1,41 @@
+#!/bin/bash
+set -euo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+VENV_PYTHON="$PROJECT_DIR/.venv/bin/python3"
+BUNDLED_PYTHON="$PROJECT_DIR/runtime/python/bin/python3"
+if [[ -x "$BUNDLED_PYTHON" ]]; then
+  DEFAULT_PYTHON="$BUNDLED_PYTHON"
+else
+  DEFAULT_PYTHON="$VENV_PYTHON"
+fi
+PYTHON_BIN="${TRAVELER_PYTHON:-$DEFAULT_PYTHON}"
+VENDOR_DIR="$PROJECT_DIR/vendor"
+VENV_SITE_PACKAGES="$(find "$PROJECT_DIR/.venv/lib" -maxdepth 2 -type d -name site-packages -print -quit 2>/dev/null || true)"
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "Python runtime is missing: $PYTHON_BIN" >&2
+  echo "Create .venv and install pyproject.toml dependencies." >&2
+  exit 2
+fi
+
+export PYTHONPATH="$PROJECT_DIR:$VENDOR_DIR${VENV_SITE_PACKAGES:+:$VENV_SITE_PACKAGES}${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONDONTWRITEBYTECODE=1
+case "${1:-}" in
+  assistant)
+    shift
+    exec "$PYTHON_BIN" -m traveler_assistant.assistant_cli "$@"
+    ;;
+  inventory)
+    shift
+    exec "$PYTHON_BIN" -m traveler_assistant.inventory "$@"
+    ;;
+  order)
+    shift
+    exec "$PYTHON_BIN" -m traveler_assistant.order_workflow "$@"
+    ;;
+  *)
+    echo "Usage: pp-flowhub {assistant|order|inventory} <command> [options]" >&2
+    exit 2
+    ;;
+esac

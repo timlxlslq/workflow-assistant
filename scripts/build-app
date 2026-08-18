@@ -2,28 +2,119 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD="$ROOT/build"
-APP="$BUILD/工作流程助手.app"
+BUILD_ROOT="${PP_FLOWHUB_BUILD_ROOT:-/tmp/pp-flowhub-build}"
+OUTPUT_APP="$BUILD_ROOT/PP FlowHub.app"
+STAGING_DIR="$(mktemp -d /tmp/workflow-assistant-build.XXXXXX)"
+trap 'rm -rf "$STAGING_DIR"' EXIT
+APP="$STAGING_DIR/PP FlowHub.app"
 CONTENTS="$APP/Contents"
 RESOURCES="$CONTENTS/Resources/project"
+PYTHON_ENV="${TRAVELER_PYTHON_ENV:-$ROOT/.venv}"
+DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+TARGET_ARCH="${TRAVELER_ARCH:-$(uname -m)}"
+SWIFT_TARGET="$TARGET_ARCH-apple-macosx$DEPLOYMENT_TARGET"
+EXPECTED_BUNDLE_IDENTIFIER="com.pacificpride.ppflowhub"
+INFO_PLIST="$ROOT/macos/Info.plist"
 
-rm -rf "$APP"
+if ! BUNDLE_IDENTIFIER="$(/usr/bin/plutil -extract CFBundleIdentifier raw "$INFO_PLIST" 2>/dev/null)"; then
+  echo "Unable to read CFBundleIdentifier from $INFO_PLIST" >&2
+  exit 2
+fi
+if [[ "$BUNDLE_IDENTIFIER" != "$EXPECTED_BUNDLE_IDENTIFIER" ]]; then
+  echo "Unexpected Bundle Identifier: $BUNDLE_IDENTIFIER" >&2
+  echo "Expected fixed Bundle Identifier: $EXPECTED_BUNDLE_IDENTIFIER" >&2
+  exit 2
+fi
+
+# Signing intentionally happens only in scripts/install-app, which must be
+# run from the user's normal Aqua Terminal session. This script is safe to run
+# in the Codex Background Security Session: it never reads the keychain and it
+# never uses ad-hoc signing.
+
+if [[ ! -x "$PYTHON_ENV/bin/python3" ]]; then
+  echo "Missing Python environment: $PYTHON_ENV" >&2
+  echo "Create it with: python3 -m venv .venv && .venv/bin/python3 -m pip install ." >&2
+  exit 2
+fi
+if ! "$PYTHON_ENV/bin/python3" -c 'import agents, openpyxl, pydantic_core' >/dev/null 2>&1; then
+  echo "Python environment is incomplete or built for the wrong CPU architecture: $PYTHON_ENV" >&2
+  echo "Recreate it on this Mac and install pyproject.toml dependencies." >&2
+  exit 2
+fi
+PYTHON_BASE="${TRAVELER_PYTHON_BASE:-$("$PYTHON_ENV/bin/python3" -c 'import sys; print(sys.base_prefix)')}"
+if [[ ! -x "$PYTHON_BASE/bin/python3" || ! -f "$PYTHON_BASE/lib/libpython3.12.dylib" ]]; then
+  echo "Portable Python base runtime is incomplete: $PYTHON_BASE" >&2
+  echo "Set TRAVELER_PYTHON_BASE to the base prefix used to create .venv." >&2
+  exit 2
+fi
+
+NODE_BIN="${TRAVELER_NODE:-}"
+if [[ -z "$NODE_BIN" ]] && command -v node >/dev/null 2>&1; then
+  NODE_BIN="$(command -v node)"
+fi
+if [[ -z "$NODE_BIN" && -L "$ROOT/node_modules" ]]; then
+  NODE_MODULES_TARGET="$(readlink "$ROOT/node_modules")"
+  NODE_CANDIDATE="$(dirname "$NODE_MODULES_TARGET")/bin/node"
+  if [[ -x "$NODE_CANDIDATE" ]]; then NODE_BIN="$NODE_CANDIDATE"; fi
+fi
+if [[ -z "$NODE_BIN" || ! -x "$NODE_BIN" ]]; then
+  echo "Node.js not found. Set TRAVELER_NODE to an executable Node.js path." >&2
+  exit 2
+fi
+
+NODE_MODULES="${TRAVELER_NODE_MODULES:-$ROOT/node_modules}"
+for package in playwright playwright-core; do
+  if [[ ! -d "$NODE_MODULES/$package" ]]; then
+    echo "Missing Node dependency: $NODE_MODULES/$package" >&2
+    echo "Set TRAVELER_NODE_MODULES to the directory containing Playwright." >&2
+    exit 2
+  fi
+done
+
+mkdir -p "$BUILD_ROOT"
 mkdir -p "$CONTENTS/MacOS" "$RESOURCES"
-MODULE_CACHE="/tmp/traveler-assistant-module-cache"
+MODULE_CACHE="/tmp/pp-flowhub-module-cache"
 mkdir -p "$MODULE_CACHE"
-/usr/bin/xcrun --sdk macosx swiftc -module-cache-path "$MODULE_CACHE" -Xcc -fmodules-cache-path="$MODULE_CACHE" -parse-as-library "$ROOT/macos/TravelerAssistant.swift" -o "$CONTENTS/MacOS/TravelerAssistant" -framework SwiftUI -framework AppKit -framework UserNotifications
-cp "$ROOT/macos/Info.plist" "$CONTENTS/Info.plist"
+# Swift's linker defaults to an ad-hoc linker signature on this toolchain.
+# Disable that default so the Codex build is genuinely unsigned; the Aqua
+# Terminal install step adds the Apple Development signature later.
+/usr/bin/xcrun --sdk macosx swiftc -target "$SWIFT_TARGET" -Xlinker -no_adhoc_codesign -module-cache-path "$MODULE_CACHE" -Xcc -fmodules-cache-path="$MODULE_CACHE" "$ROOT/tools/keychain_read.swift" -o "$STAGING_DIR/keychain-read" -framework Foundation -framework Security
+/usr/bin/xcrun --sdk macosx swiftc -target "$SWIFT_TARGET" -Xlinker -no_adhoc_codesign -module-cache-path "$MODULE_CACHE" -Xcc -fmodules-cache-path="$MODULE_CACHE" -parse-as-library "$ROOT/macos/OperationLog.swift" "$ROOT/macos/TravelerAssistant.swift" "$ROOT/macos/AssistantView.swift" "$ROOT/macos/OrderDashboardView.swift" -o "$CONTENTS/MacOS/PPFlowHub" -framework SwiftUI -framework AppKit -framework AVFoundation -framework Speech -framework Security
+cp "$INFO_PLIST" "$CONTENTS/Info.plist"
 cp "$ROOT/assets/icons/AppIcon.png" "$CONTENTS/Resources/AppIcon.png"
 cp -R "$ROOT/traveler_assistant" "$RESOURCES/"
-cp -R "$ROOT/config" "$RESOURCES/"
+cp -R "$ROOT/resources" "$RESOURCES/"
 cp -R "$ROOT/scripts" "$RESOURCES/"
 cp -R "$ROOT/vendor" "$RESOURCES/"
+cp -RL "$PYTHON_ENV" "$RESOURCES/.venv"
 cp -R "$ROOT/tools" "$RESOURCES/"
 mkdir -p "$RESOURCES/bin" "$RESOURCES/node_modules"
-cp "/Users/lantian/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/bin/node" "$RESOURCES/bin/node"
-cp -RL "/Users/lantian/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright" "$RESOURCES/node_modules/playwright"
-cp -RL "/Users/lantian/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright-core" "$RESOURCES/node_modules/playwright-core"
+mkdir -p "$RESOURCES/runtime/python/bin" "$RESOURCES/runtime/python/lib"
+/usr/bin/rsync -a "$PYTHON_BASE/bin/" "$RESOURCES/runtime/python/bin/"
+/usr/bin/rsync -a --exclude 'site-packages/' --exclude 'pkgconfig/' "$PYTHON_BASE/lib/" "$RESOURCES/runtime/python/lib/"
+cp "$NODE_BIN" "$RESOURCES/bin/node"
+cp "$STAGING_DIR/keychain-read" "$RESOURCES/bin/keychain-read"
+cp -RL "$NODE_MODULES/playwright" "$RESOURCES/node_modules/playwright"
+cp -RL "$NODE_MODULES/playwright-core" "$RESOURCES/node_modules/playwright-core"
 chmod +x "$RESOURCES/bin/node"
-chmod +x "$RESOURCES/scripts/traveler-assistant"
-/usr/bin/codesign --force --deep --sign - "$APP"
-echo "$APP"
+chmod +x "$RESOURCES/bin/keychain-read"
+chmod +x "$RESOURCES/runtime/python/bin/python3"
+chmod +x "$RESOURCES/scripts/pp-flowhub"
+find "$APP" -name .DS_Store -delete
+find "$APP" -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
+find "$APP" -depth -type d -name __pycache__ -empty -delete
+/usr/bin/xattr -cr "$APP"
+if ! STAGED_BUNDLE_IDENTIFIER="$(/usr/bin/plutil -extract CFBundleIdentifier raw "$CONTENTS/Info.plist" 2>/dev/null)" \
+  || [[ "$STAGED_BUNDLE_IDENTIFIER" != "$EXPECTED_BUNDLE_IDENTIFIER" ]]; then
+  echo "Staged App Bundle Identifier changed unexpectedly: ${STAGED_BUNDLE_IDENTIFIER:-<missing>}" >&2
+  exit 2
+fi
+if [[ ! -x "$CONTENTS/MacOS/PPFlowHub" ]]; then
+  echo "Staged App executable path changed unexpectedly: $CONTENTS/MacOS/PPFlowHub" >&2
+  exit 2
+fi
+rm -rf "$OUTPUT_APP"
+/usr/bin/ditto --noextattr --noqtn "$APP" "$OUTPUT_APP"
+echo "Unsigned App bundle assembled for Aqua Terminal signing: $OUTPUT_APP"
+echo "Reminder: a new App was built. Run ./scripts/install-app from a normal macOS Terminal/Aqua session to sign and install it."
+echo "$OUTPUT_APP"

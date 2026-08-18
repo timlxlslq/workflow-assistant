@@ -1,0 +1,4 @@
+interface:
+  display_name: "Order Management"
+  short_description: "Discover and index production order folders"
+  default_prompt: "Use $order-management to inspect and classify production order folders."

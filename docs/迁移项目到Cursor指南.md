@@ -55,7 +55,6 @@ python3 -m unittest discover -s tests -v
 
 以下内容不应搬入项目或提交 GitHub：
 
-- AIMES 用户名和密码。
 - 库存系统用户名和密码。
 - macOS 钥匙串内容。
 - 浏览器登录目录。

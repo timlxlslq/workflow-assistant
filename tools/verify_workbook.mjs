@@ -24,7 +24,7 @@ const errors = await workbook.inspect({
 });
 console.log(errors.ndjson);
 
-for (const name of ["WorkOrderTraveler", "Pickinglist", "Purchase List", "Cuttinglist", "Packing and Sorting List"]) {
+for (const name of workbook.worksheets.items.map((sheet) => sheet.name)) {
   const preview = await workbook.render({ sheetName: name, autoCrop: "all", scale: 1, format: "png" });
   const safe = name.replaceAll(" ", "-");
   await fs.writeFile(path.join(outputDir, `${safe}.png`), new Uint8Array(await preview.arrayBuffer()));
