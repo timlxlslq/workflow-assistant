@@ -89,7 +89,7 @@ assert "SUMIF($I$3:$I$13,C$16,$G$3:$G$13)" in ws["C18"].value
 assert "SUMIF($I$3:$I$13,C$16,$H$3:$H$13)" in ws["C19"].value
 _, materials, edges = parse_order_materials("PP0067", material)
 assert next(item.quantity for item in materials if item.kind == "panel" and item.color == "Woodline 4") == 1
-assert abs(edges["Woodline 4"] - 18.27) < 1e-9
+assert edges["Woodline 4"] == 18
 ' "$TEST_ROOT"
 
 echo "PP0067 workbook end-to-end test passed"

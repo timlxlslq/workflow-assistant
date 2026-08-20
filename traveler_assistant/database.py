@@ -24,6 +24,100 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+_OUTBOUND_FACTORY_SPLIT_RE = re.compile(r"[,，;；、|]+")
+
+
+def _outbound_factory_tokens(value: object) -> list[str]:
+    return [
+        token.strip()
+        for token in _OUTBOUND_FACTORY_SPLIT_RE.split(str(value or ""))
+        if token.strip()
+    ]
+
+
+def ensure_outbound_document_factory_links(
+    connection: sqlite3.Connection,
+    document_number: str,
+    order_id: str,
+    factory_value: str,
+    *,
+    updated_at: str | None = None,
+) -> int:
+    """Link one outbound document to its exact factory-order identities.
+
+    The header table keeps one row per inventory document.  This relation
+    table allows one document to cover multiple factory orders without
+    encoding a list into the single-valued legacy ``factory_order`` column.
+    An order-only value is linked only when the order has exactly one active
+    factory order; split orders must provide exact factory identities.
+    """
+    document_number = str(document_number or "").strip()
+    order_id = str(order_id or "").strip().upper()
+    if not document_number or not order_id:
+        return 0
+    if connection.execute(
+        "select 1 from sqlite_master where type='table' and name='outbound_document_factories'"
+    ).fetchone() is None:
+        return 0
+    now = updated_at or _now()
+    candidates: set[str] = set()
+    for token in _outbound_factory_tokens(factory_value):
+        rows = connection.execute(
+            """
+            select factory_order
+            from factory_orders
+            where order_id=? and (factory_order=? or factory_name=?)
+            """,
+            (order_id, token, token),
+        ).fetchall()
+        candidates.update(str(row[0]).strip() for row in rows if str(row[0]).strip())
+    if not candidates:
+        active = connection.execute(
+            """
+            select factory_order
+            from factory_orders
+            where order_id=? and aimes_status='active'
+            order by factory_order
+            """,
+            (order_id,),
+        ).fetchall()
+        tokens = {
+            re.sub(r"[\s_-]+", "", token).casefold()
+            for token in _outbound_factory_tokens(factory_value)
+        }
+        order_aliases = {order_id}
+        order_aliases.update(
+            re.sub(r"[\s_-]+", "", str(row[0])).casefold()
+            for row in connection.execute(
+                "select distinct sales_order_name from factory_orders where order_id=?",
+                (order_id,),
+            ).fetchall()
+            if str(row[0]).strip()
+        )
+        if len(active) == 1 and tokens.intersection(order_aliases):
+            candidates.add(str(active[0][0]).strip())
+    inserted = 0
+    for factory_order in sorted(candidates):
+        if connection.execute(
+            """
+            select 1 from outbound_document_factories
+            where document_number=? and factory_order=?
+            """,
+            (document_number, factory_order),
+        ).fetchone():
+            continue
+        cursor = connection.execute(
+            """
+            insert or ignore into outbound_document_factories(
+                document_number, order_id, factory_order, created_at, updated_at
+            ) values(?,?,?,?,?)
+            """,
+            (document_number, order_id, factory_order, now, now),
+        )
+        inserted += cursor.rowcount
+    return inserted
+
+
 def ensure_schema(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
@@ -69,6 +163,31 @@ def ensure_schema(path: Path) -> None:
                 unique(order_id, material_type, color, thickness, unit, edge, source_type, source_path)
             );
             create index if not exists idx_material_items_order on material_items(order_id);
+            create table if not exists server_material_allocations(
+                id integer primary key,
+                source_material_id integer not null,
+                source_path text not null default '',
+                source_material_key text not null default '',
+                material_type text not null default '',
+                color text not null default '',
+                thickness text not null default '',
+                unit text not null default '',
+                edge text not null default '',
+                source_quantity real not null default 0,
+                order_id text not null,
+                allocated_quantity real not null default 0,
+                source_fingerprint text not null default '',
+                created_at text not null,
+                updated_at text not null,
+                unique(source_path, source_material_key, order_id)
+            );
+            create index if not exists idx_server_material_allocations_source
+                on server_material_allocations(source_path, source_material_key);
+            create index if not exists idx_server_material_allocations_order
+                on server_material_allocations(order_id);
+            create table if not exists server_material_preview_scopes(
+                source_folder text primary key
+            );
             create table if not exists hardware_items(
                 id integer primary key,
                 order_id text not null default '',
@@ -99,6 +218,18 @@ def ensure_schema(path: Path) -> None:
                 updated_at text not null
             );
             create index if not exists idx_outbound_documents_order on outbound_documents(order_id, factory_order);
+            create table if not exists outbound_document_factories(
+                id integer primary key,
+                document_number text not null,
+                order_id text not null default '',
+                factory_order text not null,
+                created_at text not null,
+                updated_at text not null,
+                unique(document_number, factory_order),
+                foreign key(document_number) references outbound_documents(document_number) on delete cascade
+            );
+            create index if not exists idx_outbound_document_factories_factory
+                on outbound_document_factories(order_id, factory_order);
             create table if not exists backup_records(
                 id integer primary key,
                 backup_path text not null,
@@ -200,6 +331,16 @@ def ensure_schema(path: Path) -> None:
                     connection.execute(
                         f"alter table factory_orders add column {column} {definition}"
                     )
+            for document_number, order_id, factory_value, updated_at in connection.execute(
+                "select document_number, order_id, factory_order, updated_at from outbound_documents"
+            ).fetchall():
+                ensure_outbound_document_factory_links(
+                    connection,
+                    document_number,
+                    order_id,
+                    factory_value,
+                    updated_at=updated_at or _now(),
+                )
         connection.commit()
     finally:
         connection.close()
@@ -436,6 +577,16 @@ def migrate_legacy_databases(state_dir: Path) -> dict[str, Any]:
                      str(record.get("remark", "")), str(record.get("status", "已出库")), "legacy-json",
                      str(record.get("synced_at", "")), str(record.get("traveler_path", "")), _now()),
                 )
+        for document_number, order_id, factory_value, updated_at in connection.execute(
+            "select document_number, order_id, factory_order, updated_at from outbound_documents"
+        ).fetchall():
+            ensure_outbound_document_factory_links(
+                connection,
+                document_number,
+                order_id,
+                factory_value,
+                updated_at=updated_at or _now(),
+            )
         connection.commit()
     finally:
         connection.close()

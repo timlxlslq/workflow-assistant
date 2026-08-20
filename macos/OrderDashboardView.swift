@@ -20,13 +20,18 @@ let orderDashboardMetricSpacing: CGFloat = 10
 // Give the factory identity/status columns practical minimum widths. The
 // order-level Panel colors are shown above the table, so the table no longer
 // needs a separate color column.
-let orderDashboardFactoryColumnWidths: [CGFloat] = [150, 220, 110, 110, 110]
+let orderDashboardFactoryColumnWidths: [CGFloat] = [150, 220, 110, 110, 190]
 let orderDashboardFactorySelectionColumnWidth: CGFloat = 54
 let dashboardMessageVisibleRowCount = 3
 let dashboardMessageRowHeight: CGFloat = 74
 let dashboardMessageViewportHeight = CGFloat(dashboardMessageVisibleRowCount) * dashboardMessageRowHeight
 let dashboardMessageHoverDelay: TimeInterval = 1.0
-let dashboardMessageHoverCloseGrace: TimeInterval = 1.2
+let dashboardMessageHoverCloseGrace: TimeInterval = 0.8
+
+func dashboardMessageHoverCanPresent(appIsActive: Bool, mainWindowIsFrontmost: Bool) -> Bool {
+    appIsActive && mainWindowIsFrontmost
+}
+
 let orderDashboardMetricColumns = Array(
     repeating: GridItem(.flexible(minimum: orderDashboardMetricMinimumWidth), spacing: orderDashboardMetricSpacing),
     count: orderDashboardMetricColumnCount
@@ -61,11 +66,22 @@ func orderDetailPanelRows(_ rows: [OrderMaterialPreview]) -> [OrderMaterialPrevi
         .sorted {
             let leftColor = $0.color.trimmingCharacters(in: .whitespacesAndNewlines)
             let rightColor = $1.color.trimmingCharacters(in: .whitespacesAndNewlines)
-            let colorOrder = leftColor.localizedStandardCompare(rightColor)
+            let leftColorKey = leftColor.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            let rightColorKey = rightColor.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            let colorOrder = leftColorKey.localizedStandardCompare(rightColorKey)
             if colorOrder != .orderedSame { return colorOrder == .orderedAscending }
+            let leftThicknessRank = orderDetailPanelThicknessRank($0.thickness)
+            let rightThicknessRank = orderDetailPanelThicknessRank($1.thickness)
+            if leftThicknessRank != rightThicknessRank { return leftThicknessRank < rightThicknessRank }
             if abs($0.thickness - $1.thickness) > 0.01 { return $0.thickness < $1.thickness }
             return $0.quantity < $1.quantity
         }
+}
+
+func orderDetailPanelThicknessRank(_ thickness: Double) -> Int {
+    if abs(thickness - 19.1) < 0.01 { return 0 }
+    if abs(thickness - 8) < 0.01 || abs(thickness - 9) < 0.01 { return 1 }
+    return 2
 }
 
 func orderDetailEdgeColors(_ colors: [String]) -> [String] {
@@ -192,11 +208,36 @@ func orderDashboardHasShippedSelection(
     selected.contains { statuses[$0] == "已出库" }
 }
 
+func orderDashboardNeedsOutboundUpdateSelection(
+    _ selected: Set<String>,
+    statuses: [String: String]
+) -> Bool {
+    selected.contains { statuses[$0] == "需要更新" }
+}
+
+func orderDashboardOutboundActionTitle(
+    _ selected: Set<String>,
+    statuses: [String: String]
+) -> String {
+    orderDashboardNeedsOutboundUpdateSelection(selected, statuses: statuses) ? "更新出库" : "创建出库"
+}
+
+func orderDashboardOutboundDisplay(status: String, documentNumber: String) -> String {
+    let trimmedStatus = status.trimmingCharacters(in: .whitespacesAndNewlines)
+    let trimmedDocument = documentNumber.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmedStatus == "已出库", !trimmedDocument.isEmpty else { return trimmedStatus }
+    return "\(trimmedStatus) · \(trimmedDocument)"
+}
+
 func orderDashboardStageMatchesFilter(_ stage: String, statusFilter: String) -> Bool {
     if statusFilter == "未完成订单" || statusFilter == "全部状态" {
-        return stage != "已出货"
+        return !orderDashboardIsCompleted(stage)
     }
     return stage == statusFilter
+}
+
+func orderDashboardIsCompleted(_ stage: String) -> Bool {
+    stage == "已出货"
 }
 
 func orderDashboardStatusHelp(status: String, validationMessage: String) -> String {
@@ -210,6 +251,32 @@ func orderDashboardStatusHelp(status: String, validationMessage: String) -> Stri
 func orderDashboardProgressFraction(completed: Int, total: Int) -> Double {
     guard total > 0 else { return 0 }
     return min(max(Double(completed) / Double(total), 0), 1)
+}
+
+func orderInstallationDisplayDate(_ value: String) -> String {
+    let parts = value.split(separator: "-")
+    guard parts.count == 3,
+          let month = Int(parts[1]),
+          let day = Int(parts[2]) else {
+        return value
+    }
+    return "\(month)/\(day)"
+}
+
+func orderInstallationDateSummary(_ days: [OrderInstallationDay]) -> String {
+    let dates = days.map(\.date).sorted()
+    guard let first = dates.first, let last = dates.last else { return "" }
+    let range = first == last
+        ? orderInstallationDisplayDate(first)
+        : "\(orderInstallationDisplayDate(first))–\(orderInstallationDisplayDate(last))"
+    return "\(range) · \(dates.count)天"
+}
+
+func orderInstallationQuickSummary(_ item: OrderDashboardItem) -> String {
+    let actual = orderInstallationDateSummary(item.actualInstallationDays)
+    if !actual.isEmpty { return "实际安装 \(actual)" }
+    let planned = orderInstallationDateSummary(item.plannedInstallationDays)
+    return planned.isEmpty ? "" : "计划安装 \(planned)"
 }
 
 private struct OrderDashboardProgressBar: View {
@@ -398,6 +465,15 @@ func dashboardMessageScrollKey(_ messages: [DashboardMessage]) -> String {
             .joined(separator: ";")
         return "\($0.id)|\($0.time)|\($0.detail)|\($0.operationDetails.joined(separator: "|"))|\($0.contextDetails.joined(separator: "|"))|\($0.duration ?? -1)|\(stageKey)"
     }.joined(separator: "\n")
+}
+
+func dashboardMessageSupportsHoverDetail(_ message: DashboardMessage) -> Bool {
+    !dashboardStatusIsInProgress(message.detail)
+        && (message.state == "warning" || message.state == "failure"
+            || !message.manualPaths.isEmpty
+            || !message.operationDetails.isEmpty
+            || !message.contextDetails.isEmpty
+            || !message.operationDurations.isEmpty)
 }
 
 func dashboardMessageDetailText(_ message: DashboardMessage) -> String {
@@ -633,7 +709,12 @@ private struct DashboardMessageTracePanelPresenter: NSViewRepresentable {
             guard panel == nil,
                   let message,
                   let anchorView,
-                  anchorView.window != nil else { return }
+                  let anchorWindow = anchorView.window,
+                  dashboardMessageHoverCanPresent(
+                      appIsActive: NSApp.isActive,
+                      mainWindowIsFrontmost: anchorWindow.isKeyWindow
+                          && (anchorWindow.isMainWindow || NSApp.mainWindow === anchorWindow)
+                  ) else { return }
             let hostingController = NSHostingController(
                 rootView: AnyView(
                     DashboardMessageTracePopover(
@@ -658,15 +739,26 @@ private struct DashboardMessageTracePanelPresenter: NSViewRepresentable {
             panel.acceptsMouseMovedEvents = true
             hostingController.view.layoutSubtreeIfNeeded()
             let fittingSize = hostingController.view.fittingSize
-            panel.setContentSize(NSSize(width: 520, height: max(120, fittingSize.height)))
+            let panelSize = NSSize(
+                width: 520,
+                height: max(120, min(560, fittingSize.height))
+            )
+            panel.setContentSize(panelSize)
 
-            let trackingView = DashboardMessageTraceTrackingView(frame: panel.contentView?.bounds ?? .zero)
+            let trackingView = DashboardMessageTraceTrackingView(
+                frame: NSRect(origin: .zero, size: panelSize)
+            )
             trackingView.autoresizingMask = [.width, .height]
             trackingView.onMouseEntered = { [weak self] in self?.onPanelEntered?() }
             trackingView.onMouseExited = { [weak self] in self?.onPanelExited?() }
-            hostingController.view.frame = trackingView.bounds
-            hostingController.view.autoresizingMask = [.width, .height]
+            hostingController.view.translatesAutoresizingMaskIntoConstraints = false
             trackingView.addSubview(hostingController.view)
+            NSLayoutConstraint.activate([
+                hostingController.view.leadingAnchor.constraint(equalTo: trackingView.leadingAnchor),
+                hostingController.view.trailingAnchor.constraint(equalTo: trackingView.trailingAnchor),
+                hostingController.view.topAnchor.constraint(equalTo: trackingView.topAnchor),
+                hostingController.view.bottomAnchor.constraint(equalTo: trackingView.bottomAnchor),
+            ])
             panel.contentView = trackingView
 
             self.hostingController = hostingController
@@ -755,10 +847,16 @@ private struct DashboardMessageTraceHost<Content: View>: View {
 
     private func beginHover() {
         guard !anchorHovering else { return }
+        let wasPopoverVisible = showPopover
         activeMessageID = message.id
         anchorHovering = true
-        showPopover = false
         hoverGeneration += 1
+        if wasPopoverVisible {
+            // Re-entering the row during the close grace period keeps the
+            // already-visible panel instead of hiding and re-presenting it.
+            return
+        }
+        showPopover = false
         let generation = hoverGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + dashboardMessageHoverDelay) {
             guard generation == hoverGeneration, anchorHovering else { return }
@@ -809,6 +907,7 @@ struct OrderDashboardView: View {
     @State private var statusFilter = "未完成订单"
     @State private var showFactoryStock = false
     @State private var showInventoryWorkspace = false
+    @State private var showOutboundUpdateConfirmation = false
     @State private var showOutboundScope = false
     @State private var showServerFolderImporter = false
     @State private var activeMessageID: String?
@@ -831,16 +930,20 @@ struct OrderDashboardView: View {
         model.orderFactories.filter { selectedFactoryIDs.contains($0.factoryOrder) }
     }
 
+    private var availableHardwareFactoryOrders: Set<String> {
+        Set(
+            model.orderFittings
+                .filter { $0.quantity > 0 }
+                .map { $0.factoryOrder }
+        )
+    }
+
     @ViewBuilder
     private func traceHost<Content: View>(
         for message: DashboardMessage,
         @ViewBuilder content: @escaping () -> Content
     ) -> some View {
-        if !dashboardStatusIsInProgress(message.detail),
-           (message.state == "warning" || message.state == "failure"
-            || !message.manualPaths.isEmpty
-            || !message.operationDetails.isEmpty
-            || !message.contextDetails.isEmpty) {
+        if dashboardMessageSupportsHoverDetail(message) {
             DashboardMessageTraceHost(
                 message: message,
                 activeMessageID: $activeMessageID,
@@ -877,7 +980,10 @@ struct OrderDashboardView: View {
         .sheet(isPresented: $showInventoryWorkspace) {
             InventoryView(
                 model: model,
-                onClose: { showInventoryWorkspace = false },
+                onClose: {
+                    showInventoryWorkspace = false
+                    model.refreshDashboardOrdersAfterOutbound()
+                },
                 orderContextID: model.selectedOrderId,
                 orderContextFactoryNames: selectedOutboundFactories.map(\.orderName),
                 orderContextFactoryOrders: selectedFactoryIDs.sorted()
@@ -889,7 +995,8 @@ struct OrderDashboardView: View {
                 model: model,
                 orderID: model.selectedOrderId,
                 orderType: model.dashboardOrders.first(where: { $0.orderId == model.selectedOrderId })?.orderType ?? "owned",
-                factoryOrders: selectedFactoryIDs.sorted()
+                factoryOrders: selectedFactoryIDs.sorted().filter { availableHardwareFactoryOrders.contains($0) },
+                hardwareFactoryOrders: availableHardwareFactoryOrders
             )
             .frame(width: 520, height: 430)
         }
@@ -903,6 +1010,12 @@ struct OrderDashboardView: View {
             Button("知道了") { model.aimesFailureAlert = "" }
         } message: {
             Text("本次未能获取最新 AIMES 数据，Server 扫描将继续使用最近一次成功缓存。\n\n\(model.aimesFailureAlert)")
+        }
+        .alert("确认更新出库", isPresented: $showOutboundUpdateConfirmation) {
+            Button("取消", role: .cancel) {}
+            Button("继续更新") { showInventoryWorkspace = true }
+        } message: {
+            Text("所选工厂单已有出库记录，但当前材料或五金事实发生了变化。继续后会更新原出库单，不会新建重复出库单。")
         }
         .fileImporter(
             isPresented: $showServerFolderImporter,
@@ -1238,6 +1351,20 @@ struct OrderDashboardView: View {
                             Text(item.orderId).font(.headline).foregroundColor(AppPalette.accent)
                             Text(item.orderType == "cutToSize" ? "来料加工" : (item.orderType == "temporary" ? "临时任务" : "自有订单"))
                                 .font(.caption2).foregroundColor(.secondary)
+                            if !item.userNote.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Label(item.userNote.trimmingCharacters(in: .whitespacesAndNewlines), systemImage: "note.text")
+                                    .font(.caption2)
+                                    .foregroundColor(AppPalette.accent)
+                                    .lineLimit(1)
+                                    .help(item.userNote)
+                            }
+                            let installation = orderInstallationQuickSummary(item)
+                            if !installation.isEmpty {
+                                Label(installation, systemImage: "calendar")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                    .lineLimit(1)
+                            }
                         }
                     }
                     tableCell {
@@ -1298,9 +1425,19 @@ struct OrderDashboardView: View {
                     selectedFactoryID: $selectedFactoryID,
                     selectedFactoryIDs: $selectedFactoryIDs,
                     onQueryStock: { showFactoryStock = true; model.checkSelectedOrderStock() },
-                    onOpenOutbound: { showInventoryWorkspace = true },
+                    onOpenOutbound: {
+                        let statuses = Dictionary(uniqueKeysWithValues: item.factories.map {
+                            ($0.factoryOrder, $0.outboundStatus)
+                        })
+                        if orderDashboardNeedsOutboundUpdateSelection(selectedFactoryIDs, statuses: statuses) {
+                            showOutboundUpdateConfirmation = true
+                        } else {
+                            showInventoryWorkspace = true
+                        }
+                    },
                     onOpenScope: { showOutboundScope = true },
-                    orderType: item.orderType
+                    orderType: item.orderType,
+                    isCompletedOrder: orderDashboardIsCompleted(item.stage)
                 )
                 .padding(.horizontal, 12)
                 .padding(.bottom, 12)
@@ -1312,6 +1449,7 @@ struct OrderDashboardView: View {
         selectedFactoryID = nil
         selectedFactoryIDs = []
         model.selectedOrderIsOptimized = item.stage == "已优化"
+        model.selectedOrderIsCompleted = orderDashboardIsCompleted(item.stage)
         model.loadOrderDetailFromDatabase(item)
     }
 
@@ -1385,21 +1523,24 @@ struct OrderDashboardDetailPage: View {
         GeometryReader { geometry in
             VStack(alignment: .leading, spacing: 14) {
                 orderIdentityCard
-                if model.orderDetailWaiting,
-                   model.selectedOrderId.caseInsensitiveCompare(order.orderId) == .orderedSame {
-                    AppSurfaceCard(padding: 12) {
-                        HStack(spacing: 10) {
-                            ProgressView().controlSize(.small)
-                            Text("正在扫描，扫描完成后自动读取详情")
-                                .foregroundColor(.secondary)
-                            Spacer(minLength: 0)
-                        }
-                    }
-                }
-                boardAndEdgeSection
                 ScrollView(.vertical) {
-                    hardwareSection
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                    VStack(alignment: .leading, spacing: 14) {
+                        if model.orderDetailWaiting,
+                           model.selectedOrderId.caseInsensitiveCompare(order.orderId) == .orderedSame {
+                            AppSurfaceCard(padding: 12) {
+                                HStack(spacing: 10) {
+                                    ProgressView().controlSize(.small)
+                                    Text("正在扫描，扫描完成后自动读取详情")
+                                        .foregroundColor(.secondary)
+                                    Spacer(minLength: 0)
+                                }
+                            }
+                        }
+                        OrderAnnotationsEditor(model: model, order: order)
+                        boardAndEdgeSection
+                        hardwareSection
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
                 }
                 .scrollIndicators(.automatic)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -1416,7 +1557,7 @@ struct OrderDashboardDetailPage: View {
     }
 
     private var orderIdentityCard: some View {
-        HStack(alignment: .center, spacing: 12) {
+        return HStack(alignment: .center, spacing: 12) {
             HStack(spacing: 10) {
                 Text("订单 (\(order.orderId))")
                     .font(.title2.weight(.semibold))
@@ -1575,6 +1716,166 @@ struct OrderDashboardDetailPage: View {
     }
 }
 
+private struct OrderInstallationDraft: Identifiable {
+    let id = UUID()
+    var date: Date
+    var installer: String
+}
+
+private func orderInstallationDateFormatter() -> DateFormatter {
+    let formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = .current
+    formatter.dateFormat = "yyyy-MM-dd"
+    return formatter
+}
+
+private func orderInstallationDraftDate(_ value: String) -> Date {
+    orderInstallationDateFormatter().date(from: value) ?? Date()
+}
+
+private func orderInstallationDraftValue(_ value: Date) -> String {
+    orderInstallationDateFormatter().string(from: value)
+}
+
+private struct OrderAnnotationsEditor: View {
+    @ObservedObject var model: AppModel
+    let order: OrderDashboardItem
+    @State private var note: String
+    @State private var plannedDays: [OrderInstallationDraft]
+    @State private var actualDays: [OrderInstallationDraft]
+    @State private var status = ""
+
+    init(model: AppModel, order: OrderDashboardItem) {
+        self.model = model
+        self.order = order
+        _note = State(initialValue: order.userNote)
+        _plannedDays = State(initialValue: order.plannedInstallationDays.map {
+            OrderInstallationDraft(date: orderInstallationDraftDate($0.date), installer: $0.installer)
+        })
+        _actualDays = State(initialValue: order.actualInstallationDays.map {
+            OrderInstallationDraft(date: orderInstallationDraftDate($0.date), installer: $0.installer)
+        })
+    }
+
+    var body: some View {
+        AppSurfaceCard(padding: 14) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("订单备注与安装安排")
+                    .font(.headline)
+                TextEditor(text: $note)
+                    .font(.body)
+                    .frame(minHeight: 54, maxHeight: 72)
+                    .padding(5)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(AppPalette.separator)
+                    )
+                    .overlay(alignment: .topLeading) {
+                        if note.isEmpty {
+                            Text("填写客户要求、待确认事项或特殊交付说明")
+                                .foregroundColor(.secondary)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 12)
+                                .allowsHitTesting(false)
+                        }
+                    }
+
+                installationRows(title: "计划安装日期", rows: $plannedDays)
+                installationRows(title: "实际安装日期", rows: $actualDays)
+
+                HStack(spacing: 10) {
+                    if !status.isEmpty {
+                        Text(status)
+                            .font(.caption)
+                            .foregroundColor(status.contains("失败") ? AppPalette.danger : .secondary)
+                    }
+                    Spacer(minLength: 0)
+                    Button("保存备注和安装安排") {
+                        save()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.orderRunning)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func installationRows(
+        title: String,
+        rows: Binding<[OrderInstallationDraft]>
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(title).font(.subheadline.weight(.semibold))
+                Spacer(minLength: 0)
+                Button {
+                    rows.wrappedValue.append(OrderInstallationDraft(date: Date(), installer: ""))
+                } label: {
+                    Label("添加日期", systemImage: "plus")
+                }
+                .buttonStyle(.borderless)
+            }
+            if rows.wrappedValue.isEmpty {
+                Text("未填写")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                ForEach(rows) { $day in
+                    HStack(spacing: 8) {
+                        DatePicker("", selection: $day.date, displayedComponents: .date)
+                            .labelsHidden()
+                            .datePickerStyle(.field)
+                            .frame(width: 150)
+                        TextField("安装人/安装小组", text: $day.installer)
+                            .textFieldStyle(.roundedBorder)
+                        Button {
+                            rows.wrappedValue.removeAll { $0.id == day.id }
+                        } label: {
+                            Image(systemName: "trash")
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundColor(AppPalette.danger)
+                    }
+                }
+                let summaries = rows.wrappedValue.map {
+                    OrderInstallationDay(
+                        date: orderInstallationDraftValue($0.date),
+                        installer: $0.installer
+                    )
+                }
+                Text("开始：\(orderInstallationDisplayDate(summaries.map(\.date).sorted().first ?? "—"))；结束：\(orderInstallationDisplayDate(summaries.map(\.date).sorted().last ?? "—"))；共 \(Set(summaries.map(\.date)).count) 天")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
+    private func save() {
+        let planned = plannedDays.map {
+            OrderInstallationDay(
+                date: orderInstallationDraftValue($0.date),
+                installer: $0.installer.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        let actual = actualDays.map {
+            OrderInstallationDay(
+                date: orderInstallationDraftValue($0.date),
+                installer: $0.installer.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        status = "正在保存…"
+        model.saveOrderAnnotations(
+            orderID: order.orderId,
+            userNote: note,
+            plannedDays: planned,
+            actualDays: actual
+        )
+    }
+}
+
 struct OrderDashboardDetailCard: View {
     @ObservedObject var model: AppModel
     let dashboardFactories: [OrderDashboardFactory]
@@ -1584,6 +1885,7 @@ struct OrderDashboardDetailCard: View {
     let onOpenOutbound: () -> Void
     let onOpenScope: () -> Void
     let orderType: String
+    let isCompletedOrder: Bool
 
     var body: some View {
         AppSurfaceCard(padding: 14) {
@@ -1595,30 +1897,46 @@ struct OrderDashboardDetailCard: View {
     }
 
     private var detailActions: some View {
-        HStack(alignment: .center, spacing: 12) {
+        let outboundStatuses = Dictionary(uniqueKeysWithValues: dashboardFactories.map {
+            ($0.factoryOrder, $0.outboundStatus)
+        })
+        let outboundActionTitle = orderDashboardOutboundActionTitle(selectedFactoryIDs, statuses: outboundStatuses)
+        return HStack(alignment: .center, spacing: 12) {
             HStack(spacing: 8) {
                 Button("查询库存") { onQueryStock() }
                     .appActionButton(minWidth: 96)
-                    .disabled(model.selectedOrderId.isEmpty || model.orderRunning || !model.orderPreviewReady)
+                    .disabled(isCompletedOrder || model.selectedOrderId.isEmpty || model.orderRunning || !model.orderPreviewReady)
+                    .help(isCompletedOrder ? "订单已出货，不能再查询库存" : "查询当前订单库存")
                 Button("计算成本") {
                     model.calculateSelectedOrderCost()
                 }
                 .appActionButton(minWidth: 96)
                 .disabled(model.selectedOrderId.isEmpty || model.orderRunning)
-                Button("设置出库范围") { onOpenScope() }
-                    .appActionButton(minWidth: 112)
-                    .disabled(model.selectedOrderId.isEmpty || model.orderRunning)
-                Button("创建出库") { onOpenOutbound() }
+                if orderType != "owned" {
+                    Button("设置出库范围") { onOpenScope() }
+                        .appActionButton(minWidth: 112)
+                        .disabled(isCompletedOrder || model.selectedOrderId.isEmpty || model.orderRunning)
+                        .help(isCompletedOrder ? "订单已出货，不能再设置出库范围" : "设置当前订单出库范围")
+                }
+                Button(outboundActionTitle) { onOpenOutbound() }
                     .buttonStyle(.borderedProminent)
                     .appActionButton(minWidth: 96)
                     .disabled(
-                        selectedFactoryIDs.isEmpty
+                        isCompletedOrder
+                        || selectedFactoryIDs.isEmpty
                         || orderDashboardHasShippedSelection(
                             selectedFactoryIDs,
                             statuses: Dictionary(uniqueKeysWithValues: dashboardFactories.map {
                                 ($0.factoryOrder, $0.outboundStatus)
                             })
                         )
+                    )
+                    .help(
+                        isCompletedOrder
+                            ? "订单已出货，不能再处理出库"
+                            : (outboundActionTitle == "更新出库"
+                                ? "更新所选工厂单的原出库单"
+                                : "创建当前订单出库")
                     )
             }
             .fixedSize(horizontal: true, vertical: false)
@@ -1633,11 +1951,11 @@ struct OrderDashboardDetailCard: View {
             Text("Panel颜色")
                 .font(.subheadline.weight(.semibold))
                 .foregroundColor(.secondary)
+                .fixedSize(horizontal: true, vertical: false)
             Text(colors.isEmpty ? "—" : colors.joined(separator: "、"))
                 .font(.title3.weight(.medium))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .minimumScaleFactor(0.75)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
                 .layoutPriority(1)
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
@@ -1693,6 +2011,7 @@ struct OrderDashboardDetailCard: View {
             ? (model.orderPreviewValidated ? "已优化" : "待校验")
             : (dashboardFactory?.optimized == true ? "已优化" : "待优化")
         let outbound = dashboardFactory?.outboundStatus ?? "未查询"
+        let outboundDocument = dashboardFactory?.outboundDocument ?? ""
         HStack(spacing: 0) {
             Image(systemName: isHeader ? "square" : (selected ? "checkmark.square.fill" : "square"))
                 .font(.system(size: isHeader ? 1 : 20, weight: .medium))
@@ -1703,7 +2022,11 @@ struct OrderDashboardDetailCard: View {
             factoryCell(isHeader ? "名称" : factoryName, width: orderDashboardFactoryColumnWidths[1])
             factoryCell(isHeader ? "拆单" : "已拆单", width: orderDashboardFactoryColumnWidths[2], status: !isHeader)
             factoryCell(isHeader ? "优化" : optimization, width: orderDashboardFactoryColumnWidths[3], status: !isHeader && optimization == "已优化")
-            factoryCell(isHeader ? "出库" : outbound, width: orderDashboardFactoryColumnWidths[4], status: !isHeader && outbound == "已出库")
+            factoryCell(
+                isHeader ? "出库" : orderDashboardOutboundDisplay(status: outbound, documentNumber: outboundDocument),
+                width: orderDashboardFactoryColumnWidths[4],
+                status: !isHeader && outbound == "已出库"
+            )
         }
         .font(isHeader ? .caption.weight(.semibold) : .caption)
         .foregroundColor(isHeader ? .secondary : .primary)
@@ -1728,45 +2051,65 @@ struct OutboundScopeSheet: View {
     let orderID: String
     let orderType: String
     let factoryOrders: [String]
+    let hardwareFactoryOrders: Set<String>
     @Environment(\.dismiss) private var dismiss
     @State private var scopeType = "material"
     @State private var requirement = "required"
     @State private var factoryOrder = ""
     @State private var reason = ""
+    @State private var isLoadingSavedScope = false
+    @State private var didLoadSavedScope = false
 
     private var incomingProcessing: Bool { orderType == "cutToSize" }
     private var noOutboundDecision: Bool {
         requirement == "customer_supplied" || requirement == "remainder" || requirement == "not_required"
     }
+    private var hardwareAvailable: Bool { !hardwareFactoryOrders.isEmpty }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("设置出库范围").font(.title2.weight(.semibold))
             Text("先保留订单文件读取的材料事实，再单独决定哪些项目进入出库单。数据库没有材料时不会自动判定为余料生产。")
                 .font(.caption).foregroundColor(.secondary)
-            Picker("范围", selection: $scopeType) {
-                Text("板材与封边").tag("material")
-                Text("五金").tag("hardware")
+            HStack(spacing: 2) {
+                scopeSegment("板材与封边", value: "material")
+                scopeSegment("五金", value: "hardware", disabled: !hardwareAvailable)
             }
-            .pickerStyle(.segmented)
+            .padding(2)
+            .background(Color.secondary.opacity(0.10))
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .disabled(isLoadingSavedScope)
+            if !hardwareAvailable {
+                Text("当前订单没有可用五金数据，不能设置五金出库范围。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
             if scopeType == "hardware" {
                 Picker("工厂单", selection: $factoryOrder) {
                     Text("请选择工厂单").tag("")
                     ForEach(factoryOrders, id: \.self) { Text($0).tag($0) }
                 }
+                .disabled(isLoadingSavedScope)
             }
             Picker("出库决定", selection: $requirement) {
                 Text("需要出库").tag("required")
                 if scopeType == "material" && incomingProcessing {
-                    Text("客户提供，不出库").tag("customer_supplied")
+                    Text("客户提供材料（不入库存）").tag("customer_supplied")
                 }
                 Text("余料生产，不出库").tag("remainder")
                 Text("其他原因，不出库").tag("not_required")
             }
             .pickerStyle(.radioGroup)
+            .disabled(isLoadingSavedScope)
             if noOutboundDecision {
                 TextField("必须填写原因，例如：客户提供板材和封边", text: $reason)
                     .textFieldStyle(.roundedBorder)
+                    .disabled(isLoadingSavedScope)
+            }
+            if isLoadingSavedScope {
+                Label("正在读取上次保存的出库范围…", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
             Spacer()
             HStack {
@@ -1784,14 +2127,59 @@ struct OutboundScopeSheet: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.inventoryRunning || orderID.isEmpty || (scopeType == "hardware" && factoryOrder.isEmpty) || (noOutboundDecision && reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
+                .disabled(isLoadingSavedScope || model.inventoryRunning || orderID.isEmpty || (scopeType == "hardware" && factoryOrder.isEmpty) || (noOutboundDecision && reason.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
             }
         }
         .padding(22)
+        .onAppear { loadSavedScopeIfNeeded() }
         .onChange(of: scopeType) { _, value in
-            if value == "hardware" && requirement == "customer_supplied" { requirement = "required" }
+            if value == "hardware" && (!hardwareAvailable || requirement == "customer_supplied") {
+                scopeType = "material"
+                factoryOrder = ""
+            }
             if value == "material" { factoryOrder = "" }
         }
+    }
+
+    private func loadSavedScopeIfNeeded() {
+        guard !didLoadSavedScope else { return }
+        didLoadSavedScope = true
+        isLoadingSavedScope = true
+        model.loadOutboundScope(orderID: orderID, factoryOrders: factoryOrders) { object in
+            defer { isLoadingSavedScope = false }
+            guard let object,
+                  let decision = object["last_decision"] as? [String: Any],
+                  let savedScopeType = decision["scope_type"] as? String,
+                  let savedRequirement = decision["requirement"] as? String else {
+                return
+            }
+            if savedScopeType == "hardware" {
+                let savedFactoryOrder = decision["factory_order"] as? String ?? ""
+                guard hardwareAvailable, factoryOrders.contains(savedFactoryOrder) else { return }
+                scopeType = "hardware"
+                factoryOrder = savedFactoryOrder
+            } else {
+                scopeType = "material"
+                factoryOrder = ""
+            }
+            requirement = savedRequirement
+            reason = decision["reason"] as? String ?? ""
+        }
+    }
+
+    private func scopeSegment(_ title: String, value: String, disabled: Bool = false) -> some View {
+        Button {
+            if !disabled { scopeType = value }
+        } label: {
+            Text(title)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 5)
+        }
+        .buttonStyle(.plain)
+        .foregroundColor(disabled ? .secondary.opacity(0.45) : (scopeType == value ? AppPalette.accent : .secondary))
+        .background(scopeType == value ? AppPalette.surface : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+        .disabled(disabled)
     }
 }
 
@@ -1842,13 +2230,10 @@ struct PendingCenterSheet: View {
             }
 
             HStack(alignment: .center, spacing: 10) {
-                Text("文件夹按一条主记录显示；展开后查看文件变化、失败原因和人工确认动作。")
+                Text("文件夹按一条主记录显示；预览会读取板材、封边和五金，确认后再分别写入。")
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Spacer()
-                Toggle("出库包含五金件", isOn: $model.includeHardwareForServerProcessing)
-                    .toggleStyle(.checkbox)
-                    .help("关闭后，Traveler 不写入五金，出库也不会包含五金")
                 if !model.pendingAimesReviews.isEmpty && !model.selectedAimesReviewIDs.isEmpty {
                     Button("忽略选中的 AIMES") { model.ignoreSelectedAimesFactories() }
                         .buttonStyle(.bordered)
@@ -1859,7 +2244,7 @@ struct PendingCenterSheet: View {
                     // Closing the informational sheet must remain available
                     // while background AIMES/Server work is running.
                     .disabled(false)
-                Button("自动处理已选文件夹") { model.processPendingServerChanges() }
+                Button("预览并逐单确认") { model.processPendingServerChanges() }
                     .buttonStyle(.borderedProminent)
                     .appActionButton(minWidth: 150)
                     .disabled(model.orderRunning || selectedServerCount == 0)
@@ -2006,11 +2391,11 @@ struct PendingCenterSheet: View {
                         .buttonStyle(.borderedProminent)
                         .disabled(model.orderRunning)
                 } else if issue.kind == "temporary_processing" && issue.message.contains("未映射材料") {
-                    Button("打开订单文件映射") { model.requestInventoryMapping(folderPath: issue.path) }
+                    Button("打开订单文件映射") { model.requestInventoryMapping(folderPath: issue.path, message: issue.message) }
                         .buttonStyle(.borderedProminent)
                         .disabled(model.orderRunning)
                 } else if issue.kind == "material_mapping" || issue.kind == "hardware_mapping" {
-                    Button("处理订单文件映射") { model.requestInventoryMapping(folderPath: issue.path) }
+                    Button("处理订单文件映射") { model.requestInventoryMapping(folderPath: issue.path, message: issue.message) }
                         .buttonStyle(.borderedProminent)
                         .disabled(model.orderRunning)
                 } else {
@@ -2610,7 +2995,7 @@ struct CurrentIssuesSheet: View {
                                                 .buttonStyle(.borderedProminent)
                                                 .disabled(model.orderRunning || (orderIDs[issue.id] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                                         } else if issue.kind == "material_mapping" || issue.kind == "hardware_mapping" {
-                                            Button("处理订单文件映射") { model.requestInventoryMapping(folderPath: issue.path) }
+                                            Button("处理订单文件映射") { model.requestInventoryMapping(folderPath: issue.path, message: issue.message) }
                                                 .buttonStyle(.borderedProminent)
                                                 .disabled(model.orderRunning)
                                         } else {
@@ -2736,7 +3121,7 @@ struct ServerChangesSheet: View {
                 Button("稍后处理") { model.showServerChangesPrompt = false }
                     .appActionButton(minWidth: 108)
                     .disabled(model.orderRunning)
-                Button("自动处理") { model.processPendingServerChanges() }
+                Button("预览并逐单确认") { model.processPendingServerChanges() }
                     .buttonStyle(.borderedProminent)
                     .appActionButton(minWidth: 118)
                     .disabled(model.orderRunning || selectedCount == 0)
@@ -2761,6 +3146,205 @@ struct ServerChangesSheet: View {
         default: return AppPalette.warning
         }
     }
+}
+
+struct ServerWriteConfirmationSheet: View {
+    @ObservedObject var model: AppModel
+    private var orders: [ServerWriteOrderPreview] { model.serverWritePreview?.orders ?? [] }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 5) {
+                    AppStatusBadge(text: "写入前确认", kind: .warning)
+                    Text("确认 Server 订单材料")
+                        .font(.title2.weight(.semibold))
+                    Text("Server 材料已经按房间归属解析到订单；正式数据库尚未写入。板材和封边按订单材料事实一次确认。")
+                        .font(.callout)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            if !model.serverWriteConfirmationNotice.isEmpty {
+                let noticeColor = model.serverWriteConfirmationNoticeIsError
+                    ? AppPalette.danger
+                    : AppPalette.success
+                HStack(alignment: .top, spacing: 8) {
+                    Image(systemName: model.serverWriteConfirmationNoticeIsError
+                        ? "exclamationmark.triangle.fill"
+                        : "checkmark.circle.fill")
+                    Text(model.serverWriteConfirmationNotice)
+                        .multilineTextAlignment(.leading)
+                }
+                .font(.callout.weight(.medium))
+                .foregroundColor(noticeColor)
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(noticeColor.opacity(0.10))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            }
+
+            if orders.isEmpty {
+                ContentUnavailableView("没有可确认的订单材料", systemImage: "exclamationmark.triangle", description: Text("请稍后重新扫描，或检查 Server 材料文件。"))
+            } else {
+                AppSurfaceCard(padding: 0) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        HStack(alignment: .firstTextBaseline, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("材料预览（按订单）")
+                                    .font(.title3.weight(.semibold))
+                                Text("订单与工厂单身份以 AIMES 为准；本次只写入板材和封边")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+                            Spacer()
+                            Text("\(orders.count) 个订单")
+                                .font(.subheadline.weight(.medium))
+                                .foregroundColor(AppPalette.accent)
+                        }
+                        Divider()
+                        ScrollView {
+                            LazyVStack(alignment: .leading, spacing: 12) {
+                                ForEach(orders) { order in
+                                    orderPreviewCard(order)
+                                }
+                            }
+                            .padding(16)
+                        }
+                        .frame(minHeight: 260, maxHeight: 440)
+                    }
+                }
+            }
+
+            HStack {
+                Text("确认后只写入预览中的订单材料；五金和 AIMES 工厂单归属不在本次材料确认中处理。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button(model.serverWriteConfirmationFinished ? "关闭" : "稍后处理") {
+                    model.showServerWriteConfirmation = false
+                }
+                .appActionButton(minWidth: 92)
+                .disabled(model.orderRunning)
+                Button(model.serverWriteConfirmationFinished ? "已完成写入" : "确认写入订单材料") {
+                    model.confirmServerMaterialPreview()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(model.orderRunning || orders.isEmpty || model.serverWriteConfirmationFinished)
+            }
+        }
+        .padding(20)
+        .background(AppPalette.background)
+    }
+
+    private func formatQuantity(_ value: Double) -> String {
+        value.rounded() == value ? String(Int(value)) : String(format: "%.2f", value)
+    }
+
+    @ViewBuilder
+    private func orderPreviewCard(_ order: ServerWriteOrderPreview) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Text("订单 \(order.orderID)")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+                Text("\(order.materials.count) 项材料")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundColor(.secondary)
+            }
+
+            if !order.factories.isEmpty {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("AIMES 工厂单")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundColor(.secondary)
+                    ForEach(order.factories) { factory in
+                        HStack(spacing: 10) {
+                            Text(factory.factoryOrder)
+                                .font(.body.weight(.semibold))
+                                .frame(minWidth: 118, alignment: .leading)
+                            Text(factory.factoryName.isEmpty ? "—" : factory.factoryName)
+                                .font(.body)
+                                .lineLimit(1)
+                            Spacer()
+                            Text(factory.reportState.isEmpty ? "已发现" : factory.reportState)
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(AppPalette.surface)
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    }
+                }
+            }
+
+            Text("材料明细")
+                .font(.subheadline.weight(.semibold))
+                .foregroundColor(.secondary)
+            if order.materials.isEmpty {
+                Text("没有板材或封边材料")
+                    .font(.body)
+                    .foregroundColor(.secondary)
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(order.materials) { material in
+                        materialPreviewRow(material)
+                    }
+                }
+            }
+
+            if !order.sourceFolder.isEmpty {
+                Label(order.sourceFolder, systemImage: "folder")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(16)
+        .background(AppPalette.subtleSurface)
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(AppPalette.separator))
+    }
+
+    private func materialPreviewRow(_ material: ServerWriteMaterialPreview) -> some View {
+        let isEdge = material.materialType.caseInsensitiveCompare("edge") == .orderedSame
+        let descriptors = [material.color, material.thickness]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return HStack(spacing: 12) {
+            Image(systemName: isEdge ? "line.3.horizontal" : "square.3.layers.3d")
+                .font(.title3)
+                .foregroundColor(AppPalette.accent)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(isEdge ? "封边" : "板材")
+                    .font(.caption.weight(.semibold))
+                    .foregroundColor(.secondary)
+                Text(([material.materialType] + descriptors).joined(separator: " · "))
+                    .font(.body.weight(.medium))
+                    .lineLimit(2)
+            }
+            Spacer(minLength: 12)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(formatQuantity(material.quantity))
+                    .font(.title3.weight(.semibold))
+                Text(material.unit.isEmpty ? "—" : material.unit)
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(AppPalette.surface)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+private struct ServerWriteSelectionRow: Identifiable {
+    let id: String
+    let title: String
+    let subtitle: String
 }
 
 struct FactoryStockComparisonSheet: View {

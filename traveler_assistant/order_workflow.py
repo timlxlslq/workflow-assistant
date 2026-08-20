@@ -46,6 +46,7 @@ EPSILON = 1e-9
 WORK_ORDER_SHEET = "WorkOrderTraveler"
 USAGE_LIST_SHEET = "Usage List"
 PICKING_LIST_SHEET = "Picking List"
+PURCHASE_LIST_SHEET = "Purchase List"
 MATERIAL_DETAIL_ROW_CAPACITY = 11
 MATERIAL_COLOR_COLUMN_START = 3
 
@@ -152,6 +153,34 @@ def _number(value, field: str) -> float:
         raise RuleError("invalid_number", f"{field} 不是有效数字：{value}") from exc
 
 
+def _display_number(value, number_format: str, field: str) -> float:
+    """Return the numeric value Excel displays for a supported number format.
+
+    ``openpyxl`` exposes the formula result and the number format separately;
+    it does not expose Excel's rendered cell value. Material workbooks use
+    simple numeric formats, so reproduce their rounding in memory without
+    rewriting the source workbook.
+    """
+    number = _number(value, field)
+    if not math.isfinite(number):
+        raise RuleError("invalid_number", f"{field} 不是有限数字：{value}")
+    first_section = _text(number_format).split(";", 1)[0]
+    if not first_section or first_section.casefold() == "general":
+        return number
+    # Ignore quoted literals and escaped characters when locating the
+    # numeric decimal section of a custom Excel format.
+    numeric_format = re.sub(r'"[^"]*"|\\.', "", first_section)
+    percent = "%" in numeric_format
+    if percent:
+        number *= 100
+    match = re.search(r"\.([0#?]+)", numeric_format)
+    decimal_places = len(match.group(1)) if match else 0
+    quantizer = Decimal("1") if decimal_places == 0 else Decimal(
+        "1." + ("0" * decimal_places)
+    )
+    return float(Decimal(str(number)).quantize(quantizer, rounding=ROUND_HALF_UP))
+
+
 def _integer(value, field: str) -> float:
     number = _number(value, field)
     if not math.isfinite(number) or abs(number - round(number)) > EPSILON:
@@ -166,12 +195,9 @@ def _integer_cell(cell, field: str) -> float:
     number = _number(cell.value, field)
     if not math.isfinite(number) or number < 0:
         raise RuleError("negative_material", f"{field} 数量无效：{number:g}")
-    if abs(number - round(number)) <= EPSILON:
-        return float(round(number))
-    first_section = _text(cell.number_format).split(";", 1)[0]
-    if first_section.lower() != "general" and "." not in first_section and re.search(r"[0#?]", first_section):
-        displayed = Decimal(str(number)).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
-        return float(displayed)
+    displayed = _display_number(number, cell.number_format, field)
+    if abs(displayed - round(displayed)) <= EPSILON:
+        return float(round(displayed))
     raise RuleError("fractional_material", f"{field} 数量为 {number:g}，板材数量必须为整数，请人工检查")
 
 
@@ -317,12 +343,6 @@ def repair_material_color_table(path: Path) -> dict:
             color for color in detail_colors
             if _canonical_color(color).casefold() not in table_by_key
         ]
-        # A legacy single-color workbook intentionally leaves Color Table
-        # empty and stores its totals directly on the Total Qty row. Preserve
-        # that format; only multi-color material or an already-enabled table
-        # is eligible for automatic repair.
-        if not table_colors and len(detail_colors) <= 1:
-            return {"corrected": False, "panel_count": 0, "edge_banding": 0.0, "colors": []}
         if len(table_colors) + len(missing) > MATERIAL_DETAIL_ROW_CAPACITY:
             raise RuleError(
                 "materials_schema",
@@ -353,20 +373,21 @@ def repair_material_color_table(path: Path) -> dict:
         detail_end = total_row - 1
         for col, _ in table_colors:
             letter = get_column_letter(col)
+            # Color Table is a derived summary of the detail rows. Use the
+            # same SUMIF contract for one-color and multi-color workbooks so
+            # an empty table can be populated without changing the detail
+            # rows or the Total Qty row.
             ws.cell(panel_34_row, col).value = (
-                f'=IF(AND(COUNTA(UNIQUE($I${detail_start}:$I${detail_end}))>1,'
-                f'{letter}${color_row}<>""),SUMIF($I${detail_start}:$I${detail_end},'
-                f'{letter}${color_row},$F${detail_start}:$F${detail_end})," ")'
+                f'=SUMIF($I${detail_start}:$I${detail_end},{letter}${color_row},'
+                f'$F${detail_start}:$F${detail_end})'
             )
             ws.cell(panel_14_row, col).value = (
-                f'=IF(AND(COUNTA(UNIQUE($I${detail_start}:$I${detail_end}))>1,'
-                f'{letter}${color_row}<>""),SUMIF($I${detail_start}:$I${detail_end},'
-                f'{letter}${color_row},$G${detail_start}:$G${detail_end})," ")'
+                f'=SUMIF($I${detail_start}:$I${detail_end},{letter}${color_row},'
+                f'$G${detail_start}:$G${detail_end})'
             )
             ws.cell(edge_row, col).value = (
-                f'=IF(AND(COUNTA(UNIQUE($I${detail_start}:$I${detail_end}))>1,'
-                f'{letter}${color_row}<>""),SUMIF($I${detail_start}:$I${detail_end},'
-                f'{letter}${color_row},$H${detail_start}:$H${detail_end})," ")'
+                f'=SUMIF($I${detail_start}:$I${detail_end},{letter}${color_row},'
+                f'$H${detail_start}:$H${detail_end})'
             )
 
         for row in range(3, total_row):
@@ -419,6 +440,10 @@ def parse_order_materials(order_id: str, path: Path) -> tuple[str, list[Material
         for col in range(1, ws.max_column + 1)
         if _text(ws.cell(header_row, col).value)
     }
+    finish_34_col = header_map.get(_normalized_label("3/4 Finish Panel"))
+    finish_14_col = header_map.get(_normalized_label("1/4 Finish Panel"))
+    edge_col = header_map.get(_normalized_label("Edge Banding (m)"))
+    color_col = header_map.get(_normalized_label("Color"))
     required = ["3/4 Plywood", "5/8 Plywood", "1/4 Plywood"]
     if any(_normalized_label(label) not in header_map for label in required):
         raise RuleError("materials_schema", "materials 文件缺少 Plywood 数量列")
@@ -430,33 +455,45 @@ def parse_order_materials(order_id: str, path: Path) -> tuple[str, list[Material
         total = 0.0
         source_key = _canonical_color(source_color).casefold() if source_color is not None else None
         for detail_row in range(header_row + 1, total_row):
-            detail_color = _canonical_color(_text(ws.cell(detail_row, 9).value)).casefold()
+            detail_color = _canonical_color(_text(ws.cell(detail_row, color_col or 9).value)).casefold()
             if source_key is not None and detail_color != source_key:
                 continue
             total += _number(ws.cell(detail_row, column).value, f"materials {ws.cell(2, column).value}")
         return total
 
+    def color_integer_fallback(column: int, source_color: str) -> float:
+        # A legacy one-color workbook already has the order-level quantity in
+        # Total Qty. Keep that authoritative value when the newly written
+        # Color Table formula has no cached Excel result; only calculate from
+        # detail rows when the upper total is actually empty.
+        if len(colors) == 1 and ws.cell(total_row, column).value not in (None, ""):
+            return _integer_cell(ws.cell(total_row, column), f"{source_color} total")
+        return detail_sum(column, source_color)
+
     def summary_number(row: int, column: int, label: str, fallback: float) -> float:
         value = ws.cell(row, column).value
         formula = formula_ws.cell(row, column).value
+        cell = ws.cell(row, column)
         if value in (None, "") and (
             formula_ws.cell(row, column).data_type == "f"
             or isinstance(formula, str) and formula.startswith("=")
         ):
-            return fallback
-        return _number(value, label)
+            return _display_number(fallback, cell.number_format, label)
+        return _display_number(value, cell.number_format, label)
 
     def summary_integer(row: int, column: int, label: str, fallback: float) -> float:
         value = ws.cell(row, column).value
         formula = formula_ws.cell(row, column).value
+        cell = ws.cell(row, column)
         if value in (None, "") and (
             formula_ws.cell(row, column).data_type == "f"
             or isinstance(formula, str) and formula.startswith("=")
         ):
-            if not math.isclose(fallback, round(fallback), abs_tol=EPSILON):
+            displayed = _display_number(fallback, cell.number_format, label)
+            if not math.isclose(displayed, round(displayed), abs_tol=EPSILON):
                 raise RuleError("fractional_material", f"{label} 必须是整数，当前为 {fallback}")
-            return float(round(fallback))
-        return _integer_cell(ws.cell(row, column), label)
+            return float(round(displayed))
+        return _integer_cell(cell, label)
 
     plywood = []
     for label, thickness in zip(required, (18.0, 14.5, 5.4)):
@@ -475,6 +512,40 @@ def parse_order_materials(order_id: str, path: Path) -> tuple[str, list[Material
     row_14 = _find_label_row(ws, "Sheets (1/4):")
     row_edge = _find_label_row(ws, "Edge Banding (m):")
 
+    # Panel and edge quantities are read from Color Table, but the detail
+    # rows still have to be complete enough to explain that table. Empty
+    # template rows are normal; only a row with an actual Panel/edge quantity
+    # requires a Color value.
+    if finish_34_col and finish_14_col and edge_col and color_col:
+        missing_colors = []
+        for detail_row in range(header_row + 1, total_row):
+            panel_34 = _display_number(
+                ws.cell(detail_row, finish_34_col).value,
+                ws.cell(detail_row, finish_34_col).number_format,
+                f"第 {detail_row} 行 3/4 Finish Panel",
+            )
+            panel_14 = _display_number(
+                ws.cell(detail_row, finish_14_col).value,
+                ws.cell(detail_row, finish_14_col).number_format,
+                f"第 {detail_row} 行 1/4 Finish Panel",
+            )
+            edge = _display_number(
+                ws.cell(detail_row, edge_col).value,
+                ws.cell(detail_row, edge_col).number_format,
+                f"第 {detail_row} 行 Edge Banding",
+            )
+            if panel_34 <= 0 and panel_14 <= 0 and edge <= 0:
+                continue
+            if not _text(ws.cell(detail_row, color_col).value):
+                room = _text(ws.cell(detail_row, 1).value) or f"第 {detail_row} 行"
+                missing_colors.append(room)
+        if missing_colors:
+            raise RuleError(
+                "material_color_required",
+                "材料明细存在数量但 Color 为空："
+                f"{'、'.join(missing_colors)}；请补充颜色后重新扫描 Server",
+            )
+
     colors: list[tuple[int, str]] = []
     for col in range(1, ws.max_column + 1):
         color = _text(ws.cell(color_header_row, col).value)
@@ -484,11 +555,27 @@ def parse_order_materials(order_id: str, path: Path) -> tuple[str, list[Material
     panels: list[MaterialItem] = []
     edges: dict[str, float] = {}
     if colors:
+        color_table_34_total = 0.0
+        color_table_14_total = 0.0
+        color_table_edge_total = 0.0
         for col, source_color in colors:
             color = _canonical_color(source_color)
-            qty_34 = summary_integer(row_34, col, f"{source_color} Sheets (3/4)", detail_sum(6, source_color))
-            qty_14 = summary_integer(row_14, col, f"{source_color} Sheets (1/4)", detail_sum(7, source_color))
+            qty_34 = summary_integer(
+                row_34,
+                col,
+                f"{source_color} Sheets (3/4)",
+                color_integer_fallback(6, source_color),
+            )
+            qty_14 = summary_integer(
+                row_14,
+                col,
+                f"{source_color} Sheets (1/4)",
+                color_integer_fallback(7, source_color),
+            )
             edge = summary_number(row_edge, col, f"{source_color} Edge Banding", detail_sum(8, source_color))
+            color_table_34_total += qty_34
+            color_table_14_total += qty_14
+            color_table_edge_total += edge
             if qty_34:
                 panels.append(MaterialItem("panel", 19.1, color, qty_34))
             if qty_14:
@@ -498,17 +585,61 @@ def parse_order_materials(order_id: str, path: Path) -> tuple[str, list[Material
                     raise RuleError("missing_edge", f"{source_color} 有 Panel 数量，但封边条为空或为 0")
                 if edge > 0:
                     edges[color] = edge
+
+        summary_mismatches = []
+        if finish_34_col:
+            total_34 = summary_integer(
+                total_row,
+                finish_34_col,
+                "Total Qty 3/4 Finish Panel",
+                detail_sum(finish_34_col),
+            )
+            if not math.isclose(total_34, color_table_34_total, abs_tol=EPSILON):
+                summary_mismatches.append(
+                    f"3/4 Finish Panel：Total Qty={_fmt(total_34)}，Color Table={_fmt(color_table_34_total)}"
+                )
+        if finish_14_col:
+            total_14 = summary_integer(
+                total_row,
+                finish_14_col,
+                "Total Qty 1/4 Finish Panel",
+                detail_sum(finish_14_col),
+            )
+            if not math.isclose(total_14, color_table_14_total, abs_tol=EPSILON):
+                summary_mismatches.append(
+                    f"1/4 Finish Panel：Total Qty={_fmt(total_14)}，Color Table={_fmt(color_table_14_total)}"
+                )
+        if edge_col:
+            total_edge = summary_number(
+                total_row,
+                edge_col,
+                "Total Qty Edge Banding",
+                detail_sum(edge_col),
+            )
+            if not math.isclose(total_edge, color_table_edge_total, abs_tol=EPSILON):
+                summary_mismatches.append(
+                    f"Edge Banding：Total Qty={_fmt(total_edge)}，Color Table={_fmt(color_table_edge_total)}"
+                )
+        if summary_mismatches:
+            raise RuleError(
+                "material_summary_mismatch",
+                "Total Qty 与 Color Table 合计不一致："
+                f"{'；'.join(summary_mismatches)}；请手工检查后再写入订单材料",
+            )
     else:
-        finish_34 = header_map.get(_normalized_label("3/4 Finish Panel"))
-        finish_14 = header_map.get(_normalized_label("1/4 Finish Panel"))
-        edge_col = header_map.get(_normalized_label("Edge Banding (m)"))
-        color_col = header_map.get(_normalized_label("Color"))
+        finish_34 = finish_34_col
+        finish_14 = finish_14_col
         if not all((finish_34, finish_14, edge_col, color_col)):
             raise RuleError("materials_schema", "单颜色 materials 缺少 Panel、封边或 Color 列")
         source_color = _text(ws.cell(total_row, color_col).value)
         qty_34 = _integer_cell(ws.cell(total_row, finish_34), "Sheets (3/4)")
         qty_14 = _integer_cell(ws.cell(total_row, finish_14), "Sheets (1/4)")
-        edge = _number(ws.cell(total_row, edge_col).value, "Edge Banding")
+        edge = summary_number(
+            total_row,
+            edge_col,
+            "Edge Banding",
+            detail_sum(edge_col, source_color),
+        )
         if qty_34 or qty_14 or edge:
             if not source_color:
                 raise RuleError("materials_schema", "单颜色 materials 有 Panel 或封边数量，但 Total Qty 行缺少 Color")
@@ -1111,7 +1242,8 @@ def parse_material_room_rows(path: Path) -> list[tuple[str, list[MaterialItem], 
                 raise RuleError("negative_material", f"{room} {label} 数量不能为负数：{quantity:g}")
             if quantity:
                 items.append(MaterialItem(kind, thickness, color if kind == "panel" else "", quantity, room))
-        edge = _number(ws.cell(row, headers["edgebanding(m)"]).value, f"{room} Edge Banding")
+        edge_cell = ws.cell(row, headers["edgebanding(m)"])
+        edge = _display_number(edge_cell.value, edge_cell.number_format, f"{room} Edge Banding")
         if not room and (items or edge):
             room = "__UNASSIGNED__"
         if not room:
@@ -1346,11 +1478,61 @@ def _room_matches_order(room: str, order_id: str, names: dict[str, str]) -> bool
     return False
 
 
-def _select_room_materials(rows, order_id: str, names: dict[str, str]):
-    if not ORDER_FOLDER_RE.fullmatch(order_id):
-        selected = list(rows)
-    else:
-        selected = [row for row in rows if row[0] == "__UNASSIGNED__" or _room_matches_order(row[0], order_id, names)]
+def _room_order_ids(room: str) -> list[str]:
+    return sorted({match.upper() for match in ORDER_TOKEN_RE.findall(_text(room))})
+
+
+def _room_has_explicit_order_identity(rows) -> bool:
+    return any(_room_order_ids(room) for room, _, _ in rows)
+
+
+def _select_room_materials(
+    rows,
+    order_id: str,
+    names: dict[str, str],
+    known_order_ids: set[str] | None = None,
+):
+    known = {str(value).strip().upper() for value in (known_order_ids or {order_id}) if str(value).strip()}
+    known.add(order_id.upper())
+    strict = len(known) > 1
+    selected = []
+    invalid_rooms: list[str] = []
+    for row in rows:
+        room, items, edges = row
+        has_quantity = any(item.quantity > EPSILON for item in items) or any(value > EPSILON for value in edges.values())
+        if room == "__UNASSIGNED__":
+            if strict and has_quantity:
+                invalid_rooms.append("未填写")
+            elif has_quantity:
+                selected.append(row)
+            continue
+        room_orders = _room_order_ids(room)
+        if len(room_orders) > 1:
+            invalid_rooms.append(f"{room}（包含多个订单号）")
+        elif room_orders:
+            owner = room_orders[0]
+            if owner == order_id.upper():
+                selected.append(row)
+            elif owner not in known:
+                invalid_rooms.append(f"{room}（订单号不在当前文件夹）")
+            # A row explicitly belonging to a sibling order is valid, but is
+            # intentionally omitted from the current order.
+        elif strict:
+            invalid_rooms.append(f"{room}（缺少订单号）")
+        elif _room_matches_order(room, order_id, names):
+            selected.append(row)
+        elif has_quantity:
+            # A single-order legacy workbook may use a plain room name. Keep
+            # that compatibility path; shared-order workbooks must use an
+            # explicit order-bearing factory name.
+            selected.append(row)
+    if invalid_rooms:
+        examples = "、".join(dict.fromkeys(invalid_rooms[:5]))
+        raise RuleError(
+            "material_room_owner_required",
+            f"{order_id} 的 material 存在无法确定归属的 Room/section：{examples}；"
+            "请填写包含订单号的工厂单名称，例如 PP0035-KITCHEN 或 PP0035-2-MASTER",
+        )
     if not selected:
         return [], {}, [f"{order_id} 没有在 material 中匹配到明确房间，需人工检查"]
     grouped: dict[tuple[str, float, str], list[tuple[str, float]]] = defaultdict(list)
@@ -1359,7 +1541,14 @@ def _select_room_materials(rows, order_id: str, names: dict[str, str]):
             grouped[(item.kind, item.thickness, item.color)].append((room, item.quantity))
     materials = [
         MaterialItem(kind, thickness, color, sum(quantity for _, quantity in values), ", ".join(sorted({room for room, _ in values if room != "__UNASSIGNED__"})))
-        for (kind, thickness, color), values in sorted(grouped.items())
+        for (kind, thickness, color), values in sorted(
+            grouped.items(),
+            key=lambda entry: (
+                {"plywood": 0, "panel": 1, "back": 2}.get(entry[0][0].casefold(), 9),
+                entry[0][2].casefold(),
+                entry[0][1],
+            ),
+        )
     ]
     totals: dict[tuple[str, float, str], float] = defaultdict(float)
     for item in materials:
@@ -1494,12 +1683,21 @@ def preview_order(
     )
     warnings.extend(name_warnings)
     if room_rows and ORDER_FOLDER_RE.fullmatch(order_id):
-        room_materials, room_edges, room_warnings = _select_room_materials(room_rows, order_id, names)
+        room_materials, room_edges, room_warnings = _select_room_materials(
+            room_rows,
+            order_id,
+            names,
+            known_order_ids=set(related_order_ids(folder) or [order_id]),
+        )
         warnings.extend(room_warnings)
         if room_materials or room_edges:
             selected_room_rows = [
                 row for row in room_rows
-                if row[0] == "__UNASSIGNED__" or _room_matches_order(row[0], order_id, names)
+                if row[0] == "__UNASSIGNED__"
+                or (
+                    _room_order_ids(row[0]) == [order_id.upper()]
+                    or (not _room_order_ids(row[0]) and _room_matches_order(row[0], order_id, names))
+                )
             ]
             authoritative = defaultdict(float)
             selected = defaultdict(float)
@@ -2226,6 +2424,128 @@ def _prepare_picking_list(wb, preview: OrderPreview) -> None:
         cursor += block_height
 
 
+def _purchase_material_rows(preview: OrderPreview) -> list[tuple[str, str, float]]:
+    rows: list[tuple[str, str, float]] = []
+    materials = sorted(
+        (item for item in preview.materials if item.quantity > EPSILON),
+        key=lambda item: (
+            {"plywood": 0, "panel": 1, "back": 2}.get(item.kind.casefold(), 9),
+            item.color.casefold(),
+            item.thickness,
+        ),
+    )
+    for item in materials:
+        kind = item.kind.casefold()
+        if kind == "plywood":
+            name = f"{item.thickness:g}mm--Plywood"
+            spec = "2440*1220"
+        elif kind in {"panel", "back"}:
+            name = f"{item.thickness:g}mm--{item.color}" if item.color else f"{item.thickness:g}mm--"
+            spec = "2745*1220"
+        else:
+            continue
+        rows.append((name, spec, float(item.quantity)))
+    for color, quantity in sorted(preview.edge_banding.items(), key=lambda item: item[0].casefold()):
+        if float(quantity) > EPSILON:
+            rows.append((f"Edge banding--{color}" if color else "Edge banding", "M/米", float(quantity)))
+    return rows
+
+
+def _purchase_hardware_rows(preview: OrderPreview) -> list[tuple[str, str, float, str]]:
+    rows: list[tuple[str, str, float, str]] = []
+    for factory in sorted(preview.factories, key=lambda item: (item.factory_order.casefold(), item.order_name.casefold())):
+        for item in sorted(factory.fittings, key=lambda fitting: (fitting.name.casefold(), fitting.code.casefold())):
+            if item.ignored or item.quantity <= EPSILON:
+                continue
+            rows.append((
+                item.name or item.code,
+                item.unit,
+                float(item.quantity),
+                factory.order_name or factory.factory_order,
+            ))
+    return rows
+
+
+def _insert_purchase_rows(ws, insertion_row: int, count: int, template_row: int) -> None:
+    if count <= 0:
+        return
+    _shift_merges_for_insert(ws, insertion_row, count)
+    for offset in range(count):
+        row = insertion_row + offset
+        for column in range(1, ws.max_column + 1):
+            _copy_cell(ws.cell(template_row, column), ws.cell(row, column))
+        for start, end in ((3, 4), (5, 6), (7, 8)):
+            ws.merge_cells(start_row=row, start_column=start, end_row=row, end_column=end)
+
+
+def _prepare_purchase_list(wb, preview: OrderPreview) -> None:
+    """Populate the optional Purchase List sheet from the same preview facts.
+
+    The legacy template contains example materials and accessories.  Leaving
+    those cells untouched makes a database-generated Traveler look like it has
+    hardware that was never present in SQLite, so this sheet is cleared and
+    rebuilt whenever the template provides it.
+    """
+    if PURCHASE_LIST_SHEET not in wb.sheetnames:
+        return
+    ws = wb[PURCHASE_LIST_SHEET]
+    material_rows = _purchase_material_rows(preview)
+    hardware_rows = _purchase_hardware_rows(preview)
+
+    ws["A4"] = None
+    factory_names = []
+    for factory in preview.factories:
+        name = _text(factory.order_name) or _text(factory.factory_order)
+        if name and name not in factory_names:
+            factory_names.append(name)
+    _write_merged(ws, 5, 4, "；".join(factory_names))
+
+    panel_header = next((row for row in range(1, ws.max_row + 1) if _text(ws.cell(row, 1).value) == "Panel板材"), None)
+    material_header = next((row for row in range((panel_header or 1) + 1, ws.max_row + 1) if _text(ws.cell(row, 1).value) == "No." and _text(ws.cell(row, 3).value) == "Name名字"), None)
+    accessories_header = next((row for row in range((material_header or 1) + 1, ws.max_row + 1) if _text(ws.cell(row, 1).value) == "Accessories配件"), None)
+    accessory_header = next((row for row in range((accessories_header or 1) + 1, ws.max_row + 1) if _text(ws.cell(row, 1).value) == "No." and _text(ws.cell(row, 3).value) == "Name名字"), None)
+    if not material_header or not accessories_header or not accessory_header:
+        raise RuleError("template_schema", "Purchase List 模板缺少材料或配件表头")
+
+    material_first = material_header + 1
+    material_capacity = accessories_header - material_first
+    desired_material_rows = max(2, len(material_rows))
+    if desired_material_rows > material_capacity:
+        _insert_purchase_rows(ws, accessories_header, desired_material_rows - material_capacity, accessories_header - 1)
+        accessories_header += desired_material_rows - material_capacity
+        accessory_header += desired_material_rows - material_capacity
+
+    for row in range(material_first, accessories_header):
+        for column in range(1, ws.max_column + 1):
+            cell = ws.cell(row, column)
+            if not isinstance(cell, MergedCell):
+                cell.value = None
+    for index, (name, spec, quantity) in enumerate(material_rows, start=1):
+        row = material_first + index - 1
+        ws.cell(row, 1).value = index
+        _write_merged(ws, row, 3, name)
+        _write_merged(ws, row, 5, spec)
+        _write_merged(ws, row, 7, quantity)
+
+    accessory_first = accessory_header + 1
+    accessory_capacity = ws.max_row - accessory_first + 1
+    if len(hardware_rows) > accessory_capacity:
+        _insert_purchase_rows(ws, ws.max_row + 1, len(hardware_rows) - accessory_capacity, ws.max_row)
+
+    for row in range(accessory_first, ws.max_row + 1):
+        for column in range(1, ws.max_column + 1):
+            cell = ws.cell(row, column)
+            if not isinstance(cell, MergedCell):
+                cell.value = None
+    for index, (name, unit, quantity, factory_name) in enumerate(hardware_rows, start=1):
+        row = accessory_first + index - 1
+        ws.cell(row, 1).value = index
+        _write_merged(ws, row, 3, name)
+        _write_merged(ws, row, 5, unit)
+        _write_merged(ws, row, 7, quantity)
+        ws.cell(row, 9).value = factory_name
+
+
 def _manual_hardware(ws) -> dict[str, list[dict]]:
     result: dict[str, list[dict]] = defaultdict(list)
     factory = ""
@@ -2554,6 +2874,7 @@ def generate_order_traveler(config: Config, preview: OrderPreview) -> Path:
         _write_initial_traveler_date(wb[WORK_ORDER_SHEET])
         _fill_usage_list(preview.materials_path, wb, preview.order_id, set(preview.material_rooms))
         _prepare_picking_list(wb, preview)
+        _prepare_purchase_list(wb, preview)
         wb.calculation = CalcProperties(calcMode="auto", fullCalcOnLoad=True, forceFullCalc=True)
         wb.save(draft)
         check = load_workbook(draft, data_only=False, read_only=True)
@@ -2771,6 +3092,7 @@ def update_order_traveler(config: Config, preview: OrderPreview) -> tuple[Path, 
             _restore_template_picking_list(config, wb)
         _fill_usage_list(preview.materials_path, wb, preview.order_id, set(preview.material_rooms))
         _prepare_picking_list(wb, preview)
+        _prepare_purchase_list(wb, preview)
         if preview.include_hardware:
             _restore_manual_hardware(wb[PICKING_LIST_SHEET], manual_hardware)
         wb.calculation = CalcProperties(calcMode="auto", fullCalcOnLoad=True, forceFullCalc=True)
@@ -2797,7 +3119,7 @@ def _config_from_args(args) -> Config:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="pp-flowhub order")
-    parser.add_argument("command", choices=("list", "list-index", "detail", "cost", "cost-export", "backup-status", "backup-now", "sync-index", "process-server-changes", "process-server-folder", "sync-aimes", "scan-server", "ignore-server-folder", "ignore-aimes", "restore-aimes-ignore", "assign-aimes-order", "restore-aimes-assignment", "auto-resolve-issue", "resolve-issue", "preview", "preview-related", "refresh-aimes", "stock-check", "set-ignore", "generate", "generate-db", "temporary", "generate-material", "generate-material-from-travelers", "update", "update-related", "add-hardware", "add-factory", "assign-material", "create-test-data"))
+    parser.add_argument("command", choices=("list", "list-index", "detail", "cost", "cost-export", "backup-status", "backup-now", "sync-index", "process-server-changes", "process-server-folder", "preview-server-changes", "confirm-server-preview", "confirm-server-material-preview", "sync-aimes", "scan-server", "ignore-server-folder", "ignore-aimes", "restore-aimes-ignore", "assign-aimes-order", "restore-aimes-assignment", "auto-resolve-issue", "resolve-issue", "save-order-annotations", "preview", "preview-related", "refresh-aimes", "stock-check", "set-ignore", "generate", "generate-db", "temporary", "generate-material", "generate-material-from-travelers", "update", "update-related", "add-hardware", "add-factory", "assign-material", "create-test-data"))
     parser.add_argument("--folder", type=Path)
     parser.add_argument("--server-folder", type=Path, action="append", default=[])
     parser.add_argument("--name", action="append", default=[])
@@ -2809,6 +3131,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--state-dir", type=Path)
     parser.add_argument("--target-root", type=Path)
     parser.add_argument("--order-id", default="")
+    parser.add_argument("--note", default="")
+    parser.add_argument("--planned-installation-days", default="[]")
+    parser.add_argument("--actual-installation-days", default="[]")
     parser.add_argument("--factory-name", default="")
     parser.add_argument("--factory-order", default="")
     parser.add_argument("--product-code", default="")
@@ -2822,6 +3147,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--aimes-if-needed", action="store_true")
     parser.add_argument("--full-refresh", action="store_true")
     parser.add_argument("--server-snapshot", type=Path)
+    parser.add_argument("--preview-token", default="")
+    parser.add_argument("--material-id", type=int)
     parser.add_argument("--ignore-key", action="append", default=[])
     parser.add_argument("--issue-key", default="")
     args = parser.parse_args(argv)
@@ -2881,6 +3208,44 @@ def main(argv: list[str] | None = None) -> int:
                     args.folder,
                     include_hardware=args.include_hardware == "true",
                     process_temporary=args.process_temporary,
+                )
+            except ValueError as exc:
+                raise RuleError("invalid_arguments", str(exc)) from exc
+        elif args.command == "preview-server-changes":
+            if not args.server_folder:
+                raise RuleError("invalid_arguments", "preview-server-changes 需要 --server-folder")
+            from .order_index import preview_server_changes
+            try:
+                result = preview_server_changes(
+                    config,
+                    args.server_folder,
+                    include_hardware=args.include_hardware == "true",
+                )
+            except ValueError as exc:
+                raise RuleError("invalid_arguments", str(exc)) from exc
+        elif args.command == "confirm-server-preview":
+            if not args.preview_token or not args.order_id or not args.factory_order:
+                raise RuleError("invalid_arguments", "confirm-server-preview 需要预览标识、订单号和工厂单号")
+            from .order_index import confirm_server_preview
+            try:
+                result = confirm_server_preview(
+                    config,
+                    args.preview_token,
+                    args.order_id,
+                    args.factory_order,
+                    confirm_write=args.confirm_write,
+                )
+            except ValueError as exc:
+                raise RuleError("invalid_arguments", str(exc)) from exc
+        elif args.command == "confirm-server-material-preview":
+            if not args.preview_token:
+                raise RuleError("invalid_arguments", "confirm-server-material-preview 需要预览标识")
+            from .order_index import confirm_server_material_preview
+            try:
+                result = confirm_server_material_preview(
+                    config,
+                    args.preview_token,
+                    confirm_write=args.confirm_write,
                 )
             except ValueError as exc:
                 raise RuleError("invalid_arguments", str(exc)) from exc
@@ -2945,6 +3310,25 @@ def main(argv: list[str] | None = None) -> int:
             from .order_index import resolve_current_issue
             try:
                 result = resolve_current_issue(config, args.issue_key, args.order_id, args.factory_name)
+            except ValueError as exc:
+                raise RuleError("invalid_arguments", str(exc)) from exc
+        elif args.command == "save-order-annotations":
+            if not args.order_id:
+                raise RuleError("invalid_arguments", "save-order-annotations 需要 --order-id")
+            try:
+                planned_days = json.loads(args.planned_installation_days)
+                actual_days = json.loads(args.actual_installation_days)
+            except json.JSONDecodeError as exc:
+                raise RuleError("invalid_arguments", "安装日期明细不是有效 JSON") from exc
+            from .order_index import save_order_annotations
+            try:
+                result = save_order_annotations(
+                    config,
+                    args.order_id,
+                    user_note=args.note,
+                    planned_days=planned_days,
+                    actual_days=actual_days,
+                )
             except ValueError as exc:
                 raise RuleError("invalid_arguments", str(exc)) from exc
         elif args.command == "add-factory":

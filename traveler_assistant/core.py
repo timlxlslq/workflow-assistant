@@ -303,7 +303,6 @@ def _run_aimes_lookup(
                 })
 
     for attempt in range(3):
-        attempt_started = time.perf_counter()
         attempt_timings: list[dict[str, object]] = []
         progress(f"正在获取 AIMES 数据（第 {attempt + 1}/3 次）", factory_orders=missing)
         try:
@@ -327,23 +326,16 @@ def _run_aimes_lookup(
                 for item in node_timings
                 if isinstance(item, dict) and str(item.get("label", item.get("stage", ""))).strip()
             ]
+            # The attempt duration is an envelope around the helper process,
+            # not a child stage. Keep only non-overlapping stages here; the
+            # caller owns the authoritative end-to-end duration.
             result["_aimes_timings"] = operation_timings + (normalized_timings or attempt_timings)
-            result["_aimes_timings"].append({
-                "stage": "attempt",
-                "label": "获取 AIMES 数据成功，总计用时",
-                "duration_seconds": round(time.perf_counter() - attempt_started, 2),
-            })
             result["_aimes_retry_count"] = attempt
             return result
         except subprocess.CalledProcessError as exc:
             consume_progress(exc.stderr or "", attempt_timings)
             last_error = (exc.stderr or "AIMES 查询失败").strip()[-1000:]
             operation_timings.extend(attempt_timings)
-            operation_timings.append({
-                "stage": "attempt",
-                "label": f"第 {attempt + 1} 次尝试获取 AIMES 数据失败，总计用时",
-                "duration_seconds": round(time.perf_counter() - attempt_started, 2),
-            })
             progress(
                 f"AIMES 第 {attempt + 1}/3 次尝试失败，准备重试",
                 retry_attempt=attempt + 1,
@@ -353,11 +345,6 @@ def _run_aimes_lookup(
         except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError) as exc:
             last_error = str(exc)
             operation_timings.extend(attempt_timings)
-            operation_timings.append({
-                "stage": "attempt",
-                "label": f"第 {attempt + 1} 次尝试获取 AIMES 数据失败，总计用时",
-                "duration_seconds": round(time.perf_counter() - attempt_started, 2),
-            })
             progress(
                 f"AIMES 第 {attempt + 1}/3 次尝试失败，准备重试",
                 retry_attempt=attempt + 1,
@@ -416,8 +403,21 @@ def lookup_aimes_recent_orders(
         if isinstance(row, dict)
     ]
     if include_trace:
-        return normalized, result.get("_aimes_timings", []) if isinstance(result.get("_aimes_timings", []), list) else []
+        timings = result.get("_aimes_timings", [])
+        return normalized, _non_aggregate_aimes_timings(timings)
     return normalized
+
+
+def _non_aggregate_aimes_timings(values: object) -> list[dict[str, object]]:
+    """Return only flat AIMES stages, excluding an old aggregate timing item."""
+    if not isinstance(values, list):
+        return []
+    return [
+        item for item in values
+        if isinstance(item, dict)
+        and str(item.get("stage", "")).strip() not in {"attempt", "total"}
+        and "总计用时" not in str(item.get("label", ""))
+    ]
 
 
 def verify_aimes_factory_orders(config: Config, factory_orders: list[str]) -> dict[str, list[dict[str, str]] | list[str]]:
@@ -478,9 +478,7 @@ def refresh_aimes_recent_orders_and_verify(
         ]
 
     if timing_sink is not None:
-        timings = result.get("_aimes_timings", [])
-        if isinstance(timings, list):
-            timing_sink.extend(timings)
+        timing_sink.extend(_non_aggregate_aimes_timings(result.get("_aimes_timings", [])))
     return normalize(recent_rows), {
         "rows": normalize(verified_rows),
         "missing": [str(value).upper().strip() for value in missing if str(value).strip()],

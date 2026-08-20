@@ -16,6 +16,7 @@ from traveler_assistant.inventory import InventoryMappings, parse_traveler, set_
 from traveler_assistant.order_workflow import (
     _choose_fittings,
     _fill_usage_list,
+    MaterialItem,
     generate_material_from_travelers,
     add_manual_hardware,
     find_existing_traveler,
@@ -25,6 +26,7 @@ from traveler_assistant.order_workflow import (
     list_order_folders,
     parse_order_materials,
     parse_material_room_rows,
+    _select_room_materials,
     preview_payload,
     preview_order,
     preview_manual_hardware,
@@ -220,6 +222,20 @@ class OrderWorkflowTests(unittest.TestCase):
             self.assertEqual(workbook["Usage List"]["H3"].value, 12.5)
             self.assertIn("PP9999-KITCHEN", " ".join(str(cell.value or "") for row in workbook["Picking List"].iter_rows() for cell in row))
             self.assertIn("Hinge", " ".join(str(cell.value or "") for row in workbook["Picking List"].iter_rows() for cell in row))
+            purchase = workbook["Purchase List"]
+            self.assertIsNone(purchase["A4"].value)
+            self.assertEqual(purchase["D5"].value, "PP9999-KITCHEN")
+            purchase_values = [
+                cell.value
+                for row in purchase.iter_rows()
+                for cell in row
+                if cell.value not in (None, "")
+            ]
+            self.assertIn("18mm--Plywood", purchase_values)
+            self.assertIn("19.1mm--Test Oak", purchase_values)
+            self.assertIn("Edge banding--Test Oak", purchase_values)
+            self.assertIn("Hinge", purchase_values)
+            self.assertNotIn("TB18", purchase_values)
 
     def test_legacy_traveler_gets_usage_list_and_material_from_picking_list(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -268,7 +284,7 @@ class OrderWorkflowTests(unittest.TestCase):
                 ("panel", 19.1, "Test Oak", 3.0),
                 [(item.kind, item.thickness, item.color, item.quantity) for item in materials],
             )
-            self.assertEqual(edges, {"Test Oak": 12.5})
+            self.assertEqual(edges, {"Test Oak": 13})
             updated = load_workbook(traveler, data_only=False, read_only=True)
             self.assertEqual(updated.sheetnames[:3], ["WorkOrderTraveler", "Usage List", "Picking List"])
             self.assertEqual(parse_traveler(traveler).documents["CS001"][0].name, "19.1mm--Test Oak")
@@ -286,7 +302,7 @@ class OrderWorkflowTests(unittest.TestCase):
                 {(item.kind, item.thickness, item.color): item.quantity for item in materials if item.quantity},
                 {("plywood", 18.0, ""): 2, ("panel", 19.1, "Test Oak"): 3},
             )
-            self.assertEqual(edges, {"Test Oak": 12.5})
+            self.assertEqual(edges, {"Test Oak": 13})
             generated = load_workbook(created, data_only=False).active
             self.assertEqual(generated["A14"].value, "Total Qty:")
             self.assertEqual(generated["C16"].value, "Test Oak")
@@ -338,7 +354,7 @@ class OrderWorkflowTests(unittest.TestCase):
                 next(item.quantity for item in materials if item.kind == "panel" and item.color == "Test Oak"),
                 7,
             )
-            self.assertEqual(edges, {"Test Oak": 19.75})
+            self.assertEqual(edges, {"Test Oak": 20})
 
     def test_complex_report_generation_requests_manual_material(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -536,6 +552,16 @@ class OrderWorkflowTests(unittest.TestCase):
             wb = load_workbook(output, data_only=False)
             self.assertEqual(wb["WorkOrderTraveler"]["B5"].value, "CS004")
             self.assertEqual(wb["Usage List"]["B1"].value, "CS004")
+            purchase_values = [
+                cell.value
+                for row in wb["Purchase List"].iter_rows()
+                for cell in row
+                if cell.value not in (None, "")
+            ]
+            self.assertIsNone(wb["Purchase List"]["A4"].value)
+            self.assertNotIn("TB18", purchase_values)
+            self.assertNotIn("Poket Door Pantry Hinge", purchase_values)
+            self.assertNotIn("Touch Open", purchase_values)
             picking = wb["Picking List"]
             self.assertEqual(picking["A1"].value, "Picking List领料单")
             self.assertEqual(picking_layout_snapshot(picking), template_layout)
@@ -664,6 +690,51 @@ class OrderWorkflowTests(unittest.TestCase):
             self.assertFalse([item for item in materials if item.kind == "panel"])
             self.assertEqual(edges, {"Basalto SM": 12.5})
 
+    def test_repairs_empty_single_color_table_from_detail_rows_without_changing_details(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "PP0072 materials.xlsx"
+            make_materials(path, order_id="PP0072", edge=319.64)
+            workbook = load_workbook(path, data_only=False)
+            sheet = workbook.active
+            detail_snapshot = [
+                [sheet.cell(row, column).value for column in range(1, 10)]
+                for row in range(3, 14)
+            ]
+            total_snapshot = [sheet.cell(14, column).value for column in range(1, 10)]
+            for coordinate in (
+                "C16", "D16", "E16", "C17", "D17", "E17",
+                "C18", "D18", "E18", "C19", "D19", "E19",
+            ):
+                sheet[coordinate] = None
+            workbook.save(path)
+
+            result = repair_material_color_table(path)
+            self.assertTrue(result["corrected"])
+            self.assertEqual(result["colors"], ["Basalto SM"])
+            self.assertEqual(result["panel_count"], 5)
+            self.assertAlmostEqual(result["edge_banding"], 319.64)
+
+            repaired = load_workbook(path, data_only=False).active
+            self.assertEqual(repaired["C16"].value, "Basalto SM")
+            self.assertIn("SUMIF($I$3:$I$13,C$16,$F$3:$F$13)", repaired["C17"].value)
+            self.assertIn("SUMIF($I$3:$I$13,C$16,$G$3:$G$13)", repaired["C18"].value)
+            self.assertIn("SUMIF($I$3:$I$13,C$16,$H$3:$H$13)", repaired["C19"].value)
+            self.assertEqual(
+                [repaired.cell(row, column).value for row in range(3, 14) for column in range(1, 10)],
+                [value for row in detail_snapshot for value in row],
+            )
+            self.assertEqual(
+                [repaired.cell(14, column).value for column in range(1, 10)],
+                total_snapshot,
+            )
+
+            _, materials, edges = parse_order_materials("PP0072", path)
+            self.assertEqual(
+                [(item.kind, item.color, item.quantity) for item in materials if item.kind == "panel"],
+                [("panel", "Basalto SM", 4.0), ("panel", "Basalto SM", 1.0)],
+            )
+            self.assertEqual(edges, {"Basalto SM": 319.64})
+
     def test_repairs_missing_color_table_colors_and_rebuilds_all_summary_formulas(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "PP0035-2 materials.xlsx"
@@ -673,6 +744,7 @@ class OrderWorkflowTests(unittest.TestCase):
             sheet["F3"], sheet["G3"], sheet["H3"], sheet["I3"] = 3, 0, 18.5, "Ivory Oak"
             sheet["F4"], sheet["H4"], sheet["I4"] = 1, 36.72, "Khaki"
             sheet["F5"], sheet["H5"], sheet["I5"] = 5, 87.52, "Frappe 3"
+            sheet["F14"], sheet["G14"], sheet["H14"] = 9, 0, 142.74
             sheet["C16"] = "Ivory Oak"
             sheet["D16"], sheet["E16"] = None, None
             workbook.save(path)
@@ -715,6 +787,7 @@ class OrderWorkflowTests(unittest.TestCase):
             sheet["F3"], sheet["H3"], sheet["I3"] = 3, 18.5, "Ivory Oak"
             sheet["F4"], sheet["H4"], sheet["I4"] = 1, 36.72, "Khaki"
             sheet["F5"], sheet["H5"], sheet["I5"] = 5, 87.52, "Frappe 3"
+            sheet["F14"], sheet["G14"], sheet["H14"] = 9, 1, 142.74
             sheet["D16"], sheet["E16"] = None, None
             workbook.save(path)
 
@@ -735,6 +808,7 @@ class OrderWorkflowTests(unittest.TestCase):
             sheet["F4"], sheet["H4"], sheet["I4"] = 1, 36.72, "Khaki"
             sheet["F5"], sheet["H5"], sheet["I5"] = 2, 41.28, "Khaki"
             sheet["F6"], sheet["H6"], sheet["I6"] = 5, 87.52, "Frappe 3"
+            sheet["F14"], sheet["G14"], sheet["H14"] = 11, 0, 184.02
             sheet["C16"], sheet["D16"], sheet["E16"] = "Ivory Oak", None, None
             workbook.save(path)
 
@@ -751,27 +825,23 @@ class OrderWorkflowTests(unittest.TestCase):
                 {"Ivory Oak": 18.5, "Penelope FA44": 78.0, "Frappe 3": 87.52},
             )
 
-    def test_existing_complete_color_table_is_the_source_of_panel_and_edge_totals(self):
+    def test_existing_complete_color_table_mismatch_requires_manual_handling(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "PP0035-2 materials.xlsx"
             make_materials(path, order_id="PP0035-2")
             workbook = load_workbook(path)
             sheet = workbook.active
             sheet["C16"] = "Basalto SM"
-            # Deliberately make the existing Color Table differ from the
-            # detail row. A complete table is authoritative and must not be
-            # silently replaced by detail-row totals.
+            # A complete table is still the parsing source, but a mismatch
+            # with Total Qty must stop automatic material writing.
             sheet["C17"], sheet["C18"], sheet["C19"] = 2, 0, 9.25
             workbook.save(path)
 
             result = repair_material_color_table(path)
             self.assertFalse(result["corrected"])
-            _, materials, edges = parse_order_materials("PP0035-2", path)
-            self.assertEqual(
-                [(item.kind, item.color, item.quantity) for item in materials if item.kind == "panel"],
-                [("panel", "Basalto SM", 2.0)],
-            )
-            self.assertEqual(edges, {"Basalto SM": 9.25})
+            with self.assertRaises(RuleError) as raised:
+                parse_order_materials("PP0035-2", path)
+            self.assertEqual(raised.exception.code, "material_summary_mismatch")
 
     def test_eight_color_table_is_read_without_seven_color_limit_error(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -793,6 +863,7 @@ class OrderWorkflowTests(unittest.TestCase):
                 sheet.cell(17, column).value = 1
                 sheet.cell(18, column).value = 0
                 sheet.cell(19, column).value = 10
+            sheet["F14"], sheet["G14"], sheet["H14"] = 8, 0, 80
             workbook.save(path)
 
             result = repair_material_color_table(path)
@@ -810,16 +881,89 @@ class OrderWorkflowTests(unittest.TestCase):
             make_materials(path)
             wb = load_workbook(path)
             ws = wb.active
-            for coordinate, value in {"C14": 10.25, "D14": 0.75, "E14": 3.25, "F14": 6.25}.items():
+            for coordinate, value in {
+                "C14": 10.25,
+                "D14": 0.75,
+                "E14": 3.25,
+                "F14": 6.25,
+                "H14": 319.64,
+            }.items():
                 ws[coordinate] = value
                 ws[coordinate].number_format = "0;\\-0;;@"
             wb.save(path)
-            _, materials, _ = parse_order_materials("PP0068", path)
+            _, materials, edges = parse_order_materials("PP0068", path)
             quantities = {(item.kind, item.thickness): item.quantity for item in materials}
             self.assertEqual(quantities[("plywood", 18.0)], 10)
             self.assertEqual(quantities[("plywood", 14.5)], 1)
             self.assertEqual(quantities[("plywood", 5.4)], 3)
             self.assertEqual(quantities[("panel", 19.1)], 6)
+            self.assertEqual(edges, {"Basalto SM": 320})
+
+    def test_material_detail_quantity_requires_color(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "CS004 materials.xlsx"
+            make_materials(path, order_id="CS004")
+            workbook = load_workbook(path)
+            workbook.active["I3"] = None
+            workbook.save(path)
+
+            with self.assertRaises(RuleError) as raised:
+                parse_order_materials("CS004", path)
+
+            self.assertEqual(raised.exception.code, "material_color_required")
+            self.assertIn("Kitchen", str(raised.exception))
+
+    def test_total_qty_and_color_table_must_match_before_material_write(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "CS004 materials.xlsx"
+            make_materials(path, order_id="CS004")
+            workbook = load_workbook(path)
+            sheet = workbook.active
+            sheet["C16"] = "Basalto SM"
+            sheet["C17"], sheet["C18"], sheet["C19"] = 4, 1, 12.5
+            workbook.save(path)
+
+            _, materials, edges = parse_order_materials("CS004", path)
+            self.assertEqual(
+                {(item.kind, item.color, item.quantity) for item in materials if item.kind == "panel"},
+                {("panel", "Basalto SM", 4.0), ("panel", "Basalto SM", 1.0)},
+            )
+            self.assertEqual(edges, {"Basalto SM": 12.5})
+
+            workbook = load_workbook(path)
+            workbook.active["F14"] = 5
+            workbook.save(path)
+            with self.assertRaises(RuleError) as raised:
+                parse_order_materials("CS004", path)
+            self.assertEqual(raised.exception.code, "material_summary_mismatch")
+
+    def test_formula_without_cached_values_uses_display_values_for_totals_and_color_table(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "PP0072 materials.xlsx"
+            make_materials(path, order_id="PP0072", fractional=True, edge=319.64)
+            wb = load_workbook(path)
+            ws = wb.active
+            ws["C3"], ws["D3"], ws["E3"] = 21.5, 4.5, 9
+            for column in "CDEFGH":
+                ws[f"{column}14"] = f"=SUM({column}3:{column}13)"
+                ws[f"{column}14"].number_format = r"0;\-0;;@"
+            ws["C16"] = "Basalto SM"
+            ws["C17"] = "=SUMIF($I$3:$I$13,C$16,$F$3:$F$13)"
+            ws["C18"] = "=SUMIF($I$3:$I$13,C$16,$G$3:$G$13)"
+            ws["C19"] = "=SUMIF($I$3:$I$13,C$16,$H$3:$H$13)"
+            for coordinate in ("C17", "C18", "C19"):
+                ws[coordinate].number_format = r"0;\-0;;@"
+            wb.save(path)
+
+            _, materials, edges = parse_order_materials("PP0072", path)
+
+            quantities = {(item.kind, item.thickness): item.quantity for item in materials}
+            self.assertEqual(quantities[("plywood", 18.0)], 22)
+            self.assertEqual(quantities[("plywood", 14.5)], 5)
+            self.assertEqual(quantities[("plywood", 5.4)], 9)
+            self.assertEqual(quantities[("panel", 19.1)], 4)
+            self.assertEqual(quantities[("panel", 8.0)], 1)
+            self.assertEqual(edges, {"Basalto SM": 320})
 
     def test_integer_display_format_is_also_used_for_room_rows(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -836,6 +980,29 @@ class OrderWorkflowTests(unittest.TestCase):
             rows = parse_material_room_rows(path)
             panel = next(item for item in rows[0][1] if item.kind == "panel")
             self.assertEqual(panel.quantity, 6)
+
+    def test_room_section_factory_name_extracts_exact_order_and_rejects_ambiguous_rows(self):
+        rows = [
+            ("PP0035-OFFICE", [MaterialItem("panel", 19.1, "Frappe 3", 4)], {}),
+            ("PP0035-2-MASTER", [MaterialItem("panel", 19.1, "Ivory Oak", 6)], {}),
+        ]
+        materials, edges, warnings = _select_room_materials(
+            rows,
+            "PP0035-2",
+            {},
+            known_order_ids={"PP0035", "PP0035-2"},
+        )
+        self.assertEqual([(item.color, item.quantity) for item in materials], [("Ivory Oak", 6)])
+        self.assertEqual(edges, {})
+        self.assertEqual(warnings, [])
+
+        with self.assertRaisesRegex(RuleError, "包含订单号的工厂单名称"):
+            _select_room_materials(
+                [("MASTER", [MaterialItem("panel", 19.1, "Ivory Oak", 6)], {})],
+                "PP0035-2",
+                {},
+                known_order_ids={"PP0035", "PP0035-2"},
+            )
 
     def test_related_update_reports_the_specific_order_error(self):
         group = {

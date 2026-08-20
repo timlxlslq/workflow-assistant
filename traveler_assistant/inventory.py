@@ -24,7 +24,7 @@ from openpyxl import load_workbook
 
 from .core import Config, RuleError, _normalize_name, _text, progress
 from .operation_log import configure_operation_log, log_database_statement, log_progress_payload
-from .database import ensure_schema
+from .database import ensure_outbound_document_factory_links, ensure_schema
 
 
 TRAVELER_RE = re.compile(r"^Work Order Traveler\(.+\)\.xlsx$", re.IGNORECASE)
@@ -112,10 +112,20 @@ class InventoryPreview:
     missing_items: list[dict] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     selected_document_remarks: tuple[str, ...] = ()
+    # Order-level material documents can cover one or more explicitly
+    # selected factory orders.  Keep the selection on the preview so the
+    # successful document can be linked to those exact identities when it is
+    # persisted; an order-only record must still never be broadcast to a
+    # split order implicitly.
+    selected_factory_orders: tuple[str, ...] = ()
     source_type: str = "traveler"
     scope_decisions: list[dict] = field(default_factory=list)
     excluded_items: list[dict] = field(default_factory=list)
     no_outbound_required: bool = False
+    # A room-scoped preview intentionally covers only one factory-room slice
+    # of an order.  Existing order-level outbound records must not be treated
+    # as disappeared documents when this partial slice is saved.
+    partial_scope: bool = False
 
     @property
     def ready(self) -> bool:
@@ -176,7 +186,11 @@ class InventoryPreview:
         return [
             {
                 "remark": remark,
-                "kind": "materials" if remark == self.traveler.order_id else "hardware",
+                "kind": (
+                    "materials" if all(item.section == "板材与封边" for item in mapped.get(remark, []))
+                    else "hardware" if all(item.section == "五金" for item in mapped.get(remark, []))
+                    else "materials_hardware"
+                ),
                 "items": [asdict(item) for item in mapped.get(remark, [])],
                 "ignored_items": ignored_by_remark.get(remark, []),
             }
@@ -319,6 +333,135 @@ def _database_factory_rows(config: Config, order_id: str) -> tuple[dict, dict[st
     return detail, factory_rows
 
 
+def _usable_hardware_factory_orders(detail: dict) -> set[str]:
+    """Return factory orders with active, positive-quantity hardware facts."""
+    result: set[str] = set()
+    for row in detail.get("hardware", []):
+        factory_order = str(row.get("factory_order", "")).strip().upper()
+        if not factory_order:
+            continue
+        try:
+            quantity = float(row.get("quantity", 0) or 0)
+        except (TypeError, ValueError):
+            quantity = 0
+        if quantity > 0:
+            result.add(factory_order)
+    return result
+
+
+def database_outbound_fingerprint(config: Config, order_id: str, factory_order: str) -> str:
+    """Fingerprint the persisted facts relevant to one database outbound."""
+    normalized_order_id = order_id.strip().upper()
+    normalized_factory_order = factory_order.strip().upper()
+    detail, factory_rows = _database_factory_rows(config, normalized_order_id)
+    if normalized_factory_order not in factory_rows:
+        raise RuleError(
+            "inventory_factory_unknown",
+            f"数据库中找不到订单 {normalized_order_id} 的工厂单：{normalized_factory_order or '空白'}",
+        )
+    scope = outbound_scope_decisions(config, normalized_order_id, [normalized_factory_order])
+    hardware = [
+        row for row in detail.get("hardware", [])
+        if str(row.get("factory_order", "")).strip().upper() == normalized_factory_order
+    ]
+    return _fingerprint({
+        "order_id": normalized_order_id,
+        "factory_order": normalized_factory_order,
+        "material_scope": scope["material"],
+        "materials": detail.get("materials", []),
+        "hardware_scope": scope["hardware"].get(normalized_factory_order, {}),
+        "hardware": hardware,
+    })
+
+
+def mark_customer_supplied_outbound(
+    config: Config,
+    order_id: str,
+    selected_factory_orders: Iterable[str] | None = None,
+) -> dict:
+    """Complete a customer-material outbound without creating an inventory document."""
+    normalized_order_id = order_id.strip().upper()
+    detail, factory_rows = _database_factory_rows(config, normalized_order_id)
+    scope = outbound_scope_decisions(config, normalized_order_id, selected_factory_orders)
+    if scope["material"]["requirement"] != "customer_supplied":
+        raise RuleError("inventory_scope", "当前订单没有确认“客户提供材料（不入库存）”")
+    requested = {
+        str(value).strip().upper()
+        for value in (selected_factory_orders or [])
+        if str(value).strip()
+    }
+    factory_ids = requested or set(factory_rows)
+    unknown = sorted(factory_ids - set(factory_rows))
+    if unknown:
+        raise RuleError(
+            "inventory_factory_unknown",
+            "数据库中找不到所选工厂单，已停止出库：" + "、".join(unknown),
+            factory_orders=unknown,
+        )
+    if not factory_ids:
+        raise RuleError("inventory_factory_unknown", f"订单 {normalized_order_id} 没有可确认出库的工厂单")
+    available_hardware = _usable_hardware_factory_orders(detail)
+    hardware_in_selection = sorted(available_hardware.intersection(factory_ids))
+    if hardware_in_selection:
+        raise RuleError(
+            "inventory_scope",
+            "所选工厂单存在五金数据，不能只写数据库：" + "、".join(hardware_in_selection),
+            factory_orders=hardware_in_selection,
+        )
+
+    fingerprints = {
+        factory_order: database_outbound_fingerprint(config, normalized_order_id, factory_order)
+        for factory_order in sorted(factory_ids)
+    }
+    connection = sqlite3.connect(config.workflow_database)
+    try:
+        placeholders = ",".join("?" for _ in factory_ids)
+        rows = connection.execute(
+            f"select factory_order, outbound_status from factory_orders "
+            f"where order_id=? and factory_order in ({placeholders}) and aimes_status='active'",
+            [normalized_order_id, *sorted(factory_ids)],
+        ).fetchall()
+        by_factory = {str(row[0]).upper(): str(row[1] or "") for row in rows}
+        missing = sorted(factory_ids - set(by_factory))
+        if missing:
+            raise RuleError(
+                "inventory_factory_unknown",
+                "数据库中找不到所选工厂单，已停止出库：" + "、".join(missing),
+                factory_orders=missing,
+            )
+        already_outbound = sorted(
+            factory_order for factory_order, status in by_factory.items()
+            if status == "已出库"
+        )
+        if already_outbound:
+            raise RuleError(
+                "inventory_already_outbound",
+                "工厂单 " + "、".join(already_outbound) + " 已出库，不能重复出库",
+                factory_orders=already_outbound,
+            )
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        for factory_order, fingerprint in fingerprints.items():
+            connection.execute(
+                """
+                update factory_orders
+                set outbound_status='已出库', outbound_document='',
+                    outbound_mode='customer_supplied', outbound_fingerprint=?, updated_at=?
+                where order_id=? and factory_order=? and aimes_status='active'
+                """,
+                (fingerprint, now, normalized_order_id, factory_order),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+    return {
+        "order_id": normalized_order_id,
+        "factory_orders": sorted(factory_ids),
+        "outbound_status": "已出库",
+        "outbound_mode": "customer_supplied",
+        "inventory_document": False,
+    }
+
+
 def database_document_items(
     config: Config,
     order_id: str,
@@ -431,7 +574,7 @@ def outbound_scope_decisions(
     rows.row_factory = sqlite3.Row
     try:
         decisions = rows.execute(
-            "select scope_type, factory_order, requirement, reason, source_fingerprint, updated_at "
+            "select id, scope_type, factory_order, requirement, reason, source_fingerprint, updated_at "
             "from outbound_scope_decisions where order_id=?",
             (normalized,),
         ).fetchall()
@@ -447,10 +590,11 @@ def outbound_scope_decisions(
         "source_fingerprint": "",
         "updated_at": "",
     }
+    available_hardware = _usable_hardware_factory_orders(detail)
     factory_ids = requested or set(factory_rows)
     hardware = {}
     for factory_order in sorted(factory_ids):
-        if factory_order not in factory_rows:
+        if factory_order not in factory_rows or factory_order not in available_hardware:
             continue
         hardware[factory_order] = by_key.get(("hardware", factory_order)) or {
             "scope_type": "hardware",
@@ -460,12 +604,23 @@ def outbound_scope_decisions(
             "source_fingerprint": "",
             "updated_at": "",
         }
+    persisted_decisions = [
+        dict(row)
+        for row in [material, *hardware.values()]
+        if str(row.get("updated_at") or "").strip()
+    ]
+    last_decision = max(
+        persisted_decisions,
+        key=lambda row: (str(row.get("updated_at", "")), int(row.get("id", 0) or 0)),
+        default=None,
+    )
     return {
         "order_id": normalized,
         "order_type": str(detail.get("order", {}).get("order_type", "")),
         "material": material,
         "hardware": hardware,
         "decisions": [material, *hardware.values()],
+        "last_decision": last_decision,
     }
 
 
@@ -487,11 +642,18 @@ def set_outbound_scope(
         raise RuleError("inventory_scope", "出库范围类型或决定无效")
     detail, factory_rows = _database_factory_rows(config, normalized)
     order_type = str(detail.get("order", {}).get("order_type", "")).strip()
+    if order_type == "owned":
+        raise RuleError("inventory_scope", "自有订单不支持设置出库范围")
     if scope_type == "material" and factory_order:
         raise RuleError("inventory_scope", "订单材料出库范围不能填写工厂单")
     if scope_type == "hardware":
         if not factory_order or factory_order not in factory_rows:
             raise RuleError("inventory_scope", f"数据库中找不到订单 {normalized} 的工厂单：{factory_order or '空白'}")
+        if factory_order not in _usable_hardware_factory_orders(detail):
+            raise RuleError(
+                "inventory_scope",
+                f"数据库中没有订单 {normalized} 的工厂单 {factory_order} 的可出库五金数据",
+            )
         if requirement == "customer_supplied":
             raise RuleError("inventory_scope", "客户提供材料只适用于来料加工订单的板材和封边，不适用于五金")
     if scope_type == "material" and requirement == "customer_supplied" and order_type != "cutToSize":
@@ -526,6 +688,11 @@ def build_database_preview(
     normalized_order_id, documents, zero_items, _ = database_document_items(
         config, order_id, selected_factory_orders
     )
+    selected_factory_ids = tuple(sorted({
+        str(value).strip().upper()
+        for value in (selected_factory_orders or [])
+        if str(value).strip()
+    }))
     scope = outbound_scope_decisions(config, normalized_order_id, selected_factory_orders)
     detail, factory_rows = _database_factory_rows(config, normalized_order_id)
     excluded_items: list[dict] = []
@@ -639,12 +806,153 @@ def build_database_preview(
         ignored,
         missing,
         selected_document_remarks=selected_remarks,
+        selected_factory_orders=selected_factory_ids,
         source_type="database",
         scope_decisions=scope["decisions"],
         excluded_items=excluded_items,
         no_outbound_required=not outbound and not missing and bool(
             excluded_items or scope["material"]["requirement"] in {"customer_supplied", "remainder", "not_required"}
         ),
+    )
+
+
+def build_factory_room_preview(
+    config: Config,
+    order_id: str,
+    factory_order: str,
+) -> InventoryPreview:
+    """Build a partial outbound preview for one explicitly named Server room.
+
+    Standard order materials remain order-level facts in SQLite.  This helper
+    is only for a user-confirmed room slice whose ownership is explicit in the
+    Server materials workbook, such as ``PP0035-OFFICE``.  It reads the source
+    workbook room rows, adds hardware for the selected factory order, and does
+    not infer quantities from sibling rooms.
+    """
+    from .order_workflow import parse_material_room_rows
+
+    normalized_order = order_id.strip().upper()
+    normalized_factory = factory_order.strip().upper()
+    detail, factory_rows = _database_factory_rows(config, normalized_order)
+    factory = factory_rows.get(normalized_factory)
+    if factory is None:
+        raise RuleError(
+            "inventory_factory_unknown",
+            f"数据库中找不到订单 {normalized_order} 的工厂单：{normalized_factory or '空白'}",
+        )
+    factory_name = str(factory.get("factory_name", "")).strip() or normalized_factory
+    material_paths = sorted({
+        Path(str(row.get("source_path", "")).strip())
+        for row in detail.get("materials", [])
+        if str(row.get("source_path", "")).strip()
+    })
+    material_path = next((path for path in material_paths if path.is_file()), None)
+    if material_path is None:
+        raise RuleError(
+            "inventory_material_source",
+            f"订单 {normalized_order} 找不到可读取的材料源文件，无法按房间出库",
+            factory_order=normalized_factory,
+        )
+    target_key = _normalize_name(factory_name)
+    room_rows = parse_material_room_rows(material_path)
+    selected_rows = [
+        row for row in room_rows
+        if _normalize_name(str(row[0]).strip()) == target_key
+    ]
+    if not selected_rows:
+        raise RuleError(
+            "inventory_room_unknown",
+            f"材料文件中找不到与工厂名称完全对应的房间：{factory_name}",
+            factory_order=normalized_factory,
+            source_path=str(material_path),
+        )
+
+    documents: dict[str, list[TravelerItem]] = {factory_name: []}
+    row_number = 1
+    for _, items, edges in selected_rows:
+        for material in items:
+            if material.quantity <= 0:
+                continue
+            if material.kind == "plywood":
+                name = f"{material.thickness:g}mm--Plywood"
+            elif material.kind in {"panel", "back"}:
+                name = f"{material.thickness:g}mm--{material.color}"
+            elif material.kind == "edge":
+                name = f"Edge banding--{material.color}"
+            else:
+                raise RuleError("inventory_material", f"数据库中的材料类型暂不支持：{material.kind or '空白'}")
+            documents[factory_name].append(
+                TravelerItem(row_number, "板材与封边", name, float(material.quantity), factory_name)
+            )
+            row_number += 1
+        for color, quantity in edges.items():
+            if quantity > 0:
+                documents[factory_name].append(
+                    TravelerItem(row_number, "板材与封边", f"Edge banding--{color}", float(quantity), factory_name)
+                )
+                row_number += 1
+
+    for row in detail.get("hardware", []):
+        if str(row.get("factory_order", "")).strip().upper() != normalized_factory:
+            continue
+        quantity = float(row.get("quantity", 0) or 0)
+        if quantity <= 0:
+            continue
+        name = str(row.get("name", "")).strip() or str(row.get("product_code", "")).strip()
+        documents[factory_name].append(
+            TravelerItem(row_number, "五金", name, quantity, factory_name)
+        )
+        row_number += 1
+    if not documents[factory_name]:
+        raise RuleError(
+            "inventory_empty",
+            f"工厂单 {normalized_factory} 对应房间没有可出库的材料或五金",
+        )
+
+    mappings = InventoryMappings(config.workflow_database)
+    outbound: list[OutboundItem] = []
+    ignored: list[dict] = []
+    missing: list[dict] = []
+    catalog_path = bootstrap_product_database(config)
+    catalog_context = (
+        ProductDatabase(catalog_path)
+        if catalog_path.suffix.lower() in {".sqlite", ".sqlite3", ".db"}
+        else None
+    )
+    try:
+        catalog = catalog_context or ProductCatalog(catalog_path)
+        for item in documents[factory_name]:
+            reason = mappings.ignored_reason(item.name)
+            if reason is not None:
+                ignored.append({**asdict(item), "reason": reason})
+                continue
+            try:
+                outbound.extend(match_item(catalog, mappings, item))
+            except RuleError as exc:
+                missing.append({**asdict(item), "code": exc.code, "message": str(exc), **exc.context})
+    finally:
+        if catalog_context is not None:
+            catalog_context.close()
+    traveler = TravelerData(
+        path=material_path.resolve(),
+        pp_folder=Path(str(detail.get("order", {}).get("source_folder", ""))).name or normalized_order,
+        order_id=normalized_order,
+        order_name=normalized_order,
+        items=list(documents[factory_name]),
+        zero_items=[],
+        documents=documents,
+        modified_at=datetime.fromtimestamp(material_path.stat().st_mtime).isoformat(timespec="seconds"),
+        fingerprint=_fingerprint({"factory_order": normalized_factory, "documents": {factory_name: [asdict(item) for item in documents[factory_name]]}}),
+    )
+    return InventoryPreview(
+        traveler=traveler,
+        outbound_items=outbound,
+        ignored_items=ignored,
+        missing_items=missing,
+        selected_document_remarks=(factory_name,),
+        selected_factory_orders=(normalized_factory,),
+        source_type="database_room",
+        partial_scope=True,
     )
 
 
@@ -1915,7 +2223,7 @@ class InventorySyncStore:
             remark for remark in previous
             if remark and (remark not in current or not preview.traveler.documents.get(remark))
         )
-        if disappeared:
+        if disappeared and not preview.partial_scope:
             raise RuleError(
                 "inventory_manual_void",
                 "以下已出库工厂单在当前 Traveler 中消失或五金为空，请人工删除或作废旧出库单后再处理："
@@ -1983,7 +2291,10 @@ class InventorySyncStore:
                 "synced_at": datetime.now().isoformat(timespec="seconds"),
             }
         self.data["version"] = 2
-        central = self.path.parent.parent / "workflow.sqlite3"
+        # The sync JSON and the authoritative workflow database live in the
+        # same state directory (normally ``data``).  Using parent.parent here
+        # silently bypasses the central database after the storage cutover.
+        central = self.path.parent / "workflow.sqlite3"
         if central.is_file():
             connection = sqlite3.connect(central)
             try:
@@ -1998,31 +2309,81 @@ class InventorySyncStore:
                         "select factory_order from factory_orders where order_id=? and (factory_name=? or factory_order=?) limit 1",
                         (preview.traveler.order_id, remark, remark),
                     ).fetchone()
+                    # Materials are an order-level document.  In the order
+                    # center, an explicit factory selection is the evidence
+                    # that this document covered those exact factory orders.
+                    # Preserve that identity in the relation table without
+                    # changing the legacy single-value header column.  Do
+                    # not infer/broadcast an order-only record when there is
+                    # no explicit selection.
+                    linked_factory_values = (
+                        preview.selected_factory_orders
+                        if (
+                            preview.source_type == "database"
+                            and _normalize_name(remark) == _normalize_name(preview.traveler.order_id)
+                            and preview.selected_factory_orders
+                        )
+                        else (factory[0],) if factory else (remark,)
+                    )
                     connection.execute(
                         """insert into outbound_documents(
                             document_number,document_type,order_id,factory_order,status,source,issued_at,source_path,updated_at
                         ) values(?,?,?,?,?,?,?,?,?)
                         on conflict(document_number) do update set
-                            status=excluded.status, factory_order=excluded.factory_order,
-                            issued_at=excluded.issued_at, source_path=excluded.source_path, updated_at=excluded.updated_at""",
+                            document_type=excluded.document_type, order_id=excluded.order_id,
+                            factory_order=excluded.factory_order, status=excluded.status,
+                            source=excluded.source, issued_at=excluded.issued_at,
+                            source_path=excluded.source_path, updated_at=excluded.updated_at""",
                         (document_number, str(result.get("kind", "")), preview.traveler.order_id,
                          factory[0] if factory else remark, "已出库", "金蝶", str(result.get("syncedAt", "")),
                          str(preview.traveler.path), datetime.now().isoformat(timespec="seconds")),
                     )
+                    for linked_factory_value in linked_factory_values:
+                        ensure_outbound_document_factory_links(
+                            connection,
+                            document_number,
+                            preview.traveler.order_id,
+                            linked_factory_value,
+                        )
                 connection.commit()
             finally:
                 connection.close()
-        else:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(self.data, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        # Keep the human-readable audit file in sync with the authoritative
+        # SQLite record.  The central database branch above used to skip this
+        # write, so a later outbound retry could treat a confirmed document
+        # as new and try to edit it again in JDY.
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
     def _backup_current(self) -> None:
         if not self.path.is_file():
             return
-        self.backup_root.mkdir(parents=True, exist_ok=True)
-        destination = self.backup_root / f"inventory-sync {datetime.now():%Y-%m-%d %H%M%S.%f}.json"
-        shutil.copy2(self.path, destination)
-        backups = sorted(self.backup_root.glob("inventory-sync *.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+        backup_root = self.backup_root
+        try:
+            backup_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # The configured production backup is commonly on a Server mount.
+            # A missing mount must not discard a confirmed local inventory sync;
+            # keep a recoverable copy beside the local workflow database.
+            backup_root = self.path.parent / "database-backups" / "Inventory Sync Records"
+            backup_root.mkdir(parents=True, exist_ok=True)
+        destination = backup_root / f"inventory-sync {datetime.now():%Y-%m-%d %H%M%S.%f}.json"
+        try:
+            shutil.copy2(self.path, destination)
+        except OSError:
+            # Some SMB/macOS mounts reject the metadata pass in copy2() even
+            # though the file contents are writable.  A backup failure must
+            # never prevent recording a confirmed JDY document: retry on the
+            # local state volume, where both contents and metadata are safe.
+            destination.unlink(missing_ok=True)
+            backup_root = self.path.parent / "database-backups" / "Inventory Sync Records"
+            backup_root.mkdir(parents=True, exist_ok=True)
+            destination = backup_root / f"inventory-sync {datetime.now():%Y-%m-%d %H%M%S.%f}.json"
+            shutil.copyfile(self.path, destination)
+        backups = sorted(backup_root.glob("inventory-sync *.json"), key=lambda item: item.stat().st_mtime, reverse=True)
         for old in backups[50:]:
             old.unlink()
 
@@ -2058,6 +2419,37 @@ def _catalog_info(config: Config) -> dict:
 
 def _sync_path(config: Config) -> Path:
     return config.state_dir / "inventory-outbound-records.json"
+
+
+def _persist_completed_outbound_results(
+    config: Config,
+    preview: InventoryPreview | None,
+    confirm_save: bool,
+    responses: list[dict],
+) -> list[str]:
+    """Persist documents already returned before a later outbound fails.
+
+    A multi-document outbound is executed one document at a time. If a later
+    browser process times out, earlier successful documents are still facts and
+    must be recorded before the remaining document is retried. This does not
+    mark the whole order shipped; normal reconciliation waits for all facts.
+    """
+    if not (confirm_save and preview is not None):
+        return []
+    completed = [
+        item for item in responses
+        if item.get("saved") or item.get("unchanged")
+    ]
+    if not completed:
+        return []
+    InventorySyncStore(_sync_path(config), config.backup_root).save_success(
+        preview, completed
+    )
+    return [
+        str(item.get("documentNumber", "")).strip()
+        for item in completed
+        if str(item.get("documentNumber", "")).strip()
+    ]
 
 
 def bootstrap_catalog(config: Config) -> Path:
@@ -2585,7 +2977,8 @@ def run_jdy(config: Config, action: str, traveler_path: Path | None = None, conf
             stock_items: list[dict] | None = None,
             selected_document_remarks: Iterable[str] | None = None,
             selected_factory_orders: Iterable[str] | None = None,
-            order_id: str = "") -> dict:
+            order_id: str = "",
+            room_material: bool = False) -> dict:
     operation_started = time.perf_counter()
     progress(f"库存系统：开始准备 {action} 操作")
     username = _local_setting(config, "jdy_username")
@@ -2611,7 +3004,13 @@ def run_jdy(config: Config, action: str, traveler_path: Path | None = None, conf
     preview = None
     if action == "outbound":
         if order_id.strip():
-            preview = build_database_preview(config, order_id, selected_factory_orders)
+            if room_material:
+                selected = list(selected_factory_orders or [])
+                if len(selected) != 1:
+                    raise RuleError("inventory_argument", "按房间出库必须只选择一个工厂单")
+                preview = build_factory_room_preview(config, order_id, selected[0])
+            else:
+                preview = build_database_preview(config, order_id, selected_factory_orders)
         else:
             if not traveler_path:
                 raise RuleError("inventory_argument", "出库必须提供订单号或 Traveler")
@@ -2638,6 +3037,32 @@ def run_jdy(config: Config, action: str, traveler_path: Path | None = None, conf
         documents = store.prepare_documents(preview)
         if not documents:
             if preview.no_outbound_required:
+                material_scope = next(
+                    (
+                        decision for decision in preview.scope_decisions
+                        if decision.get("scope_type") == "material"
+                    ),
+                    {},
+                )
+                if (
+                    order_id.strip()
+                    and material_scope.get("requirement") == "customer_supplied"
+                ):
+                    completion = mark_customer_supplied_outbound(
+                        config,
+                        order_id,
+                        selected_factory_orders,
+                    )
+                    return {
+                        "ok": True,
+                        "saved": True,
+                        "no_outbound_required": True,
+                        "customer_supplied": True,
+                        "database_updated": True,
+                        **completion,
+                        "scope_decisions": preview.scope_decisions,
+                        "message": "客户提供材料且没有需要出库的五金，已确认出库并仅更新数据库，未创建库存出库单",
+                    }
                 return {
                     "ok": True,
                     "saved": False,
@@ -2750,6 +3175,18 @@ def run_jdy(config: Config, action: str, traveler_path: Path | None = None, conf
                     part for part in (timeout_text(exc.stderr), timeout_text(exc.stdout)) if part
                 )
             )
+            try:
+                partial_numbers = _persist_completed_outbound_results(
+                    config, preview, confirm_save, responses
+                )
+            except Exception as sync_error:  # preserve the original timeout diagnosis
+                detail = f"{detail}；已完成单据本地同步失败：{sync_error}"
+            else:
+                if partial_numbers:
+                    detail = (
+                        f"{detail}；已完成单据已同步：{'、'.join(partial_numbers)}；"
+                        "后续单据结果需要先查询库存历史再重试"
+                    )
             raise RuleError(
                 "jdy_timeout",
                 f"库存系统操作超过 90 秒未完成：{detail}",
@@ -2767,15 +3204,9 @@ def run_jdy(config: Config, action: str, traveler_path: Path | None = None, conf
                     log_progress_payload(event)
             sys.stderr.write(result.stderr)
         if result.returncode != 0:
-            if action == "outbound" and preview is not None and confirm_save and responses:
-                completed = [
-                    item for item in responses
-                    if item.get("saved") or item.get("unchanged")
-                ]
-                if completed:
-                    InventorySyncStore(_sync_path(config), config.backup_root).save_success(
-                        preview, completed
-                    )
+            _persist_completed_outbound_results(
+                config, preview, confirm_save, responses
+            )
             raise RuleError("jdy_browser", _jdy_error_detail(result.stderr))
         try:
             responses.append(json.loads(result.stdout))
@@ -2904,7 +3335,7 @@ def check_database_stock(config: Config, order_id: str) -> dict:
 def inventory_main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="pp-flowhub inventory")
     parser.add_argument("action", choices=(
-        "list", "list-names", "preview", "order-preview", "import-products", "preflight", "outbound",
+        "list", "list-names", "preview", "order-preview", "get-outbound-scope", "import-products", "preflight", "outbound",
         "find-outbound", "reconcile-folder", "ignore-item", "unignore-item",
         "search-products", "set-mapping", "update-mapping", "remove-mapping", "list-mappings", "update-ignore", "set-outbound-scope", "update-products", "stock-check", "open-chrome", "close-chrome",
     ))
@@ -2930,6 +3361,7 @@ def inventory_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--query", default="")
     parser.add_argument("--product-code", default="")
     parser.add_argument("--include-hardware", action="store_true")
+    parser.add_argument("--room-material", action="store_true")
     args = parser.parse_args(argv)
     config = Config()
     config.load_settings()
@@ -2953,6 +3385,10 @@ def inventory_main(argv: list[str] | None = None) -> int:
             if not args.order_id:
                 raise RuleError("inventory_argument", "order-preview 必须提供 --order-id")
             result = build_database_preview(config, args.order_id, args.factory_order).payload()
+        elif args.action == "get-outbound-scope":
+            if not args.order_id:
+                raise RuleError("inventory_argument", "读取出库范围需要订单号")
+            result = outbound_scope_decisions(config, args.order_id, args.factory_order)
         elif args.action == "set-outbound-scope":
             if not args.order_id or not args.scope_type or not args.requirement:
                 raise RuleError("inventory_argument", "保存出库范围需要订单号、范围类型和决定")
@@ -3033,6 +3469,7 @@ def inventory_main(argv: list[str] | None = None) -> int:
                 selected_document_remarks=args.document_remark,
                 selected_factory_orders=args.factory_order,
                 order_id=args.order_id,
+                room_material=args.room_material,
             )
         logger.event("backend.command.completed", "库存系统操作完成", details={"action": args.action})
         print(json.dumps(result, ensure_ascii=False, indent=2))

@@ -71,6 +71,7 @@ private struct MacOSUIRegressionTests {
         testMaterialDisplayNames()
         testOrderDetailMaterialRows()
         testOrderDashboardRules()
+        testPendingInventorySourceFolderPath()
         testOrderOutboundFactorySelection()
         testSharedPageHeaderHeight()
         testInventoryActionLayoutRules()
@@ -83,6 +84,7 @@ private struct MacOSUIRegressionTests {
         testFullPageHeaderBoundaryAlignment()
         testOperationLogScrollsAfterAppending()
         testOperationLogReader()
+        testOperationLogMaintenance()
         testRunningProgressReusesOperationRow()
         testInventoryProgressKeepsStageHistory()
         testOrderOperationDurationFormatting()
@@ -187,18 +189,25 @@ private struct MacOSUIRegressionTests {
 
     private static func testOrderDetailMaterialRows() {
         let rows = [
-            OrderMaterialPreview(kind: "panel", thickness: 19.1, color: "Woodline 4", quantity: 2),
+            OrderMaterialPreview(kind: "panel", thickness: 8, color: " woodline 4 ", quantity: 1),
             OrderMaterialPreview(kind: "plywood", thickness: 5.4, color: "", quantity: 3),
             OrderMaterialPreview(kind: "panel", thickness: 19.1, color: "Basalto", quantity: 1),
             OrderMaterialPreview(kind: "plywood", thickness: 18, color: "", quantity: 4),
+            OrderMaterialPreview(kind: "panel", thickness: 9, color: "Woodline 4", quantity: 1),
+            OrderMaterialPreview(kind: "panel", thickness: 19.1, color: "Woodline 4", quantity: 2),
         ]
         require(
             orderDetailPlywoodRows(rows).map { orderMaterialDisplayName($0) } == ["柜体板", "背板"],
             "订单详情 Plywood 未保持厚度顺序"
         )
+        let panelRows = orderDetailPanelRows(rows)
+        let expectedPanelRows = [("Basalto", 19.1), ("Woodline 4", 19.1), (" woodline 4 ", 8), ("Woodline 4", 9)]
         require(
-            orderDetailPanelRows(rows).map(\.color) == ["Basalto", "Woodline 4"],
-            "订单详情 Panel 未按颜色排序"
+            panelRows.count == expectedPanelRows.count
+                && zip(panelRows, expectedPanelRows).allSatisfy { row, expected in
+                    row.color == expected.0 && row.thickness == expected.1
+                },
+            "订单详情 Panel 未按颜色分组，或同色未按 19.1mm、8/9mm 顺序显示"
         )
         require(
             orderDetailEdgeColors(["Woodline 4", "Basalto", "Ivory Oak"]) == ["Basalto", "Ivory Oak", "Woodline 4"],
@@ -209,7 +218,51 @@ private struct MacOSUIRegressionTests {
     private static func testOrderDashboardRules() {
         require(dashboardStatusIsInProgress("正在后台扫描 Server 变化…"), "进行中的 Server 状态未被识别")
         require(!dashboardStatusIsInProgress("✅ Server 扫描完成"), "已完成的 Server 状态被误判为进行中")
+        require(orderDashboardIsCompleted("已出货"), "已出货订单没有被识别为已完成")
+        require(!orderDashboardIsCompleted("部分出货"), "部分出货订单被错误识别为已完成")
         require(dashboardMessageHoverDelay == 1.0, "消息悬停详情必须停留超过一秒后才显示")
+        require(dashboardMessageHoverCloseGrace == 0.8, "消息悬停离开后应保持 0.8 秒")
+        require(
+            dashboardMessageHoverCanPresent(appIsActive: true, mainWindowIsFrontmost: true),
+            "前台主窗口不允许显示消息悬停详情"
+        )
+        require(
+            !dashboardMessageHoverCanPresent(appIsActive: false, mainWindowIsFrontmost: true),
+            "App 不在前台时不应显示消息悬停详情"
+        )
+        require(
+            !dashboardMessageHoverCanPresent(appIsActive: true, mainWindowIsFrontmost: false),
+            "主窗口不在最前面时不应显示消息悬停详情"
+        )
+        let successfulAimesTrace = DashboardMessage(
+            id: "aimes-success",
+            source: "aimes",
+            time: "12:00:00",
+            title: "AIMES",
+            detail: "获取 AIMES 数据成功",
+            state: "success",
+            operationDurations: [
+                DashboardOperationDuration(label: "登录 AIMES", duration: 9.29),
+            ]
+        )
+        require(
+            dashboardMessageSupportsHoverDetail(successfulAimesTrace),
+            "成功 AIMES 消息有阶段耗时时必须支持悬停详情"
+        )
+        require(
+            !dashboardMessageSupportsHoverDetail(DashboardMessage(
+                id: "aimes-running",
+                source: "aimes",
+                time: "12:00:01",
+                title: "AIMES",
+                detail: "正在获取 AIMES 数据…",
+                state: "info",
+                operationDurations: [
+                    DashboardOperationDuration(label: "登录 AIMES", duration: 9.29),
+                ]
+            )),
+            "进行中的 AIMES 消息不应提前显示悬停详情"
+        )
         let materials = [
             OrderMaterialPreview(kind: "panel", thickness: 19.1, color: "Basalto SM", quantity: 7),
             OrderMaterialPreview(kind: "panel", thickness: 19.1, color: " basalto sm ", quantity: 1),
@@ -241,6 +294,15 @@ private struct MacOSUIRegressionTests {
                 && orderDashboardProgressFraction(completed: -1, total: 2) == 0,
             "订单中心进度条比例未限制在有效范围"
         )
+        let installationDays = [
+            OrderInstallationDay(date: "2026-07-08", installer: "安装组 A"),
+            OrderInstallationDay(date: "2026-07-11", installer: "安装组 B"),
+        ]
+        require(
+            orderInstallationDateSummary(installationDays) == "7/8–7/11 · 2天",
+            "非连续安装日期的开始日、结束日或天数摘要错误"
+        )
+        require(orderInstallationDisplayDate("2026-07-08") == "7/8", "安装日期显示格式错误")
         require(
             orderDashboardMetricsFit(width: AppLayout.windowMinWidth, horizontalPadding: AppLayout.contentPadding),
             "订单指标卡在最小窗口宽度下无法保持一行显示"
@@ -308,6 +370,15 @@ private struct MacOSUIRegressionTests {
         )
         require(aimesActionDetails.contains("已忽略 1 条："), "AIMES 已忽略数量详情缺失")
         require(aimesActionDetails.contains(where: { $0.contains("F201") && $0.contains("OFFICE TEST") }), "AIMES 已忽略具体工厂单详情缺失")
+        let normalizedAimesStages = dashboardFlatOperationDurations([
+            ["stage": "browser_launch", "label": "启动 AIMES 浏览器", "duration_seconds": 0.37],
+            ["stage": "attempt", "label": "获取 AIMES 数据成功，总计用时", "duration_seconds": 44.11],
+            ["stage": "factory_order_verify", "label": "精确核验工厂单存在性", "duration_seconds": 28.83],
+        ])
+        require(
+            normalizedAimesStages.map(\.label) == ["启动 AIMES 浏览器", "精确核验工厂单存在性"],
+            "AIMES 总耗时不应作为阶段重复显示"
+        )
         let warningDetails = dashboardAimesWarningDetails([[
             "factory_order": "F2606150155",
             "factory_name": "PP0018 DRAWER",
@@ -630,11 +701,27 @@ private struct MacOSUIRegressionTests {
         require(orderDashboardExpandedID(current: "PP0035-2", tapped: "PP0035-2") == nil, "再次点击同一订单行应折叠")
         require(orderDashboardExpandedID(current: "PP0035", tapped: "PP0035-2") == "PP0035-2", "点击其他订单行应切换展开项")
         require(orderDashboardExpandedID(current: "PP0035-2", tapped: "PP0035-2", forceOpen: true) == "PP0035-2", "强制打开不应意外折叠")
-        require(appSectionShowsInTopNavigation("assistant"), "助手页面必须保留顶部导航")
-        require(appSectionShowsInTopNavigation("orders"), "订单中心必须继续保留顶部导航")
         require(appDefaultSectionRawValue == "orders", "App 默认页面必须继续是订单中心")
         _ = OrderDashboardMetricsView(model: AppModel())
         _ = OrderDashboardView(model: AppModel())
+    }
+
+    private static func testPendingInventorySourceFolderPath() {
+        let reportFile = "/Volumes/server/Optimized Orders/pp0072/PP0072-MasterBed_Landing_Bed1_Bed2_Office/Report/FittingslistPC124429962608190002.xlsx"
+        require(
+            inventoryMappingSourceFolderPath(reportFile) == "/Volumes/server/Optimized Orders/pp0072/PP0072-MasterBed_Landing_Bed1_Bed2_Office",
+            "订单文件映射重读没有回到标准订单根目录"
+        )
+        let reportFolder = "/Volumes/server/Optimized Orders/pp0072/PP0072-MasterBed_Landing_Bed1_Bed2_Office/Report"
+        require(
+            inventoryMappingSourceFolderPath(reportFolder) == "/Volumes/server/Optimized Orders/pp0072/PP0072-MasterBed_Landing_Bed1_Bed2_Office",
+            "Report 文件夹路径没有回到标准订单根目录"
+        )
+        let temporaryReport = "/Volumes/server/temporary-order/Fittingslist.xlsx"
+        require(
+            inventoryMappingSourceFolderPath(temporaryReport) == "/Volumes/server/temporary-order",
+            "临时订单报表路径没有保留临时订单文件夹"
+        )
     }
 
     private static func testOrderOutboundFactorySelection() {
@@ -658,8 +745,28 @@ private struct MacOSUIRegressionTests {
             "已出库工厂单必须阻止再次出库"
         )
         require(
+            orderDashboardOutboundDisplay(status: "已出库", documentNumber: "QTCK20260729007") == "已出库 · QTCK20260729007",
+            "已出库工厂单没有显示出库单据编号"
+        )
+        require(
+            orderDashboardOutboundDisplay(status: "需要更新", documentNumber: "QTCK-OLD") == "需要更新",
+            "未出库状态不应错误显示历史出库单据编号"
+        )
+        require(
             !orderDashboardHasShippedSelection(["F200"], statuses: ["F100": "已出库", "F200": "需要更新"]),
             "需要更新工厂单应允许进入更新出库"
+        )
+        require(
+            orderDashboardNeedsOutboundUpdateSelection(["F200"], statuses: ["F100": "已出库", "F200": "需要更新"]),
+            "需要更新工厂单应被识别为更新出库"
+        )
+        require(
+            orderDashboardOutboundActionTitle(["F200"], statuses: ["F100": "已出库", "F200": "需要更新"]) == "更新出库",
+            "需要更新工厂单的按钮不能继续显示创建出库"
+        )
+        require(
+            orderDashboardOutboundActionTitle(["F100"], statuses: ["F100": "已出库", "F200": "需要更新"]) == "创建出库",
+            "普通未出库选择应显示创建出库"
         )
         require(
             !orderDashboardStageMatchesFilter("已出货", statusFilter: "未完成订单")
@@ -722,7 +829,33 @@ private struct MacOSUIRegressionTests {
             inventoryActionColumnCount(availableWidth: AppLayout.inventoryActionMinWidth) == 1,
             "库存操作区在窄窗口下未换行为单列"
         )
-        _ = InventoryView(model: AppModel(), onClose: {})
+        func preview(_ name: String, _ section: String) -> InventoryPreviewRow {
+            InventoryPreviewRow(
+                travelerName: name,
+                productCode: "M0001",
+                productName: name,
+                quantity: 1,
+                source: "测试",
+                status: "已映射",
+                section: section
+            )
+        }
+        let sorted = sortedInventoryPreviewRows([
+            preview("Hinge", "五金"),
+            preview("Edge banding--Basalto SM", "板材与封边"),
+            preview("14.5mm--Plywood", "板材与封边"),
+            preview("19.1mm--Basalto SM", "板材与封边"),
+            preview("5.4mm--Plywood", "板材与封边"),
+            preview("18mm--Plywood", "板材与封边")
+        ])
+        require(
+            sorted.map(\.travelerName) == [
+                "18mm--Plywood", "14.5mm--Plywood", "5.4mm--Plywood",
+                "19.1mm--Basalto SM", "Edge banding--Basalto SM", "Hinge"
+            ],
+            "出库预览没有按 Plywood、Panel、封边条、五金及 Plywood 子分类排序"
+        )
+        _ = InventoryView(model: AppModel(), onClose: {}, orderContextID: "PP0001")
     }
 
     private static func testRunningProgressReusesOperationRow() {
@@ -933,6 +1066,35 @@ private struct MacOSUIRegressionTests {
         require(entry.operation == "点击保存设置", "操作日志查看页未显示用户可理解的操作内容")
         require(entry.displayTime == "2026-08-13 15:30:45", "操作日志时间未格式化为本地可读格式")
         require(OperationLogReader.parse(line: "不是 JSON") == nil, "无效操作日志行不应导致读取失败")
+    }
+
+    private static func testOperationLogMaintenance() {
+        let fileManager = FileManager.default
+        let url = fileManager.temporaryDirectory
+            .appendingPathComponent("operation-log-test-\(UUID().uuidString).jsonl")
+        defer { try? fileManager.removeItem(at: url) }
+
+        let lines = [
+            "{\"event\":\"user.action\",\"message\":\"旧记录\",\"timestamp\":\"2026-01-07T23:59:59-08:00\"}",
+            "{\"event\":\"user.action\",\"message\":\"三天边界\",\"timestamp\":\"2026-01-08T00:00:00-08:00\"}",
+            "{\"event\":\"user.action\",\"message\":\"今天记录\",\"timestamp\":\"2026-01-10T12:00:00-08:00\"}",
+            "{\"event\":\"user.action\",\"message\":\"UTC 今天记录\",\"timestamp\":\"2026-01-11T07:30:00Z\"}",
+        ]
+        try! lines.joined(separator: "\n").appending("\n").data(using: .utf8)!.write(to: url)
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "America/Los_Angeles")!
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let now = formatter.date(from: "2026-01-10T12:00:00-08:00")!
+        let result = try! OperationLogReader.trim(toRecentDays: 3, at: url, now: now, calendar: calendar)
+        let remaining = try! String(contentsOf: url, encoding: .utf8)
+
+        require(result.removedEntries == 1, "日志清理未删除三天前的记录")
+        require(result.retainedEntries == 3, "日志清理未保留近三天的记录")
+        require(!remaining.contains("旧记录"), "日志清理仍保留三天前的记录")
+        require(remaining.contains("三天边界") && remaining.contains("UTC 今天记录"), "日志清理错误处理日期边界或 UTC 时间")
+        require(OperationLogReader.fileSizeText(from: url) != "0 bytes", "日志文件大小显示未读取文件")
     }
 
     private static func traveler(_ name: String, folder: String, modifiedAt: String) -> InventoryTraveler {

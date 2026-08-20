@@ -25,6 +25,26 @@ struct OperationLogEntry: Identifiable, Equatable {
     }()
 }
 
+struct OperationLogTrimResult: Equatable {
+    let removedEntries: Int
+    let retainedEntries: Int
+    let byteCount: Int64
+}
+
+enum OperationLogMaintenanceError: LocalizedError {
+    case invalidLine(Int)
+    case logChangedDuringCleanup
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidLine(let line):
+            return "第 \(line) 行不是有效的操作日志，已停止清理。"
+        case .logChangedDuringCleanup:
+            return "日志在清理期间发生变化，请停止正在运行的任务后重试。"
+        }
+    }
+}
+
 enum OperationLogReader {
     static func entries(from url: URL) -> [OperationLogEntry] {
         guard let data = try? Data(contentsOf: url),
@@ -38,7 +58,7 @@ enum OperationLogReader {
         guard let data = line.data(using: .utf8),
               let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let timestampText = payload["timestamp"] as? String,
-              let timestamp = parseTimestamp(timestampText) else {
+              let timestamp = timestamp(from: timestampText) else {
             return nil
         }
         let message = (payload["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -48,11 +68,94 @@ enum OperationLogReader {
         return OperationLogEntry(timestamp: timestamp, operation: operation)
     }
 
-    private static func parseTimestamp(_ text: String) -> Date? {
+    static func timestamp(from text: String) -> Date? {
         if let date = ISO8601DateFormatter.operationLog.date(from: text) { return date }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         return formatter.date(from: text)
+    }
+
+    static func fileSizeText(from url: URL) -> String {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let bytes = (attributes?[.size] as? NSNumber)?.int64Value ?? 0
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useKB, .useMB, .useGB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
+
+    static func trim(
+        toRecentDays days: Int,
+        at url: URL,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) throws -> OperationLogTrimResult {
+        guard days > 0 else { return OperationLogTrimResult(removedEntries: 0, retainedEntries: 0, byteCount: 0) }
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return OperationLogTrimResult(removedEntries: 0, retainedEntries: 0, byteCount: 0)
+        }
+
+        let originalAttributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let originalData = try Data(contentsOf: url)
+        guard let text = String(data: originalData, encoding: .utf8) else {
+            throw OperationLogMaintenanceError.invalidLine(1)
+        }
+
+        let localCalendar = calendar
+        let todayStart = localCalendar.startOfDay(for: now)
+        guard let cutoff = localCalendar.date(byAdding: .day, value: -(days - 1), to: todayStart),
+              let tomorrowStart = localCalendar.date(byAdding: .day, value: 1, to: todayStart) else {
+            return OperationLogTrimResult(removedEntries: 0, retainedEntries: 0, byteCount: Int64(originalData.count))
+        }
+
+        let lines = text.split(whereSeparator: \.isNewline).map(String.init)
+        var retainedLines: [String] = []
+        retainedLines.reserveCapacity(lines.count)
+        for (index, line) in lines.enumerated() {
+            guard let data = line.data(using: .utf8),
+                  let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let timestampText = payload["timestamp"] as? String,
+                  let timestamp = timestamp(from: timestampText) else {
+                throw OperationLogMaintenanceError.invalidLine(index + 1)
+            }
+            if timestamp >= cutoff && timestamp < tomorrowStart {
+                retainedLines.append(line)
+            }
+        }
+
+        let hadTrailingNewline = text.last?.isNewline == true
+        var output = retainedLines.joined(separator: "\n")
+        if hadTrailingNewline && !retainedLines.isEmpty { output.append("\n") }
+        let outputData = Data(output.utf8)
+
+        let latestAttributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        let originalSize = (originalAttributes[.size] as? NSNumber)?.int64Value ?? Int64(originalData.count)
+        let latestSize = (latestAttributes[.size] as? NSNumber)?.int64Value ?? -1
+        let originalModified = originalAttributes[.modificationDate] as? Date
+        let latestModified = latestAttributes[.modificationDate] as? Date
+        guard originalSize == latestSize && originalModified == latestModified else {
+            throw OperationLogMaintenanceError.logChangedDuringCleanup
+        }
+
+        let temporaryURL = url
+            .deletingLastPathComponent()
+            .appendingPathComponent(".operation-log-cleanup-\(UUID().uuidString).tmp")
+        var replaced = false
+        defer {
+            if !replaced { try? FileManager.default.removeItem(at: temporaryURL) }
+        }
+        try outputData.write(to: temporaryURL, options: .atomic)
+        if let permissions = originalAttributes[.posixPermissions] {
+            try? FileManager.default.setAttributes([.posixPermissions: permissions], ofItemAtPath: temporaryURL.path)
+        }
+        _ = try FileManager.default.replaceItemAt(url, withItemAt: temporaryURL, backupItemName: nil, options: [])
+        replaced = true
+
+        return OperationLogTrimResult(
+            removedEntries: lines.count - retainedLines.count,
+            retainedEntries: retainedLines.count,
+            byteCount: Int64(outputData.count)
+        )
     }
 
     private static func friendlyEvent(_ event: String) -> String {
@@ -102,9 +205,8 @@ final class OperationLogWriter {
         force: Bool = false
     ) {
         lock.lock()
-        let shouldWrite = enabled || force
-        lock.unlock()
-        guard shouldWrite else { return }
+        defer { lock.unlock() }
+        guard enabled || force else { return }
 
         var payload: [String: Any] = [
             "timestamp": ISO8601DateFormatter.operationLog.string(from: Date()),
@@ -140,6 +242,16 @@ final class OperationLogWriter {
             // Audit logging must never break the user's business operation.
         }
         payload.removeAll()
+    }
+
+    func trimLogToRecentDays(
+        _ days: Int = 3,
+        now: Date = Date(),
+        calendar: Calendar = .current
+    ) throws -> OperationLogTrimResult {
+        lock.lock()
+        defer { lock.unlock() }
+        return try OperationLogReader.trim(toRecentDays: days, at: logURL, now: now, calendar: calendar)
     }
 
     func environment(operationID: String? = nil) -> [String: String] {

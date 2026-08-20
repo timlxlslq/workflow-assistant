@@ -74,7 +74,10 @@ class CoreTests(unittest.TestCase):
                     "split_time": "",
                 }],
                 "missing": ["F101"],
-                "_aimes_timings": [{"label": "获取 AIMES 数据成功，总计用时", "duration_seconds": 1.2}],
+                "_aimes_timings": [
+                    {"stage": "login", "label": "登录 AIMES", "duration_seconds": 1.2},
+                    {"stage": "attempt", "label": "获取 AIMES 数据成功，总计用时", "duration_seconds": 9.9},
+                ],
             },
         ) as lookup:
             timings = []
@@ -87,7 +90,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(rows[0]["factory_order"], "F100")
         self.assertEqual(verification["rows"][0]["factory_order"], "F099")
         self.assertEqual(verification["missing"], ["F101"])
-        self.assertEqual(timings[0]["label"], "获取 AIMES 数据成功，总计用时")
+        self.assertEqual(timings[0]["label"], "登录 AIMES")
+        self.assertFalse(any("总计用时" in item["label"] for item in timings))
         self.assertEqual(lookup.call_args.kwargs["recent_limit"], 50)
         self.assertTrue(lookup.call_args.kwargs["verify_factory_orders"])
 

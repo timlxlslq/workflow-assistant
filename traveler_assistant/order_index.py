@@ -5,7 +5,9 @@ import hashlib
 import os
 import re
 import sqlite3
+import shutil
 import time
+import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
@@ -23,6 +25,7 @@ from .core import (
 )
 from .operation_log import log_database_statement
 from .fittings import select_latest_fittings
+from .database import ensure_outbound_document_factory_links
 from .inventory import InventoryMappings
 
 
@@ -41,6 +44,8 @@ SERVER_FOLDER_IGNORE_WATCH_DAYS = 30
 SERVER_SNAPSHOT_MAX_WORKERS = 4
 SERVER_SCAN_SNAPSHOT_FILENAME = "server-scan-snapshot.json"
 BATCH_NUMBER_RE = re.compile(r"(PC\d{12,})", re.IGNORECASE)
+MATERIAL_ALLOCATION_EPSILON = 0.01
+TRAVELER_FILENAME_RE = re.compile(r"^Work Order Traveler\(.+\)\.xlsx$", re.IGNORECASE)
 
 
 def _now() -> str:
@@ -109,6 +114,11 @@ def _server_folder_matches_root(folder: Path, root: Path, order_ids: set[str]) -
 def _is_standard_order_folder(name: str) -> bool:
     """Recognize the two supported standard Server folder-name formats."""
     return bool(ORDER_FOLDER_RE.fullmatch(str(name or "")))
+
+
+def _is_traveler_file(path: Path) -> bool:
+    """Return whether a path has the production Work Order Traveler filename."""
+    return bool(TRAVELER_FILENAME_RE.fullmatch(path.name))
 
 
 def _folder_created_at(folder: Path) -> float:
@@ -405,6 +415,30 @@ def _partition_aimes_rows(
     return visible, issues
 
 
+def _merge_aimes_recent_and_verified_rows(
+    recent_rows: list[dict],
+    verification_result: dict | None,
+) -> list[dict]:
+    """Combine the recent page with exact rows found outside that page.
+
+    AIMES returns recent-page rows and exact-verification rows separately.  A
+    verified row is still authoritative identity data and must be persisted;
+    it is not only evidence that the factory order was not deleted.
+    """
+    merged: dict[str, dict] = {}
+    for row in recent_rows:
+        factory_order = str(row.get("factory_order", "")).upper().strip()
+        if factory_order:
+            merged[factory_order] = row
+    for row in (verification_result or {}).get("rows", []):
+        if not isinstance(row, dict):
+            continue
+        factory_order = str(row.get("factory_order", "")).upper().strip()
+        if factory_order and factory_order not in merged:
+            merged[factory_order] = row
+    return list(merged.values())
+
+
 def _business_validation_message(exc: Exception) -> str:
     """Convert parser/runtime failures into an actionable order explanation."""
     message = str(exc).strip()
@@ -484,8 +518,19 @@ class OrderIndexStore:
                 material_status text not null default '待校验',
                 last_server_seen text not null default '',
                 last_aimes_seen text not null default '',
-                updated_at text not null
+                updated_at text not null,
+                user_note text not null default ''
             );
+            create table if not exists order_installation_days(
+                order_id text not null,
+                date_type text not null check(date_type in ('planned', 'actual')),
+                install_date text not null,
+                installer text not null default '',
+                updated_at text not null,
+                primary key(order_id, date_type, install_date)
+            );
+            create index if not exists idx_order_installation_days_order
+                on order_installation_days(order_id, date_type, install_date);
             create table if not exists factory_orders(
                 factory_order text primary key,
                 order_id text not null default '',
@@ -501,6 +546,8 @@ class OrderIndexStore:
                 optimized integer not null default 0,
                 outbound_status text not null default '未查询',
                 outbound_document text not null default '',
+                outbound_mode text not null default '',
+                outbound_fingerprint text not null default '',
                 last_server_seen text not null default '',
                 last_aimes_seen text not null default '',
                 updated_at text not null
@@ -516,6 +563,31 @@ class OrderIndexStore:
                 size integer not null default 0,
                 content_fingerprint text not null default '',
                 last_seen text not null
+            );
+            create table if not exists server_material_allocations(
+                id integer primary key,
+                source_material_id integer not null,
+                source_path text not null default '',
+                source_material_key text not null default '',
+                material_type text not null default '',
+                color text not null default '',
+                thickness text not null default '',
+                unit text not null default '',
+                edge text not null default '',
+                source_quantity real not null default 0,
+                order_id text not null,
+                allocated_quantity real not null default 0,
+                source_fingerprint text not null default '',
+                created_at text not null,
+                updated_at text not null,
+                unique(source_path, source_material_key, order_id)
+            );
+            create index if not exists idx_server_material_allocations_source
+                on server_material_allocations(source_path, source_material_key);
+            create index if not exists idx_server_material_allocations_order
+                on server_material_allocations(order_id);
+            create table if not exists server_material_preview_scopes(
+                source_folder text primary key
             );
             create table if not exists sync_runs(
                 id integer primary key,
@@ -642,12 +714,24 @@ class OrderIndexStore:
             self.connection.execute(
                 "alter table factory_orders add column split_time text not null default ''"
             )
+        if "outbound_mode" not in factory_columns:
+            self.connection.execute(
+                "alter table factory_orders add column outbound_mode text not null default ''"
+            )
+        if "outbound_fingerprint" not in factory_columns:
+            self.connection.execute(
+                "alter table factory_orders add column outbound_fingerprint text not null default ''"
+            )
         order_columns = {
             row[1] for row in self.connection.execute("pragma table_info(orders)").fetchall()
         }
         if "validation_message" not in order_columns:
             self.connection.execute(
                 "alter table orders add column validation_message text not null default ''"
+            )
+        if "user_note" not in order_columns:
+            self.connection.execute(
+                "alter table orders add column user_note text not null default ''"
             )
         temporary_columns = {
             row[1] for row in self.connection.execute("pragma table_info(temporary_orders)").fetchall()
@@ -1019,7 +1103,7 @@ class OrderIndexStore:
         material_status: str | None = None,
         server_seen: str = "",
         aimes_seen: str = "",
-    ) -> None:
+        ) -> None:
         order_id = order_id.upper()
         current = self.connection.execute(
             "select validation_status, stage, material_status, order_type from orders where order_id = ?",
@@ -1063,6 +1147,93 @@ class OrderIndexStore:
             ),
         )
 
+    def save_order_annotations(
+        self,
+        order_id: str,
+        *,
+        user_note: str,
+        planned_days: list[dict[str, str]],
+        actual_days: list[dict[str, str]],
+    ) -> dict:
+        """Save user-maintained order note and installation date facts.
+
+        Server/AIMES upserts never touch these fields.  Installation dates are
+        kept as explicit rows so non-consecutive workdays remain accurate.
+        """
+        order_id = str(order_id or "").strip().upper()
+        if not order_id:
+            raise ValueError("保存订单信息需要订单号")
+        exists = self.connection.execute(
+            "select 1 from orders where order_id = ?", (order_id,)
+        ).fetchone()
+        if exists is None:
+            raise ValueError(f"找不到订单：{order_id}")
+
+        normalized: dict[str, list[tuple[str, str]]] = {}
+        for date_type, values in (("planned", planned_days), ("actual", actual_days)):
+            if not isinstance(values, list):
+                raise ValueError(f"{date_type} 安装日期格式不正确")
+            rows: list[tuple[str, str]] = []
+            seen_dates: set[str] = set()
+            for value in values:
+                if not isinstance(value, dict):
+                    raise ValueError("安装日期明细格式不正确")
+                install_date = str(value.get("date", "")).strip()
+                installer = str(value.get("installer", "")).strip()
+                try:
+                    datetime.strptime(install_date, "%Y-%m-%d")
+                except ValueError as exc:
+                    raise ValueError(f"安装日期必须是 YYYY-MM-DD：{install_date}") from exc
+                if install_date in seen_dates:
+                    raise ValueError(f"{date_type} 安装日期重复：{install_date}")
+                seen_dates.add(install_date)
+                rows.append((install_date, installer))
+            normalized[date_type] = sorted(rows)
+
+        updated_at = _now()
+        self.connection.execute(
+            "update orders set user_note = ?, updated_at = ? where order_id = ?",
+            (str(user_note or "").strip(), updated_at, order_id),
+        )
+        self.connection.execute(
+            "delete from order_installation_days where order_id = ?", (order_id,)
+        )
+        self.connection.executemany(
+            """
+            insert into order_installation_days(
+                order_id, date_type, install_date, installer, updated_at
+            ) values(?,?,?,?,?)
+            """,
+            [
+                (order_id, date_type, install_date, installer, updated_at)
+                for date_type, rows in normalized.items()
+                for install_date, installer in rows
+            ],
+        )
+        self.connection.commit()
+        summary = next(
+            (item for item in self.summaries() if item["order_id"] == order_id),
+            None,
+        )
+        if summary is None:
+            summary = {
+                "order_id": order_id,
+                "user_note": str(user_note or "").strip(),
+                "installation": {
+                    date_type: {
+                        "days": [
+                            {"date": install_date, "installer": installer}
+                            for install_date, installer in rows
+                        ],
+                        "start_date": rows[0][0] if rows else "",
+                        "end_date": rows[-1][0] if rows else "",
+                        "day_count": len(rows),
+                    }
+                    for date_type, rows in normalized.items()
+                },
+            }
+        return {"saved": True, "order": summary}
+
     def upsert_factory(
         self,
         factory_order: str,
@@ -1079,6 +1250,8 @@ class OrderIndexStore:
         optimized: bool | None = None,
         outbound_status: str | None = None,
         outbound_document: str | None = None,
+        outbound_mode: str | None = None,
+        outbound_fingerprint: str | None = None,
         server_seen: str = "",
         aimes_seen: str = "",
     ) -> None:
@@ -1086,7 +1259,7 @@ class OrderIndexStore:
         current = self.connection.execute(
             """
             select report_state, ownership_status, has_hardware, optimized,
-                   outbound_status, outbound_document
+                   outbound_status, outbound_document, outbound_mode, outbound_fingerprint
             from factory_orders where factory_order = ?
             """,
             (factory_order,),
@@ -1115,14 +1288,22 @@ class OrderIndexStore:
             outbound_document if outbound_document is not None
             else (current[5] if current else "")
         )
+        resolved_outbound_mode = (
+            outbound_mode if outbound_mode is not None
+            else (current[6] if current else "")
+        )
+        resolved_outbound_fingerprint = (
+            outbound_fingerprint if outbound_fingerprint is not None
+            else (current[7] if current else "")
+        )
         self.connection.execute(
             """
             insert into factory_orders(
                 factory_order, order_id, factory_name, sales_order_name, split_time, name_source, source_folder,
                 report_state, ownership_status, has_hardware, optimized,
-                outbound_status, outbound_document, last_server_seen,
+                outbound_status, outbound_document, outbound_mode, outbound_fingerprint, last_server_seen,
                 last_aimes_seen, updated_at
-            ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             on conflict(factory_order) do update set
                 order_id=case when excluded.order_id <> '' then excluded.order_id else factory_orders.order_id end,
                 factory_name=case when excluded.factory_name <> '' then excluded.factory_name else factory_orders.factory_name end,
@@ -1136,6 +1317,8 @@ class OrderIndexStore:
                 optimized=excluded.optimized,
                 outbound_status=excluded.outbound_status,
                 outbound_document=excluded.outbound_document,
+                outbound_mode=excluded.outbound_mode,
+                outbound_fingerprint=excluded.outbound_fingerprint,
                 last_server_seen=case when excluded.last_server_seen <> '' then excluded.last_server_seen else factory_orders.last_server_seen end,
                 last_aimes_seen=case when excluded.last_aimes_seen <> '' then excluded.last_aimes_seen else factory_orders.last_aimes_seen end,
                 updated_at=excluded.updated_at
@@ -1154,6 +1337,8 @@ class OrderIndexStore:
                 int(resolved_optimized),
                 resolved_outbound_status,
                 resolved_outbound_document,
+                resolved_outbound_mode,
+                resolved_outbound_fingerprint,
                 server_seen,
                 aimes_seen,
                 _now(),
@@ -1704,10 +1889,25 @@ class OrderIndexStore:
 
     def summaries(self) -> list[dict]:
         orders = self.connection.execute(
-            "select order_id, order_type, source_folder, source_folder_mtime, validation_status, stage, material_status, last_server_seen, last_aimes_seen, updated_at, validation_message from orders order by order_id"
+            "select order_id, order_type, source_folder, source_folder_mtime, validation_status, stage, material_status, last_server_seen, last_aimes_seen, updated_at, validation_message, user_note from orders order by order_id"
         ).fetchall()
+        installation_rows = self.connection.execute(
+            """
+            select order_id, date_type, install_date, installer
+            from order_installation_days
+            order by order_id, date_type, install_date
+            """
+        ).fetchall()
+        installation_by_order: dict[str, dict[str, list[dict[str, str]]]] = defaultdict(
+            lambda: {"planned": [], "actual": []}
+        )
+        for installation_row in installation_rows:
+            installation_by_order[installation_row[0]][installation_row[1]].append({
+                "date": installation_row[2],
+                "installer": installation_row[3],
+            })
         factories = self.connection.execute(
-            "select factory_order, order_id, factory_name, sales_order_name, split_time, name_source, source_folder, report_state, ownership_status, has_hardware, optimized, outbound_status, outbound_document, updated_at from factory_orders where aimes_status = 'active' order by factory_order"
+            "select factory_order, order_id, factory_name, sales_order_name, split_time, name_source, source_folder, report_state, ownership_status, has_hardware, optimized, outbound_status, outbound_document, outbound_mode, outbound_fingerprint, updated_at from factory_orders where aimes_status = 'active' order by factory_order"
         ).fetchall()
         grouped: dict[str, list[dict]] = defaultdict(list)
         for row in factories:
@@ -1727,7 +1927,9 @@ class OrderIndexStore:
                 "optimized": bool(row[10]),
                 "outbound_status": row[11],
                 "outbound_document": row[12],
-                "updated_at": row[13],
+                "outbound_mode": row[13],
+                "outbound_fingerprint": row[14],
+                "updated_at": row[15],
             })
         result = []
         stage_changed = False
@@ -1744,8 +1946,16 @@ class OrderIndexStore:
             else:
                 children = [
                     item for item in grouped.get(order_id, [])
-                    if item["name_source"] == "AIMES"
-                    and item["sales_order_name"] == order_id
+                    if (
+                        (
+                            item["name_source"] == "AIMES"
+                            and item["sales_order_name"] == order_id
+                        )
+                        or (
+                            item["order_id"] == order_id
+                            and item["ownership_status"] == "已确认"
+                        )
+                    )
                     and "test" not in item["order_name"].casefold()
                 ]
             if not children and not is_temporary:
@@ -1762,10 +1972,14 @@ class OrderIndexStore:
                 stage = "数据异常" if row[4] == "数据异常" else "待确认"
             elif expected == 0:
                 stage = "已设计"
+            elif shipped == expected:
+                # Shipment completion is terminal for the order dashboard,
+                # even when historical optimization evidence is incomplete.
+                # Otherwise a fully shipped order can remain visible as
+                # "已拆单待优化" solely because optimized is still 0.
+                stage = "已出货"
             elif optimized < expected:
                 stage = "已拆单待优化" if optimized == 0 else "部分优化"
-            elif shipped == expected:
-                stage = "已出货"
             elif shipped:
                 stage = "部分出货"
             else:
@@ -1792,6 +2006,18 @@ class OrderIndexStore:
                 ),
                 "validation_status": row[4],
                 "validation_message": row[10],
+                "user_note": row[11],
+                "installation": {
+                    date_type: {
+                        "days": rows,
+                        "start_date": rows[0]["date"] if rows else "",
+                        "end_date": rows[-1]["date"] if rows else "",
+                        "day_count": len(rows),
+                    }
+                    for date_type, rows in installation_by_order.get(
+                        order_id, {"planned": [], "actual": []}
+                    ).items()
+                },
                 "stage": stage,
                 "material_status": row[6],
                 "latest_split_time": latest_split_time,
@@ -2126,10 +2352,60 @@ def _load_outbound_records(config: Config) -> list[dict]:
         try:
             if connection.execute("select 1 from sqlite_master where type='table' and name='outbound_documents'").fetchone():
                 rows = connection.execute(
-                    "select document_number, document_type, order_id, factory_order, status, source, issued_at, source_path from outbound_documents"
+                    """
+                    select od.document_number, od.document_type, od.order_id,
+                           coalesce(odf.factory_order, od.factory_order) as matched_factory_order,
+                           od.factory_order as document_remark,
+                           od.status, od.source, od.issued_at, od.source_path
+                    from outbound_documents od
+                    left join outbound_document_factories odf
+                      on odf.document_number = od.document_number
+                    where odf.id is not null
+                       or not exists (
+                           select 1 from outbound_document_factories existing
+                           where existing.document_number = od.document_number
+                       )
+                    order by od.document_number, matched_factory_order
+                    """
                 ).fetchall()
+                audit_by_document: dict[str, dict] = {}
+                audit_path = config.state_dir / "inventory-outbound-records.json"
+                try:
+                    audit_payload = json.loads(audit_path.read_text(encoding="utf-8"))
+                    audit_records = audit_payload.get("records", {})
+                    if isinstance(audit_records, dict):
+                        audit_by_document = {
+                            str(record.get("document_number", "")).strip(): record
+                            for record in audit_records.values()
+                            if isinstance(record, dict)
+                            and str(record.get("document_number", "")).strip()
+                        }
+                except (OSError, TypeError, json.JSONDecodeError):
+                    audit_by_document = {}
                 return [
-                    {"document_number": row[0], "kind": row[1], "order_id": row[2], "factory_order": row[3], "remark": row[3], "status": row[4], "source": row[5], "synced_at": row[6], "source_path": row[7]}
+                    {
+                        "document_number": row[0],
+                        "kind": row[1],
+                        "order_id": row[2],
+                        "factory_order": row[3],
+                        "remark": row[3],
+                        # ``remark`` identifies the exact factory for status
+                        # matching; the header value identifies the source
+                        # document (for example, an order-level materials
+                        # document whose relation covers one factory).
+                        "document_remark": row[4],
+                        "status": row[5],
+                        "source": row[6],
+                        "synced_at": row[7],
+                        "source_path": row[8],
+                        # SQLite is authoritative for document identity and
+                        # status; the audit JSON retains the source and
+                        # mapped fingerprints needed to detect a later
+                        # material or hardware change.
+                        "raw_fingerprint": audit_by_document.get(row[0], {}).get("raw_fingerprint", ""),
+                        "mapped_fingerprint": audit_by_document.get(row[0], {}).get("mapped_fingerprint", ""),
+                        "traveler_path": audit_by_document.get(row[0], {}).get("traveler_path", row[8]),
+                    }
                     for row in rows
                 ]
         finally:
@@ -2171,6 +2447,28 @@ def _outbound_record_matches_factory(record: dict, factory: dict, *, allow_order
     return False
 
 
+def _factory_outbound_metadata(config: Config, factory: dict) -> tuple[str, str]:
+    mode = str(factory.get("outbound_mode", "")).strip()
+    fingerprint = str(factory.get("outbound_fingerprint", "")).strip()
+    if mode or fingerprint:
+        return mode, fingerprint
+    factory_order = str(factory.get("factory_order", "")).strip().upper()
+    if not factory_order or not config.workflow_database.is_file():
+        return "", ""
+    connection = sqlite3.connect(config.workflow_database)
+    try:
+        row = connection.execute(
+            "select outbound_mode, outbound_fingerprint from factory_orders where factory_order=?",
+            (factory_order,),
+        ).fetchone()
+    finally:
+        connection.close()
+    return (
+        str(row[0] or "").strip(),
+        str(row[1] or "").strip(),
+    ) if row else ("", "")
+
+
 def _refresh_outbound_status(
     config: Config,
     factory: dict,
@@ -2181,13 +2479,43 @@ def _refresh_outbound_status(
     if not factory["order_id"] or not factory["factory_name"]:
         return "未查询", ""
     records = _load_outbound_records(config) if records is None else records
+    outbound_mode, stored_fingerprint = _factory_outbound_metadata(config, factory)
+    allow_order_alias = bool(factory_group and len(factory_group) == 1)
+    exact_records = []
+    order_alias_records = []
+    exact_aliases = _outbound_exact_aliases(factory)
     for record in records:
-        if not _outbound_record_matches_factory(
-            record,
-            factory,
-            allow_order_alias=bool(factory_group and len(factory_group) == 1),
-        ):
+        if _outbound_key(record.get("order_id")) != _outbound_key(factory.get("order_id")):
             continue
+        remark = _outbound_key(record.get("remark"))
+        if remark in exact_aliases:
+            exact_records.append(record)
+        elif allow_order_alias and remark in {
+            _outbound_key(factory.get("order_id")),
+            _outbound_key(factory.get("sales_order_name")),
+        }:
+            order_alias_records.append(record)
+    # Prefer a factory-specific hardware document over an order-level
+    # materials document when both exist.  Otherwise the earlier materials
+    # number can mask the actual factory outbound document in the dashboard.
+    matching_records = exact_records + order_alias_records
+    has_inventory_record = bool(matching_records)
+    if outbound_mode == "customer_supplied" and not has_inventory_record:
+        try:
+            from .inventory import database_outbound_fingerprint
+
+            current_fingerprint = database_outbound_fingerprint(
+                config,
+                str(factory.get("order_id", "")),
+                str(factory.get("factory_order", "")),
+            )
+        except (OSError, KeyError, TypeError, ValueError, RuleError):
+            return "需要更新", ""
+        if stored_fingerprint and current_fingerprint != stored_fingerprint:
+            return "需要更新", ""
+        return "已出库", ""
+    document_numbers = []
+    for record in matching_records:
         if record.get("status") == "已出库":
             document_number = str(record.get("document_number", ""))
             recorded_raw = str(record.get("raw_fingerprint", ""))
@@ -2196,7 +2524,9 @@ def _refresh_outbound_status(
                 try:
                     from .inventory import InventorySyncStore, database_document_items, parse_traveler
 
-                    record_remark = _outbound_key(record.get("remark"))
+                    record_remark = _outbound_key(
+                        record.get("document_remark") or record.get("remark")
+                    )
                     current_items = []
                     try:
                         _, documents, _, _ = database_document_items(
@@ -2217,7 +2547,13 @@ def _refresh_outbound_status(
                         )
                     except (OSError, KeyError, TypeError, ValueError, RuleError):
                         has_database_document = False
-                    if not has_database_document:
+                    # Order-center material previews use the central SQLite
+                    # database as their source path.  If the document is no
+                    # longer present in the current database, do not pass
+                    # that SQLite path to ``parse_traveler``; an absent
+                    # document is a valid changed/removed-source case and is
+                    # compared as an empty item list below.
+                    if not has_database_document and _is_traveler_file(traveler_path):
                         traveler = parse_traveler(traveler_path)
                         current_items = next(
                             (
@@ -2226,14 +2562,28 @@ def _refresh_outbound_status(
                             ),
                             [],
                         )
+                    elif not has_database_document and not _is_traveler_file(traveler_path):
+                        # Standard order outbound records may retain the
+                        # material source workbook as ``traveler_path`` for a
+                        # room-level document. It is not a Traveler and its
+                        # sheet layout is intentionally different. Without a
+                        # matching database document, do not infer a changed
+                        # outbound document from an incompatible source file.
+                        if document_number:
+                            document_numbers.append(document_number)
+                        continue
                     if InventorySyncStore.raw_document_fingerprint(current_items) != recorded_raw:
-                        return "需要更新", document_number
-                except (OSError, KeyError, TypeError, ValueError):
+                        document_numbers.append(document_number)
+                        return "需要更新", "、".join(filter(None, document_numbers))
+                except (OSError, KeyError, TypeError, ValueError, RuleError):
                     # Keep the last confirmed shipped state when the current
                     # Traveler cannot be read; the inventory workflow will
                     # surface the concrete parse/read error on retry.
                     pass
-            return "已出库", document_number
+            if document_number:
+                document_numbers.append(document_number)
+    if document_numbers:
+        return "已出库", "、".join(dict.fromkeys(document_numbers))
     return "未出库", ""
 
 
@@ -2329,7 +2679,7 @@ def reconcile_outbound_statuses(
     rows = store.connection.execute(
         """
         select factory_order, order_id, factory_name, sales_order_name,
-               outbound_status, outbound_document
+               outbound_status, outbound_document, outbound_mode, outbound_fingerprint
         from factory_orders
         where order_id <> '' and aimes_status = 'active'
         """
@@ -2342,6 +2692,8 @@ def reconcile_outbound_statuses(
             "sales_order_name": row[3],
             "outbound_status": row[4],
             "outbound_document": row[5],
+            "outbound_mode": row[6],
+            "outbound_fingerprint": row[7],
         }
         for row in rows
     ]
@@ -2358,7 +2710,9 @@ def reconcile_outbound_statuses(
             records,
             factory_group=order_factories,
         )
-        if status not in {"已出库", "需要更新"} or not matched_document:
+        if status not in {"已出库", "需要更新"}:
+            continue
+        if not matched_document and factory["outbound_mode"] != "customer_supplied":
             continue
         desired_status = status
         if (
@@ -2369,13 +2723,22 @@ def reconcile_outbound_statuses(
         store.connection.execute(
             """
             update factory_orders
-            set outbound_status = ?, outbound_document = ?, updated_at = ?
+            set outbound_status = ?, outbound_document = ?, outbound_mode = ?,
+                outbound_fingerprint = ?, updated_at = ?
             where factory_order = ?
             """,
-            (desired_status, matched_document, _now(), factory["factory_order"]),
+            (
+                desired_status,
+                matched_document,
+                "inventory" if matched_document else factory["outbound_mode"],
+                "" if matched_document else factory["outbound_fingerprint"],
+                _now(),
+                factory["factory_order"],
+            ),
         )
         updated += 1
-    if updated:
+    resolved_issues = _resolve_fully_shipped_server_issues(config, store)
+    if updated or resolved_issues:
         store.commit()
     if owns_store:
         store.close()
@@ -2393,11 +2756,33 @@ def _orders_requiring_server_scan(
     are merged in memory so a newly split factory order can trigger a Server
     scan before the next index write.
     """
+    factories = _aimes_factory_records(store, aimes_rows)
+    records = _load_outbound_records(config)
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for factory in factories.values():
+        grouped[factory["order_id"]].append(factory)
+    result: set[str] = set()
+    for order_id, items in grouped.items():
+        statuses = {
+            _refresh_outbound_status(config, item, records, factory_group=items)[0]
+            for item in items
+        }
+        if not statuses or statuses != {"已出库"}:
+            result.add(order_id)
+    return result
+
+
+def _aimes_factory_records(
+    store: OrderIndexStore,
+    aimes_rows: list[dict] | None = None,
+) -> dict[str, dict]:
+    """Return active AIMES factory facts, optionally merged with fresh rows."""
     factories: dict[str, dict] = {}
     for row in store.connection.execute(
         """
         select factory_order, order_id, factory_name, sales_order_name,
-               split_time, outbound_status, outbound_document
+               split_time, outbound_status, outbound_document, outbound_mode,
+               outbound_fingerprint
         from factory_orders
         where name_source = 'AIMES' and aimes_status = 'active' and order_id <> ''
         """
@@ -2410,6 +2795,8 @@ def _orders_requiring_server_scan(
             "split_time": row[4],
             "outbound_status": row[5],
             "outbound_document": row[6],
+            "outbound_mode": row[7],
+            "outbound_fingerprint": row[8],
         }
     for row in aimes_rows or []:
         factory_order = str(row.get("factory_order", "")).upper().strip()
@@ -2425,21 +2812,89 @@ def _orders_requiring_server_scan(
             "split_time": str(row.get("split_time", "")).strip() or previous.get("split_time", ""),
             "outbound_status": previous.get("outbound_status", "未查询"),
             "outbound_document": previous.get("outbound_document", ""),
+            "outbound_mode": previous.get("outbound_mode", ""),
+            "outbound_fingerprint": previous.get("outbound_fingerprint", ""),
         }
 
-    records = _load_outbound_records(config)
-    grouped: dict[str, list[dict]] = defaultdict(list)
-    for factory in factories.values():
-        grouped[factory["order_id"]].append(factory)
-    result: set[str] = set()
-    for order_id, items in grouped.items():
-        statuses = {
-            _refresh_outbound_status(config, item, records, factory_group=items)[0]
-            for item in items
-        }
-        if not statuses or statuses != {"已出库"}:
-            result.add(order_id)
-    return result
+    return factories
+
+
+def _server_folder_order_ids(folder: Path) -> set[str]:
+    """Return order ids represented by a standard or mixed Server folder."""
+    if _is_standard_order_folder(folder.name):
+        return {folder.name.upper()}
+    if _is_mixed_order_folder(folder):
+        return set(_folder_order_ids(folder))
+    return set()
+
+
+def _server_folder_is_fully_shipped(
+    config: Config,
+    store: OrderIndexStore,
+    folder: Path,
+    aimes_rows: list[dict] | None = None,
+) -> bool:
+    """Return whether every known order in a standard/mixed folder is shipped.
+
+    An order without an active AIMES mapping is deliberately not considered
+    shipped: the scanner must keep the folder eligible until its identity is
+    known.  Fresh AIMES rows are merged in memory so a newly discovered factory
+    order can reopen a folder during the same sync.
+    """
+    order_ids = _server_folder_order_ids(folder)
+    if not order_ids:
+        return False
+    factories = _aimes_factory_records(store, aimes_rows)
+    mapped_order_ids = {
+        str(factory.get("order_id") or "").upper()
+        for factory in factories.values()
+        if str(factory.get("order_id") or "").strip()
+    }
+    if not order_ids.issubset(mapped_order_ids):
+        return False
+    return not (order_ids & _orders_requiring_server_scan(config, store, aimes_rows))
+
+
+def _server_folder_for_issue(issue_path: str) -> Path | None:
+    """Find the standard/mixed Server folder containing an issue path."""
+    path = Path(issue_path).expanduser()
+    # Some issues point at the offending file, while folder-level issues such
+    # as hardware selection point directly at the order folder.  Include the
+    # path itself so both forms resolve to the same Server-order boundary.
+    for candidate in (path, path.parent, *path.parents):
+        if candidate.is_dir() and (
+            _is_standard_order_folder(candidate.name)
+            or _is_mixed_order_folder(candidate)
+        ):
+            return candidate
+    return None
+
+
+def _resolve_fully_shipped_server_issues(
+    config: Config,
+    store: OrderIndexStore,
+) -> int:
+    """Close stale Server issues once every order in their folder shipped.
+
+    Material validation and hardware selection issues can be created before
+    the outbound workflow finishes.  Automatic scans correctly stop selecting
+    a fully shipped folder, so those old issues otherwise have no later
+    validation pass that could close them.  Keep the historical sync_changes
+    rows, but remove the stale open items.
+    """
+    resolvable_kinds = {"material_validation", "hardware_selection"}
+    resolved = 0
+    for issue in store.active_issues():
+        if issue.get("kind") not in resolvable_kinds or issue.get("status") != "open":
+            continue
+        folder = _server_folder_for_issue(str(issue.get("path") or ""))
+        if folder is None:
+            continue
+        if not _server_folder_is_fully_shipped(config, store, folder):
+            continue
+        store.resolve_active_issue(str(issue.get("issue_key") or ""))
+        resolved += 1
+    return resolved
 
 
 def _aimes_row_signature(rows: list[dict]) -> list[tuple[str, str, str, str]]:
@@ -2458,6 +2913,8 @@ def _persist_valid_aimes_mapping(
     config: Config,
     rows: list[dict],
     warnings: list[dict],
+    *,
+    cached_rows: list[dict] | None = None,
 ) -> None:
     """Persist only validated AIMES mapping rows.
 
@@ -2465,7 +2922,24 @@ def _persist_valid_aimes_mapping(
     are deliberately absent from both the source cache and the factory-name
     cache so a malformed AIMES sales-order name cannot become business data.
     """
-    save_aimes_order_cache(config, rows)
+    # The online endpoint intentionally returns only a recent page.  Keep the
+    # local cache as a cumulative identity cache as well, so a later 50-row
+    # fetch cannot make older, still-valid AIMES facts disappear locally.
+    cached_rows = cached_rows if cached_rows is not None else load_aimes_order_cache(config)
+    merged_rows = {
+        str(row.get("factory_order", "")).upper().strip(): row
+        for row in cached_rows
+        if str(row.get("factory_order", "")).strip()
+    }
+    for warning in warnings:
+        factory_order = str(warning.get("factory_order", "")).upper().strip()
+        if factory_order:
+            merged_rows.pop(factory_order, None)
+    for row in rows:
+        factory_order = str(row.get("factory_order", "")).upper().strip()
+        if factory_order:
+            merged_rows[factory_order] = row
+    save_aimes_order_cache(config, list(merged_rows.values()))
     names = load_factory_name_cache(config)
     for warning in warnings:
         factory_order = str(warning.get("factory_order", "")).upper().strip()
@@ -2601,6 +3075,7 @@ def sync_aimes_index(config: Config, *, force: bool = False, if_needed: bool = F
                 verification_candidates,
                 timing_sink=fetch_stage_durations,
             )
+            fetched = _merge_aimes_recent_and_verified_rows(fetched, verification_result)
         else:
             fetched = refresh_aimes_recent_orders(
                 config,
@@ -2627,7 +3102,9 @@ def sync_aimes_index(config: Config, *, force: bool = False, if_needed: bool = F
             error=message,
         )
         store.commit()
-        aimes_stage_durations = list(exc.context.get("aimes_timings", [])) if isinstance(exc, RuleError) else []
+        aimes_stage_durations = _flat_aimes_stage_durations(
+            exc.context.get("aimes_timings", []) if isinstance(exc, RuleError) else []
+        )
         result = {
             "orders": store.summaries(),
             "aimes": {
@@ -2665,9 +3142,14 @@ def sync_aimes_index(config: Config, *, force: bool = False, if_needed: bool = F
 
     changed = _aimes_row_signature(rows) != _aimes_row_signature(cached_rows)
     seen_at = _now()
-    aimes_stage_durations = list(fetch_stage_durations)
+    aimes_stage_durations = _flat_aimes_stage_durations(fetch_stage_durations)
     persist_started = time.perf_counter()
-    _persist_valid_aimes_mapping(config, rows, issues)
+    _persist_valid_aimes_mapping(
+        config,
+        rows,
+        issues,
+        cached_rows=cached_rows,
+    )
     for row in rows:
         store.upsert_order(row["sales_order_name"], aimes_seen=seen_at)
         store.upsert_aimes_factory(
@@ -2681,7 +3163,7 @@ def sync_aimes_index(config: Config, *, force: bool = False, if_needed: bool = F
     aimes_stage_durations.append({
         "stage": "mapping_write",
         "label": "写入有效映射和数据库",
-        "duration_seconds": round(time.perf_counter() - persist_started, 2),
+        "duration_seconds": round(time.perf_counter() - persist_started, 6),
     })
     verify_started = time.perf_counter()
     deleted_count, deletion_check_error = _verify_missing_aimes_factories(
@@ -2691,11 +3173,15 @@ def sync_aimes_index(config: Config, *, force: bool = False, if_needed: bool = F
     aimes_stage_durations.append({
         "stage": "deleted_verify",
         "label": "精确核验已删除工厂单",
-        "duration_seconds": round(time.perf_counter() - verify_started, 2),
+        "duration_seconds": round(time.perf_counter() - verify_started, 6),
     })
     store.replace_aimes_review_rows([])
     finished = _now()
-    elapsed_seconds = round(time.perf_counter() - operation_started, 2)
+    elapsed_seconds = round(time.perf_counter() - operation_started, 6)
+    aimes_stage_durations = _complete_aimes_stage_durations(
+        aimes_stage_durations,
+        elapsed_seconds,
+    )
     store.record_run(
         started,
         finished,
@@ -3205,23 +3691,40 @@ def _server_snapshot_folder(folder: Path) -> dict[str, dict]:
 
 def _server_snapshot(config: Config, store: OrderIndexStore) -> tuple[Path, dict[str, dict]]:
     # Automatic scans deliberately exclude standard orders whose known AIMES
-    # factory orders are all shipped.  Manual folder selection does not use
-    # this snapshot path and therefore remains an explicit override.
+    # factory orders are all shipped.  A standard folder without a persisted
+    # AIMES mapping remains a candidate: it may be a freshly cleaned order
+    # whose identity must be recovered from the next Server read.  Manual
+    # folder selection does not use this snapshot path and therefore remains
+    # an explicit override.
     roots = _available_server_roots(config)
     if not roots:
         from .order_workflow import resolve_source_root
         resolve_source_root(config.source_root)
     root = roots[0]
-    order_ids = _orders_requiring_server_scan(config, store)
     folders = []
     for server_root in roots:
         for folder in sorted(server_root.iterdir(), key=lambda item: item.name.casefold()):
             if not folder.is_dir():
                 continue
             is_order_folder = _is_standard_order_folder(folder.name)
-            if is_order_folder and not _server_folder_matches_root(folder, server_root, order_ids):
+            if is_order_folder:
+                if _order_type(folder.name) != _server_root_order_type(server_root):
+                    continue
+                if _server_folder_is_fully_shipped(config, store, folder):
+                    continue
+            if (
+                not is_order_folder
+                and _is_mixed_order_folder(folder)
+                and _server_folder_is_fully_shipped(config, store, folder)
+            ):
                 continue
-            if not is_order_folder and not _temporary_folder_is_candidate(config, store, folder):
+            if (
+                not is_order_folder
+                and _is_mixed_order_folder(folder)
+                and _server_folder_is_suppressed(store, folder)
+            ):
+                continue
+            if not is_order_folder and not _is_mixed_order_folder(folder) and not _temporary_folder_is_candidate(config, store, folder):
                 continue
             folders.append(folder)
 
@@ -3523,6 +4026,39 @@ def _trace_rows(rows: list[dict]) -> tuple[int, int]:
     return len(orders), len(factories)
 
 
+def _flat_aimes_stage_durations(values: object) -> list[dict[str, object]]:
+    """Keep only non-overlapping AIMES stages in the display contract."""
+    if not isinstance(values, list):
+        return []
+    return [
+        item
+        for item in values
+        if isinstance(item, dict)
+        and str(item.get("stage", "")).strip() not in {"attempt", "total"}
+        and "总计用时" not in str(item.get("label", ""))
+    ]
+
+
+def _complete_aimes_stage_durations(
+    values: object,
+    total_seconds: float,
+) -> list[dict[str, object]]:
+    """Make the flat stage list account for backend-only preparation/cleanup."""
+    stages = _flat_aimes_stage_durations(values)
+    tracked = sum(
+        max(0.0, float(item.get("duration_seconds", 0)))
+        for item in stages
+    )
+    residual = max(0.0, float(total_seconds) - tracked)
+    if residual >= 0.005:
+        stages.append({
+            "stage": "backend_overhead",
+            "label": "后台准备与收尾",
+            "duration_seconds": round(residual, 6),
+        })
+    return stages
+
+
 def _aimes_trace(
     config: Config,
     *,
@@ -3556,8 +4092,6 @@ def _aimes_trace(
         f"工厂单号 {factory_count} 个的工厂单名称、销售单名称和拆单时间；",
         f"写入到了 {', '.join(writes)}。",
     ]
-    if elapsed_seconds is not None:
-        trace.insert(1, f"AIMES 后台总耗时：{elapsed_seconds:.2f} 秒（包含登录、浏览器启动、重试和数据库写入）。")
     if stage_durations:
         trace.append(
             "阶段耗时："
@@ -3590,6 +4124,70 @@ def _server_scan_trace(stats: dict[str, int | float], roots: list[str] | None = 
     ]
 
 
+def _validate_materials_during_server_scan(
+    config: Config,
+    folders: list[Path],
+    seen_at: str,
+) -> None:
+    """Validate changed material workbooks in an isolated preview database.
+
+    Server scanning must not write order or factory facts, but it should still
+    tell the user that a material workbook needs manual correction before the
+    preview/confirmation step becomes available.
+    """
+    if not folders:
+        return
+    store = OrderIndexStore(config.workflow_database)
+    try:
+        for folder in folders:
+            folder_path = str(folder)
+            order_ids = _server_folder_order_ids(folder)
+            display_order_id = "、".join(sorted(order_ids))
+            try:
+                preview_server_changes(config, [folder])
+            except RuleError as exc:
+                if exc.code != "material_validation":
+                    continue
+                issue_rows = exc.context.get("issues") or []
+                if not issue_rows:
+                    issue_rows = [{"path": folder_path, "message": str(exc)}]
+                for issue in issue_rows:
+                    path = str(issue.get("path") or folder_path)
+                    message = f"material 文件校验未通过：{issue.get('message') or str(exc)}"
+                    issue_key = f"material_validation:{display_order_id}:{path}"
+                    store.upsert_active_issue(
+                        issue_key=issue_key,
+                        kind="material_validation",
+                        order_id=display_order_id,
+                        path=path,
+                        message=message,
+                        seen_at=seen_at,
+                    )
+                    store.add_change(
+                        severity="warning",
+                        kind="material_validation",
+                        order_id=display_order_id,
+                        message=message,
+                        path=path,
+                        observed_at=seen_at,
+                    )
+            except (OSError, ValueError):
+                # The metadata scan remains useful even when an isolated
+                # preview cannot be assembled for a folder without enough
+                # order evidence. The actionable material parser errors are
+                # returned as RuleError above.
+                continue
+            else:
+                for issue in store.active_issues():
+                    if issue.get("kind") != "material_validation":
+                        continue
+                    if _path_in_folders(str(issue.get("path") or ""), [folder_path]):
+                        store.resolve_active_issue(issue["issue_key"])
+        store.commit()
+    finally:
+        store.close()
+
+
 def scan_server_changes(config: Config) -> dict:
     """Compare Server metadata without advancing the processed baseline.
 
@@ -3601,6 +4199,9 @@ def scan_server_changes(config: Config) -> dict:
     store = OrderIndexStore(config.workflow_database)
     _clear_stale_server_pending_state(config, store)
     root, current = _server_snapshot(config, store)
+    _resolve_fully_shipped_server_issues(config, store)
+    store.commit()
+    scan_roots = _available_server_roots(config)
     current_folders = {item["source_folder"] for item in current.values()}
     previous_all = {
         row[0]: {
@@ -3627,7 +4228,7 @@ def scan_server_changes(config: Config) -> dict:
         for row in store.connection.execute(
             "select path, source_folder, kind, modified_at, size, order_id, content_fingerprint from source_files"
         ).fetchall()
-        if root is None or _path_is_within(Path(row[1]), root)
+        if root is None or any(_path_is_within(Path(row[1]), scan_root) for scan_root in scan_roots)
     }
     rename_pairs = _server_folder_rename_pairs(previous_all, current)
     renamed_old = {old for old, _ in rename_pairs}
@@ -3795,6 +4396,41 @@ def scan_server_changes(config: Config) -> dict:
         "deleted_count": sum(item["change_type"] == "removed" for item in changes),
         "renamed_count": sum(item["change_type"] == "renamed" for item in changes),
     }
+    existing_issues = store.active_issues()
+    changed_paths = {str(item.get("path") or "") for item in changes}
+    material_folders = {
+        str(item.get("source_folder") or "")
+        for path, item in current.items()
+        if item.get("kind") == "material"
+        and (path in changed_paths or any(
+            issue.get("kind") == "material_validation"
+            and str(issue.get("path") or "") == path
+            for issue in existing_issues
+        ))
+    }
+    material_folders.update(
+        str(item.get("source_folder") or "")
+        for item in changes
+        if item.get("kind") == "material" and item.get("source_folder")
+    )
+    material_folders = {path for path in material_folders if path}
+    for folder_path, item in current.items():
+        if item.get("kind") != "folder":
+            continue
+        if any(
+            issue.get("kind") == "material_validation"
+            and _path_is_within(Path(str(issue.get("path") or "")), Path(folder_path))
+            for issue in existing_issues
+        ):
+            material_folders.add(folder_path)
+    store.commit()
+    store.close()
+    _validate_materials_during_server_scan(
+        config,
+        [Path(path) for path in sorted(material_folders) if Path(path).is_dir()],
+        scanned_at,
+    )
+    store = OrderIndexStore(config.workflow_database)
     current_issues = store.active_issues()
     store.commit()
     store.close()
@@ -3886,9 +4522,13 @@ def _server_folders_for_sync(
                 for folder in server_root.iterdir()
                 if folder.is_dir()
                 and (
-                    (_is_standard_order_folder(folder.name) and _server_folder_matches_root(folder, server_root, order_ids))
+                    (
+                        _is_standard_order_folder(folder.name)
+                        and _server_folder_matches_root(folder, server_root, order_ids)
+                    )
                     or (
                         _is_mixed_order_folder(folder)
+                        and not _server_folder_is_fully_shipped(config, store, folder, aimes_rows)
                         and not _server_folder_is_suppressed(store, folder)
                     )
                     or (
@@ -3918,8 +4558,44 @@ def _server_folders_for_sync(
     )
 
 
+def _clear_stale_mapping_validation_status(
+    store: OrderIndexStore,
+    order_ids: set[str],
+    current_issue_keys: set[str],
+    seen_at: str,
+) -> int:
+    """Clear an old SKU validation error after its mapping is now resolved."""
+    cleared = 0
+    for order_id in sorted({value.upper() for value in order_ids if value}):
+        mapping_prefixes = (
+            f"material_mapping:{order_id}:",
+            f"hardware_mapping:{order_id}:",
+        )
+        if any(key.startswith(mapping_prefixes) for key in current_issue_keys):
+            continue
+        row = store.connection.execute(
+            "select validation_status, validation_message from orders where order_id = ?",
+            (order_id,),
+        ).fetchone()
+        if not row or row[0] != "数据异常" or "未完成商品 SKU 处理" not in (row[1] or ""):
+            continue
+        store.connection.execute(
+            "update orders set validation_status = '正常', validation_message = '', updated_at = ? where order_id = ?",
+            (seen_at, order_id),
+        )
+        cleared += 1
+    return cleared
+
+
 def _exact_resolve_unowned_factories(config: Config, candidates: dict[str, dict]) -> str:
-    """Use exact AIMES lookups only for factory orders still lacking an owner."""
+    """Use exact AIMES lookups only for factory orders absent from local DB.
+
+    The local factory-order table is the durable identity index. A Server
+    report may be re-read with only a partial name, so callers hydrate
+    candidates from that table before considering an online exact lookup.
+    Exact lookup is reserved for a genuinely new factory order that has no
+    local identity.
+    """
     missing = sorted(
         factory_order
         for factory_order, candidate in candidates.items()
@@ -3946,6 +4622,46 @@ def _exact_resolve_unowned_factories(config: Config, candidates: dict[str, dict]
     return ""
 
 
+def _merge_database_factory_candidates(
+    store: OrderIndexStore,
+    candidates: dict[str, dict],
+) -> set[str]:
+    """Reuse durable factory identity before any exact AIMES lookup."""
+    if not candidates:
+        return set()
+    placeholders = ",".join("?" for _ in candidates)
+    rows = store.connection.execute(
+        f"""
+        select factory_order, order_id, factory_name, sales_order_name,
+               split_time, name_source, has_hardware, optimized
+        from factory_orders
+        where aimes_status='active' and factory_order in ({placeholders})
+        """,
+        tuple(candidates),
+    ).fetchall()
+    found: set[str] = set()
+    for row in rows:
+        factory_order = str(row[0]).upper().strip()
+        name_source = str(row[5] or "server_report")
+        candidate_source = {
+            "AIMES": "aimes",
+            "AIMES精确查询": "aimes_exact",
+        }.get(name_source, "server")
+        _merge_candidate(
+            candidates,
+            factory_order,
+            name=str(row[2] or ""),
+            source=candidate_source,
+            order_id=str(row[1] or ""),
+            sales_order_name=str(row[3] or "") if candidate_source in {"aimes", "aimes_exact"} else "",
+            split_time=str(row[4] or "") if candidate_source in {"aimes", "aimes_exact"} else "",
+            has_hardware=bool(row[6]),
+            optimized=bool(row[7]),
+        )
+        found.add(factory_order)
+    return found
+
+
 def sync_order_index(
     config: Config,
     *,
@@ -3956,6 +4672,9 @@ def sync_order_index(
     process_temporary: bool = False,
     include_hardware: bool = True,
     full_refresh: bool = False,
+    validate_selected_orders: bool = True,
+    refresh_outbound_statuses: bool = True,
+    reconcile_outbound: bool = True,
     server_snapshot_path: Path | None = None,
 ) -> dict:
     """Refresh AIMES/Server facts into the local order index and return summaries.
@@ -3988,8 +4707,13 @@ def sync_order_index(
         phase_durations[name] = round(now - phase_started, 3)
         phase_started = now
 
+    inventory_mappings = InventoryMappings(config.workflow_database) if config.storage_prepared else None
+    # InventoryMappings opens short-lived read connections to the same
+    # workflow database.  Initialize it before OrderIndexStore starts its
+    # schema transaction, and reuse it throughout this sync.
     store = OrderIndexStore(config.workflow_database)
-    reconcile_outbound_statuses(config, store)
+    if reconcile_outbound:
+        reconcile_outbound_statuses(config, store)
     _clear_stale_server_pending_state(config, store)
     store.delete_stale_factory_ownership_issues(config.initial_date)
     changes_before = store.latest_change_id()
@@ -4029,6 +4753,10 @@ def sync_order_index(
                     verification_candidates,
                     timing_sink=fetch_stage_durations,
                 )
+                fetched_rows = _merge_aimes_recent_and_verified_rows(
+                    fetched_rows,
+                    aimes_verification_result,
+                )
             else:
                 fetched_rows = refresh_aimes_recent_orders(
                     config,
@@ -4042,13 +4770,18 @@ def sync_order_index(
                 store.ignored_aimes_keys(),
                 store.aimes_assignments(),
             )
-            aimes_stage_durations = list(fetch_stage_durations)
+            aimes_stage_durations = _flat_aimes_stage_durations(fetch_stage_durations)
             persist_started = time.perf_counter()
-            _persist_valid_aimes_mapping(config, aimes_rows, aimes_warnings)
+            _persist_valid_aimes_mapping(
+                config,
+                aimes_rows,
+                aimes_warnings,
+                cached_rows=cached_aimes_source_rows,
+            )
             aimes_stage_durations.append({
                 "stage": "mapping_write",
                 "label": "写入有效映射和数据库",
-                "duration_seconds": round(time.perf_counter() - persist_started, 2),
+                "duration_seconds": round(time.perf_counter() - persist_started, 6),
             })
             aimes_succeeded = True
             verify_started = time.perf_counter()
@@ -4059,9 +4792,13 @@ def sync_order_index(
             aimes_stage_durations.append({
                 "stage": "deleted_verify",
                 "label": "精确核验已删除工厂单",
-                "duration_seconds": round(time.perf_counter() - verify_started, 2),
+                "duration_seconds": round(time.perf_counter() - verify_started, 6),
             })
-            aimes_duration_seconds = round(time.perf_counter() - aimes_started, 2)
+            aimes_duration_seconds = round(time.perf_counter() - aimes_started, 6)
+            aimes_stage_durations = _complete_aimes_stage_durations(
+                aimes_stage_durations,
+                aimes_duration_seconds,
+            )
         except Exception as exc:
             message = _business_aimes_message(exc)
             errors.append(message)
@@ -4073,22 +4810,6 @@ def sync_order_index(
         aimes_warnings = []
     store.replace_aimes_review_rows([])
     finish_phase("load_aimes_and_local_state")
-
-    candidates: dict[str, dict] = {}
-    for row in aimes_rows:
-        if _factory_order_before_initial_date(
-            row["factory_order"], row.get("split_time", ""), config.initial_date
-        ):
-            continue
-        _merge_candidate(
-            candidates,
-            row["factory_order"],
-            name=row["factory_name"],
-            source="aimes",
-            sales_order_name=row["sales_order_name"],
-            split_time=row["split_time"],
-        )
-        store.upsert_order(row["sales_order_name"], aimes_seen=_now())
 
     snapshot_data = None
     if selected_folder is None and selected_folders is None:
@@ -4111,6 +4832,33 @@ def sync_order_index(
             root = None
             server_folders = []
     finish_phase("server_folder_selection")
+    candidates: dict[str, dict] = {}
+    candidate_aimes_rows = aimes_rows
+    if selected_folder is not None or selected_folders is not None:
+        selected_order_ids = {
+            order_id.upper()
+            for folder in server_folders
+            for order_id in _server_folder_order_ids(folder)
+        }
+        candidate_aimes_rows = [
+            row for row in aimes_rows
+            if str(row.get("sales_order_name", "")).upper().strip() in selected_order_ids
+        ]
+    for row in candidate_aimes_rows:
+        if _factory_order_before_initial_date(
+            row["factory_order"], row.get("split_time", ""), config.initial_date
+        ):
+            continue
+        _merge_candidate(
+            candidates,
+            row["factory_order"],
+            name=row["factory_name"],
+            source="aimes",
+            sales_order_name=row["sales_order_name"],
+            split_time=row["split_time"],
+        )
+        store.upsert_order(row["sales_order_name"], aimes_seen=_now())
+
     folder_count = 0
     server_seen = _now()
     seen_source_paths: set[str] = set()
@@ -4124,6 +4872,7 @@ def sync_order_index(
     changed_factory_orders: set[str] = set()
     scanned_server_folders: set[str] = set()
     current_issue_keys: set[str] = set()
+    resolved_mapping_order_ids: set[str] = set()
     temporary_processing_errors: dict[str, str] = {}
     temporary_processing_results: list[dict] = []
     exact_lookup_error = ""
@@ -4269,7 +5018,12 @@ def sync_order_index(
             for order_id in folder_order_ids:
                 store.upsert_order(
                     order_id,
-                    order_type="temporary" if manual_folder else None,
+                    # A standard or mixed Server folder is authoritative
+                    # evidence that a previously temporary-looking order is
+                    # now a normal owned/cut-to-size order.  Passing None
+                    # here used to retain a stale ``temporary`` flag forever,
+                    # which also forced the derived stage to ``待人工处理``.
+                    order_type="temporary" if manual_folder else _order_type(order_id),
                     source_folder=str(folder),
                     server_seen=server_seen,
                 )
@@ -4362,83 +5116,150 @@ def sync_order_index(
                 if kind == "fittings" and not include_hardware:
                     continue
                 if kind == "material" and config.storage_prepared:
-                    for material_order_id in folder_order_ids:
-                        try:
-                            _, parsed_materials, parsed_edges = parse_order_materials(material_order_id, path)
-                        except Exception:
-                            continue
-                        from .inventory import resolve_inventory_items, TravelerItem
+                    from .order_workflow import (
+                        _room_has_explicit_order_identity,
+                        _select_room_materials,
+                        parse_order_materials,
+                        parse_material_room_rows,
+                    )
+                    from .inventory import resolve_inventory_items, TravelerItem
 
-                        resolution_items = [
-                            (
-                                TravelerItem(
-                                    row=index,
-                                    section="板材与封边",
-                                    name=_material_inventory_name(item.kind, item.thickness, item.color),
-                                    quantity=item.quantity,
-                                    document_remark=material_order_id,
-                                ),
-                                "",
-                            )
-                            for index, item in enumerate(parsed_materials, start=1)
-                        ]
-                        resolution_items.extend(
-                            (
-                                TravelerItem(
-                                    row=len(resolution_items) + index,
-                                    section="板材与封边",
-                                    name=f"Edge banding--{color}",
-                                    quantity=quantity,
-                                    document_remark=material_order_id,
-                                ),
-                                "",
-                            )
-                            for index, (color, quantity) in enumerate(parsed_edges.items(), start=1)
+                    try:
+                        # Room-level allocation is used to preserve factory
+                        # ownership, but it must not bypass the order-level
+                        # material workbook checks. In particular, a standard
+                        # single-order folder with explicit room rows would
+                        # otherwise go straight to _select_room_materials()
+                        # and skip Color/Color Table validation entirely.
+                        validation_order_id = next(
+                            iter(folder_order_ids),
+                            display_order_id or Path(str(folder)).name,
                         )
-                        resolution = resolve_inventory_items(config, resolution_items)
-                        if resolution["missing"]:
-                            names = "、".join(dict.fromkeys(
-                                str(item.get("name", "")).strip()
-                                for item in resolution["missing"]
-                                if str(item.get("name", "")).strip()
-                            )) or "材料"
-                            issue_key = f"material_mapping:{material_order_id.upper()}:{path}"
-                            issue_message = (
-                                f"订单 {material_order_id.upper()} 存在未完成商品 SKU 处理：{names}；"
-                                "请先设置映射或加入全局忽略清单，暂未写入新的材料事实。"
+                        parse_order_materials(validation_order_id, path)
+                        room_rows = parse_material_room_rows(path)
+                        if len(folder_order_ids) > 1 and not room_rows:
+                            raise RuleError(
+                                "material_room_owner_required",
+                                f"{path.name} 同时涉及多个订单，但没有可用的 Room/section 明细；"
+                                "请在每个材料明细行填写包含订单号的工厂单名称",
                             )
-                            current_issue_keys.add(issue_key)
-                            store.upsert_active_issue(
-                                issue_key=issue_key,
-                                kind="material_mapping",
-                                order_id=material_order_id,
-                                path=str(path),
-                                message=issue_message,
-                                seen_at=server_seen,
+                        parsed_by_order: dict[str, tuple[list, dict[str, float]]] = {}
+                        for material_order_id in folder_order_ids:
+                            if room_rows and (
+                                len(folder_order_ids) > 1
+                                or _room_has_explicit_order_identity(room_rows)
+                            ):
+                                parsed_materials, parsed_edges, room_warnings = _select_room_materials(
+                                    room_rows,
+                                    material_order_id,
+                                    {},
+                                    known_order_ids=set(folder_order_ids),
+                                )
+                                if room_warnings and not parsed_materials and not parsed_edges:
+                                    raise RuleError("material_room_owner_required", room_warnings[0])
+                            else:
+                                _, parsed_materials, parsed_edges = parse_order_materials(material_order_id, path)
+                            if not parsed_materials and not parsed_edges:
+                                raise RuleError(
+                                    "material_room_owner_required",
+                                    f"{material_order_id} 没有匹配到有效材料明细；请检查 Room/section 中的工厂单名称",
+                                )
+                            parsed_by_order[material_order_id] = (parsed_materials, parsed_edges)
+
+                        mappings = inventory_mappings
+                        if mappings is None:
+                            raise RuleError("material_mapping", "库存映射数据库尚未准备好")
+                        # resolve_inventory_items reads mapping rules through a
+                        # separate SQLite connection. Commit the source-file
+                        # metadata update before opening that reader.
+                        store.commit()
+                        for material_order_id, (parsed_materials, parsed_edges) in parsed_by_order.items():
+                            resolution_items = [
+                                (
+                                    TravelerItem(
+                                        row=index,
+                                        section="板材与封边",
+                                        name=_material_inventory_name(item.kind, item.thickness, item.color),
+                                        quantity=item.quantity,
+                                        document_remark=material_order_id,
+                                    ),
+                                    "",
+                                )
+                                for index, item in enumerate(parsed_materials, start=1)
+                            ]
+                            resolution_items.extend(
+                                (
+                                    TravelerItem(
+                                        row=len(resolution_items) + index,
+                                        section="板材与封边",
+                                        name=f"Edge banding--{color}",
+                                        quantity=quantity,
+                                        document_remark=material_order_id,
+                                    ),
+                                    "",
+                                )
+                                for index, (color, quantity) in enumerate(parsed_edges.items(), start=1)
                             )
-                            store.add_change(
-                                severity="warning",
-                                kind="material_mapping",
-                                order_id=material_order_id,
-                                message=issue_message,
-                                path=str(path),
-                                observed_at=server_seen,
+                            resolution = resolve_inventory_items(config, resolution_items)
+                            if resolution["missing"]:
+                                names = "、".join(dict.fromkeys(
+                                    str(item.get("name", "")).strip()
+                                    for item in resolution["missing"]
+                                    if str(item.get("name", "")).strip()
+                                )) or "材料"
+                                raise RuleError(
+                                    "material_mapping",
+                                    f"订单 {material_order_id.upper()} 存在未完成商品 SKU 处理：{names}；"
+                                    "请先设置映射或加入全局忽略清单，暂未写入新的材料事实。",
+                                )
+
+                        for material_order_id, (parsed_materials, parsed_edges) in parsed_by_order.items():
+                            _replace_server_material_facts(
+                                store,
+                                material_order_id,
+                                path,
+                                parsed_materials,
+                                parsed_edges,
+                                mappings,
+                                server_seen,
                             )
-                            continue
-                        mappings = InventoryMappings(config.workflow_database)
-                        _replace_server_material_facts(
-                            store,
-                            material_order_id,
-                            path,
-                            parsed_materials,
-                            parsed_edges,
-                            mappings,
-                            server_seen,
+                            store.connection.execute(
+                                "update orders set material_status = '板材 · 封边', updated_at = ? where order_id = ?",
+                                (server_seen, material_order_id.upper()),
+                            )
+                            resolved_mapping_order_ids.add(material_order_id.upper())
+                        for issue in store.active_issues():
+                            if (
+                                issue.get("kind") == "material_validation"
+                                and str(issue.get("path") or "") == str(path)
+                            ):
+                                store.resolve_active_issue(issue["issue_key"])
+                    except Exception as exc:
+                        if not isinstance(exc, RuleError):
+                            exc = RuleError(
+                                "material_validation",
+                                f"无法读取或校验 material：{exc}",
+                            )
+                        issue_key = f"material_validation:{display_order_id}:{path}"
+                        issue_message = f"material 文件 {path.name} 校验未通过：{exc}"
+                        current_issue_keys.add(issue_key)
+                        store.upsert_active_issue(
+                            issue_key=issue_key,
+                            kind="material_validation",
+                            order_id=display_order_id,
+                            path=str(path),
+                            message=issue_message,
+                            seen_at=server_seen,
                         )
-                        store.connection.execute(
-                            "update orders set material_status = '板材 · 封边', updated_at = ? where order_id = ?",
-                            (server_seen, material_order_id.upper()),
+                        store.add_change(
+                            severity="warning",
+                            kind="material_validation",
+                            order_id=display_order_id,
+                            message=issue_message,
+                            path=str(path),
+                            observed_at=server_seen,
                         )
+                        continue
                 if manual_folder and kind in {"board", "fittings"}:
                     continue
                 if (
@@ -4546,7 +5367,9 @@ def sync_order_index(
                         if config.storage_prepared:
                             from .inventory import ignored_hardware_reason, resolve_inventory_items, TravelerItem
 
-                            mappings = InventoryMappings(config.workflow_database)
+                            mappings = inventory_mappings
+                            if mappings is None:
+                                raise RuleError("hardware_mapping", "库存映射数据库尚未准备好")
                             # A Fittingslist can be copied into a folder whose
                             # name is no longer its AIMES owner. Clear the old
                             # projection for this source before rebuilding it;
@@ -4561,6 +5384,7 @@ def sync_order_index(
                                 and selected_groups
                                 and not order_hint.upper().startswith("CS")
                             ):
+                                store.commit()
                                 resolution_items = [
                                     (
                                         TravelerItem(
@@ -4633,6 +5457,7 @@ def sync_order_index(
                                             (hardware_order_id, factory_order.upper(), "factory_order", item.code, item.name,
                                              item.size, float(item.quantity), item.unit, "aicnc", str(path), "", server_seen),
                                         )
+                                resolved_mapping_order_ids.add(order_hint.upper())
                         store.update_source_file_identity(
                             path,
                             order_id=order_hint,
@@ -4711,8 +5536,16 @@ def sync_order_index(
             config.initial_date,
         )
     }
+    _merge_database_factory_candidates(store, candidates)
     exact_lookup_error = _exact_resolve_unowned_factories(config, candidates)
     effective = {}
+    outbound_records = _load_outbound_records(config) if refresh_outbound_statuses else []
+    outbound_metadata = {
+        str(row[0]).upper(): (str(row[1] or ""), str(row[2] or ""))
+        for row in store.connection.execute(
+            "select factory_order, outbound_mode, outbound_fingerprint from factory_orders"
+        ).fetchall()
+    }
     for factory_order, candidate in candidates.items():
         item = _effective_factory_candidate(factory_order, candidate)
         effective[factory_order] = item
@@ -4743,15 +5576,26 @@ def sync_order_index(
                 message=issue_message,
                 path=item["source_folder"],
             )
-        outbound_status, outbound_document = _refresh_outbound_status(config, item)
-        if (
-            outbound_status == "已出库"
-            and (
-                factory_order.upper() in changed_factory_orders
-                or item["order_id"].upper() in changed_order_level_ids
+        item["outbound_mode"], item["outbound_fingerprint"] = outbound_metadata.get(
+            factory_order.upper(), ("", "")
+        )
+        if refresh_outbound_statuses:
+            outbound_status, outbound_document = _refresh_outbound_status(
+                config,
+                item,
+                outbound_records,
             )
-        ):
-            outbound_status = "需要更新"
+            if (
+                outbound_status == "已出库"
+                and (
+                    factory_order.upper() in changed_factory_orders
+                    or item["order_id"].upper() in changed_order_level_ids
+                )
+            ):
+                outbound_status = "需要更新"
+        else:
+            outbound_status = None
+            outbound_document = None
         item["outbound_status"] = outbound_status
         item["outbound_document"] = outbound_document
         store.upsert_factory(
@@ -4836,9 +5680,11 @@ def sync_order_index(
     ).fetchall())
     full_validation = bool(
         full_refresh
-        or selected_folder is not None
-        or selected_folders is not None
         or process_temporary
+        or (
+            validate_selected_orders
+            and (selected_folder is not None or selected_folders is not None)
+        )
     )
     validation_rows = all_validation_rows if full_refresh else [
         row for row in all_validation_rows
@@ -4937,6 +5783,13 @@ def sync_order_index(
 
     finish_phase("order_validation")
 
+    _clear_stale_mapping_validation_status(
+        store,
+        resolved_mapping_order_ids,
+        current_issue_keys,
+        server_seen,
+    )
+
     if root is not None:
         store.resolve_active_issues_not_in(
             current_issue_keys,
@@ -4953,7 +5806,8 @@ def sync_order_index(
         error="；".join(errors),
     )
     store.commit()
-    reconcile_outbound_statuses(config, store)
+    if reconcile_outbound:
+        reconcile_outbound_statuses(config, store)
     finish_phase("finalize_and_commit")
     if root is None:
         server_trace = [
@@ -5046,6 +5900,980 @@ def process_server_folder(
         process_temporary=process_temporary,
         include_hardware=include_hardware,
     )
+
+
+def _server_preview_directory(config: Config) -> Path:
+    directory = config.state_dir / "server-previews"
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _server_preview_path(config: Config, token: str) -> Path:
+    token = str(token or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise ValueError("Server 预览标识无效，请重新扫描")
+    path = _server_preview_directory(config) / token / "workflow.sqlite3"
+    if not path.is_file():
+        raise ValueError("Server 预览已失效，请重新扫描")
+    return path
+
+
+def _clone_workflow_database(config: Config, destination: Path) -> None:
+    """Clone the production index without copying its WAL files by hand."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if config.workflow_database.is_file():
+        source = sqlite3.connect(config.workflow_database)
+        target = sqlite3.connect(destination)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+    else:
+        target = sqlite3.connect(destination)
+        target.close()
+
+
+def _preview_config(config: Config, state_dir: Path) -> Config:
+    return Config(
+        source_root=config.source_root,
+        order_root=state_dir / "travelers",
+        template=config.template,
+        backup_root=config.backup_root,
+        state_dir=state_dir,
+        initial_date=config.initial_date,
+        server_scan_baseline_folder=config.server_scan_baseline_folder,
+        server_scan_baseline_at=config.server_scan_baseline_at,
+        aimes_username=config.aimes_username,
+        aimes_keychain_service=config.aimes_keychain_service,
+        aimes_retry_delays=config.aimes_retry_delays,
+        operation_log_enabled=False,
+        storage_prepared=True,
+    )
+
+
+def _path_in_folders(path: str, folders: list[str]) -> bool:
+    try:
+        path_value = Path(path).expanduser().resolve()
+        return any(
+            path_value == (folder_value := Path(folder).expanduser().resolve())
+            or folder_value in path_value.parents
+            for folder in folders
+        )
+    except (OSError, RuntimeError, ValueError):
+        return any(path == folder or path.startswith(folder.rstrip("/") + "/") for folder in folders)
+
+
+def _server_material_allocation_rows(
+    store: OrderIndexStore,
+    source_path: str,
+    material_key: str,
+) -> list[dict]:
+    rows = store.connection.execute(
+        """
+        select order_id, allocated_quantity, material_type, color,
+               thickness, unit, edge
+        from server_material_allocations
+        where source_path = ?
+        order by order_id
+        """,
+        (source_path,),
+    ).fetchall()
+    return [
+        {
+            "order_id": str(row[0]).upper(),
+            "quantity": float(row[1] or 0),
+        }
+        for row in rows
+        if _server_material_identity_key(
+            source_path, row[2], row[3], row[4], row[5], row[6]
+        ) == material_key
+    ]
+
+
+def _server_material_identity_key(
+    source_path: str,
+    material_type: str,
+    color: str,
+    thickness: str,
+    unit: str,
+    edge: str,
+) -> str:
+    """Return a stable identity for one parsed Server material fact.
+
+    ``material_items.id`` is an SQLite row id and changes whenever a source
+    workbook is refreshed.  Allocation records must therefore use the source
+    path and normalized material fields instead of that transient id.
+    """
+    values = [
+        str(value or "").strip().casefold()
+        for value in (source_path, material_type, color, thickness, unit, edge)
+    ]
+    return "v2:" + hashlib.sha256("\x1f".join(values).encode()).hexdigest()
+
+
+def _server_material_preview_row(store: OrderIndexStore, row: tuple) -> dict:
+    (
+        material_id,
+        provisional_order_id,
+        material_type,
+        color,
+        thickness,
+        quantity,
+        unit,
+        edge,
+        source_path,
+        source_fingerprint,
+    ) = row
+    source_quantity = float(quantity or 0)
+    material_key = _server_material_identity_key(
+        str(source_path or ""), material_type, color, thickness, unit, edge
+    )
+    allocations = _server_material_allocation_rows(store, str(source_path or ""), material_key)
+    allocated_quantity = sum(item["quantity"] for item in allocations)
+    return {
+        "material_id": int(material_id),
+        "source_order_id": str(provisional_order_id or "").upper(),
+        "material_type": str(material_type or ""),
+        "color": str(color or ""),
+        "thickness": str(thickness or ""),
+        "quantity": source_quantity,
+        "source_quantity": source_quantity,
+        "allocated_quantity": allocated_quantity,
+        "remaining_quantity": max(0.0, source_quantity - allocated_quantity),
+        "unit": str(unit or ""),
+        "edge": str(edge or ""),
+        "source_path": str(source_path or ""),
+        "source_fingerprint": str(source_fingerprint or ""),
+        "allocations": allocations,
+    }
+
+
+def _server_material_source_rows(
+    store: OrderIndexStore,
+    folder_paths: list[str],
+) -> list[tuple]:
+    rows = store.connection.execute(
+        """
+        select id, order_id, material_type, color, thickness, quantity,
+               unit, edge, source_path, source_fingerprint
+        from material_items
+        where source_type = 'aihouse'
+        order by source_path, id
+        """
+    ).fetchall()
+    return [row for row in rows if _path_in_folders(str(row[8] or ""), folder_paths)]
+
+
+def _server_material_sort_key(item: dict) -> tuple:
+    kind = str(item.get("material_type", "")).casefold()
+    try:
+        thickness = float(item.get("thickness") or 0)
+    except (TypeError, ValueError):
+        thickness = 0.0
+    return (
+        {"plywood": 0, "panel": 1, "back": 2, "edge": 3}.get(kind, 9),
+        str(item.get("color", "")).casefold(),
+        thickness,
+        str(item.get("source_path", "")).casefold(),
+        int(item.get("material_id", 0) or 0),
+    )
+
+
+def _server_preview_payload(
+    config: Config,
+    preview_path: Path,
+    token: str,
+    folders: list[Path],
+    include_hardware: bool,
+) -> dict:
+    store = OrderIndexStore(preview_path)
+    folder_paths = [str(folder) for folder in folders]
+    order_ids: set[str] = set()
+    source_rows = store.connection.execute(
+        "select path, source_folder, kind, order_id, factory_order, batch_number from source_files"
+    ).fetchall()
+    for path, source_folder, kind, order_id, factory_order, batch_number in source_rows:
+        if not _path_in_folders(str(source_folder), folder_paths):
+            continue
+        order_ids.update(
+            value.strip().upper()
+            for value in str(order_id or "").split("、")
+            if value.strip()
+        )
+
+    material_source_rows = _server_material_source_rows(store, folder_paths)
+    material_sources = [
+        _server_material_preview_row(store, row)
+        for row in material_source_rows
+    ]
+    for item in material_sources:
+        if item["source_order_id"]:
+            order_ids.add(item["source_order_id"])
+    materials_by_order: dict[str, list[dict]] = defaultdict(list)
+    for item in material_sources:
+        order_id = str(item.get("source_order_id", "")).strip().upper()
+        if order_id:
+            materials_by_order[order_id].append(item)
+    material_sources.sort(key=_server_material_sort_key)
+    for items in materials_by_order.values():
+        items.sort(key=_server_material_sort_key)
+
+    factory_rows = store.connection.execute(
+        """
+        select factory_order, order_id, factory_name, sales_order_name, split_time,
+               name_source, source_folder, report_state, ownership_status,
+               has_hardware, optimized, outbound_status, outbound_document,
+               production_batch_id
+        from factory_orders
+        where order_id <> ''
+        order by order_id, factory_order
+        """
+    ).fetchall()
+    factories_by_order: dict[str, list[dict]] = defaultdict(list)
+    selected_factories: set[str] = set()
+    for row in factory_rows:
+        factory_order, order_id = str(row[0]), str(row[1]).upper()
+        source_folder = str(row[6] or "")
+        if order_id not in order_ids and not _path_in_folders(source_folder, folder_paths):
+            continue
+        order_ids.add(order_id)
+        selected_factories.add(factory_order.upper())
+        hardware = []
+        if include_hardware:
+            hardware = [
+                {
+                    "product_code": str(item[0] or ""),
+                    "name": str(item[1] or ""),
+                    "spec": str(item[2] or ""),
+                    "quantity": float(item[3] or 0),
+                    "unit": str(item[4] or ""),
+                    "source_path": str(item[5] or ""),
+                }
+                for item in store.connection.execute(
+                    """
+                    select product_code, name, spec, quantity, unit, source_path
+                    from hardware_items
+                    where factory_order = ?
+                    order by id
+                    """,
+                    (factory_order.upper(),),
+                ).fetchall()
+            ]
+        factories_by_order[order_id].append({
+            "factory_order": factory_order,
+            "factory_name": str(row[2] or ""),
+            "sales_order_name": str(row[3] or ""),
+            "split_time": str(row[4] or ""),
+            "name_source": str(row[5] or ""),
+            "source_folder": source_folder,
+            "report_state": str(row[7] or ""),
+            "ownership_status": str(row[8] or ""),
+            "has_hardware": bool(row[9]),
+            "optimized": bool(row[10]),
+            "outbound_status": str(row[11] or ""),
+            "outbound_document": str(row[12] or ""),
+            "production_batch_id": row[13],
+            "hardware": hardware,
+        })
+
+    orders = []
+    for order_id in sorted(order_ids):
+        row = store.connection.execute(
+            "select order_id, source_folder, validation_status, validation_message, material_status from orders where order_id = ?",
+            (order_id,),
+        ).fetchone()
+        if row is None:
+            continue
+        source_paths = sorted({
+            str(path)
+            for path, source_folder, kind, source_order_id, factory_order, batch_number in source_rows
+            if _path_in_folders(str(source_folder), folder_paths)
+            and (
+                order_id in str(source_order_id or "").upper().split("、")
+                or order_id in str(store.connection.execute(
+                    "select order_id from factory_orders where factory_order = ?",
+                    (str(factory_order or "").split(",")[0].upper(),),
+                ).fetchone() or "")
+            )
+        })
+        orders.append({
+            "order_id": order_id,
+            "source_folder": str(row[1] or ""),
+            "validation_status": str(row[2] or ""),
+            "validation_message": str(row[3] or ""),
+            "material_status": str(row[4] or ""),
+            "materials": materials_by_order.get(order_id, []),
+            "factories": factories_by_order.get(order_id, []),
+            "source_paths": source_paths,
+        })
+    store.close()
+    return {
+        "token": token,
+        "created_at": _now(),
+        "include_hardware": include_hardware,
+        "source_folders": folder_paths,
+        "materials": material_sources,
+        "orders": orders,
+    }
+
+
+def preview_server_changes(
+    config: Config,
+    selected_folders: list[Path],
+    *,
+    include_hardware: bool = True,
+) -> dict:
+    """Parse Server changes into an isolated SQLite preview.
+
+    No production order, factory, material, or hardware facts are changed by
+    this command. The preview file is kept until the selected factory-order
+    evidence has been confirmed or the user starts a new scan. Material facts
+    are assigned to orders while parsing the source workbook.
+    """
+    if not selected_folders:
+        raise ValueError("请先选择要预览的 Server 文件夹")
+    normalized_folders = [folder.expanduser().resolve() for folder in selected_folders]
+    _server_folders_for_sync(config, None, selected_folders=normalized_folders)
+    token = uuid.uuid4().hex
+    stage_state_dir = _server_preview_directory(config) / token
+    preview_path = stage_state_dir / "workflow.sqlite3"
+    _clone_workflow_database(config, preview_path)
+    stage_config = _preview_config(config, stage_state_dir)
+    try:
+        # Product mappings and the order index share the central SQLite file;
+        # create the shadow product tables before opening OrderIndexStore so
+        # the preview never tries to migrate the same file while it is locked.
+        from .inventory import bootstrap_product_database
+        bootstrap_product_database(stage_config)
+        # The preview intentionally never runs temporary-order outbound or
+        # traveler generation. Those are separate user-approved operations.
+        sync_order_index(
+            stage_config,
+            selected_folders=normalized_folders,
+            process_temporary=False,
+            include_hardware=include_hardware,
+            full_refresh=False,
+            validate_selected_orders=False,
+            refresh_outbound_statuses=False,
+            reconcile_outbound=False,
+        )
+        preview_store = OrderIndexStore(preview_path)
+        try:
+            material_issues = preview_store.connection.execute(
+                "select path, message from active_issues where kind = 'material_validation' and status = 'open' order by path"
+            ).fetchall()
+            if material_issues:
+                issue_details = [
+                    {"path": str(path or ""), "message": str(message or "")}
+                    for path, message in material_issues
+                    if _path_in_folders(str(path or ""), [str(folder) for folder in normalized_folders])
+                ]
+                if issue_details:
+                    summary = "；".join(
+                        f"{item['path']}: {item['message']}" for item in issue_details
+                    )
+                    raise RuleError(
+                        "material_validation",
+                        f"材料文件尚未通过校验：{summary}。请手工修正 Room/section 后重新扫描 Server",
+                        issues=issue_details,
+                    )
+            preview_store.connection.executemany(
+                "insert or replace into server_material_preview_scopes(source_folder) values(?)",
+                [(str(folder),) for folder in normalized_folders],
+            )
+            preview_store.commit()
+        finally:
+            preview_store.close()
+        payload = _server_preview_payload(
+            config, preview_path, token, normalized_folders, include_hardware
+        )
+        if not payload["orders"]:
+            raise ValueError("Server 文件夹中没有解析出可确认的订单和工厂单")
+        return {"server_write_preview": payload}
+    except Exception:
+        shutil.rmtree(stage_state_dir, ignore_errors=True)
+        raise
+    finally:
+        # Keep only the SQLite snapshot. Temporary traveler/cache files are
+        # never part of the user confirmation payload.
+        for child in stage_config.state_dir.iterdir() if stage_config.state_dir.is_dir() else []:
+            if child != preview_path:
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+
+
+def allocate_server_material(
+    config: Config,
+    token: str,
+    material_id: int,
+    order_id: str,
+    quantity: float,
+) -> dict:
+    """Record one order-level material allocation in the shadow database."""
+    preview_path = _server_preview_path(config, token)
+    order_id = str(order_id or "").strip().upper()
+    try:
+        quantity = float(quantity)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("分配数量必须是数字") from exc
+    if not order_id:
+        raise ValueError("材料分配需要目标订单号")
+    if quantity <= MATERIAL_ALLOCATION_EPSILON:
+        raise ValueError("分配数量必须大于 0")
+    preview = OrderIndexStore(preview_path)
+    try:
+        if preview.connection.execute(
+            "select 1 from orders where order_id = ?", (order_id,)
+        ).fetchone() is None:
+            raise ValueError("所选订单不在本次 Server 预览中")
+        row = preview.connection.execute(
+            """
+            select id, order_id, material_type, color, thickness, quantity,
+                   unit, edge, source_path, source_fingerprint
+            from material_items
+            where id = ? and source_type = 'aihouse'
+            """,
+            (int(material_id),),
+        ).fetchone()
+        if row is None:
+            raise ValueError("所选材料明细不在本次 Server 预览中")
+        source_quantity = float(row[5] or 0)
+        source_path = str(row[8] or "")
+        material_key = _server_material_identity_key(
+            source_path, row[2], row[3], row[4], row[6], row[7]
+        )
+        allocation_rows = preview.connection.execute(
+            """
+            select id, order_id, allocated_quantity, material_type, color,
+                   thickness, unit, edge
+            from server_material_allocations
+            where source_path = ?
+            """,
+            (source_path,),
+        ).fetchall()
+        matching_allocations = [
+            item for item in allocation_rows
+            if _server_material_identity_key(
+                source_path, item[3], item[4], item[5], item[6], item[7]
+            ) == material_key
+        ]
+        allocated = sum(float(item[2] or 0) for item in matching_allocations)
+        remaining = source_quantity - float(allocated or 0)
+        if quantity - remaining > MATERIAL_ALLOCATION_EPSILON:
+            raise ValueError(
+                f"分配数量超过剩余数量：剩余 {remaining:g} {row[6] or ''}，本次 {quantity:g}"
+            )
+        now = _now()
+        existing = next(
+            (item for item in matching_allocations if str(item[1]).upper() == order_id),
+            None,
+        )
+        source_key = material_key
+        if existing is None:
+            preview.connection.execute(
+                """
+                insert into server_material_allocations(
+                    source_material_id, source_path, source_material_key,
+                    material_type, color, thickness, unit, edge,
+                    source_quantity, order_id, allocated_quantity,
+                    source_fingerprint, created_at, updated_at
+                ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    int(material_id), source_path, source_key,
+                    str(row[2] or ""), str(row[3] or ""), str(row[4] or ""),
+                    str(row[6] or ""), str(row[7] or ""), source_quantity,
+                    order_id, quantity, str(row[9] or ""), now, now,
+                ),
+            )
+        else:
+            preview.connection.execute(
+                """
+                update server_material_allocations
+                set allocated_quantity = ?, updated_at = ?
+                where id = ?
+                """,
+                (float(existing[1]) + quantity, now, int(existing[0])),
+            )
+        preview.connection.commit()
+        material = _server_material_preview_row(preview, row)
+        return {
+            "server_material_allocated": True,
+            "material": material,
+            "order_id": order_id,
+        }
+    finally:
+        preview.close()
+
+
+def confirm_server_material_allocations(
+    config: Config,
+    token: str,
+    *,
+    confirm_write: bool = False,
+) -> dict:
+    """Write balanced order-level material allocations to production."""
+    if not confirm_write:
+        raise RuleError("write_confirmation_required", "材料分配写入需要用户明确确认")
+    preview_path = _server_preview_path(config, token)
+    preview = OrderIndexStore(preview_path)
+    try:
+        scope_paths = [
+            str(row[0])
+            for row in preview.connection.execute(
+                "select source_folder from server_material_preview_scopes order by source_folder"
+            ).fetchall()
+        ]
+        material_rows = _server_material_source_rows(preview, scope_paths)
+        if not material_rows:
+            raise ValueError("本次预览没有可写入的板材或封边条")
+        allocations_by_material: dict[str, list[tuple]] = defaultdict(list)
+        for row in preview.connection.execute(
+            """
+            select id, source_path, order_id, allocated_quantity,
+                   material_type, color, thickness, unit, edge
+            from server_material_allocations
+            order by source_path, order_id, id
+            """
+        ).fetchall():
+            allocation_key = _server_material_identity_key(
+                row[1], row[4], row[5], row[6], row[7], row[8]
+            )
+            allocations_by_material[allocation_key].append(
+                (int(row[0]), str(row[2]).upper(), float(row[3] or 0))
+            )
+        # Material room ownership is already explicit in the Server workbook
+        # and is persisted as source_order_id during the read-only preview.
+        # Default unallocated quantity to that source order so confirmation
+        # never asks the user to select a factory order for order-level
+        # material facts. Existing manual splits remain untouched.
+        for row in material_rows:
+            source_order_id = str(row[1] or "").strip().upper()
+            source_quantity = float(row[5] or 0)
+            source_path = str(row[8] or "")
+            source_key = _server_material_identity_key(
+                source_path, row[2], row[3], row[4], row[6], row[7]
+            )
+            material_allocations = allocations_by_material[source_key]
+            allocated_quantity = sum(
+                float(item[2] or 0) for item in material_allocations
+            )
+            remaining = source_quantity - allocated_quantity
+            if remaining <= MATERIAL_ALLOCATION_EPSILON:
+                continue
+            if not source_order_id:
+                raise ValueError(
+                    f"材料 {row[3] or row[2] or '未命名'} 没有明确订单归属，不能自动确认"
+                )
+            now = _now()
+            existing_index = next(
+                (
+                    index for index, item in enumerate(material_allocations)
+                    if item[1] == source_order_id
+                ),
+                None,
+            )
+            existing = (
+                material_allocations[existing_index]
+                if existing_index is not None else None
+            )
+            if existing is None:
+                cursor = preview.connection.execute(
+                    """
+                    insert into server_material_allocations(
+                        source_material_id, source_path, source_material_key,
+                        material_type, color, thickness, unit, edge,
+                        source_quantity, order_id, allocated_quantity,
+                        source_fingerprint, created_at, updated_at
+                    ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        int(row[0]), source_path, source_key,
+                        str(row[2] or ""), str(row[3] or ""), str(row[4] or ""),
+                        str(row[6] or ""), str(row[7] or ""), source_quantity,
+                        source_order_id, remaining, str(row[9] or ""), now, now,
+                    ),
+                )
+                material_allocations.append(
+                    (int(cursor.lastrowid), source_order_id, remaining)
+                )
+            else:
+                preview.connection.execute(
+                    """
+                    update server_material_allocations
+                    set allocated_quantity = allocated_quantity + ?, updated_at = ?
+                    where id = ?
+                    """,
+                    (remaining, now, int(existing[0])),
+                )
+                material_allocations[existing_index] = (
+                    existing[0], existing[1], existing[2] + remaining
+                )
+        for row in material_rows:
+            source_quantity = float(row[5] or 0)
+            source_key = _server_material_identity_key(
+                str(row[8] or ""), row[2], row[3], row[4], row[6], row[7]
+            )
+            allocated_quantity = sum(
+                float(item[2] or 0) for item in allocations_by_material[source_key]
+            )
+            if abs(source_quantity - allocated_quantity) > MATERIAL_ALLOCATION_EPSILON:
+                remaining = source_quantity - allocated_quantity
+                raise ValueError(
+                    f"材料尚未分配完成：{row[3] or row[2] or '未命名'}，"
+                    f"还差 {remaining:g} {row[6] or ''}"
+                )
+        affected_orders = sorted({
+            str(item[1]).upper()
+            for values in allocations_by_material.values()
+            for item in values
+        })
+        if not affected_orders:
+            raise ValueError("请先将板材和封边条分配到订单")
+        source_paths = sorted({str(row[8] or "") for row in material_rows if row[8]})
+        orders_by_source_path: dict[str, set[str]] = defaultdict(set)
+        for row in material_rows:
+            source_key = _server_material_identity_key(
+                str(row[8] or ""), row[2], row[3], row[4], row[6], row[7]
+            )
+            for allocation in allocations_by_material[source_key]:
+                orders_by_source_path[str(row[8] or "")].add(str(allocation[1]).upper())
+        production = OrderIndexStore(config.workflow_database)
+        try:
+            production.connection.execute("begin")
+            order_columns = [
+                item[1]
+                for item in preview.connection.execute("pragma table_info(orders)").fetchall()
+            ]
+            for order_id in affected_orders:
+                order_row = preview.connection.execute(
+                    "select * from orders where order_id = ?", (order_id,)
+                ).fetchone()
+                if order_row is None:
+                    raise ValueError(f"目标订单不存在：{order_id}")
+                placeholders = ",".join("?" for _ in order_columns)
+                production.connection.execute(
+                    f"insert or replace into orders({','.join(order_columns)}) values({placeholders})",
+                    tuple(order_row),
+                )
+                for source_path in source_paths:
+                    production.connection.execute(
+                        """
+                        delete from material_items
+                        where order_id = ? and source_type = 'aihouse' and source_path = ?
+                        """,
+                        (order_id, source_path),
+                    )
+
+            material_columns = (
+                "order_id", "material_type", "color", "thickness", "quantity",
+                "unit", "edge", "source_type", "source_path", "source_fingerprint", "updated_at",
+            )
+            material_sql = f"""
+                insert into material_items({','.join(material_columns)})
+                values({','.join('?' for _ in material_columns)})
+                on conflict(order_id, material_type, color, thickness, unit, edge, source_type, source_path)
+                do update set
+                    quantity = material_items.quantity + excluded.quantity,
+                    source_fingerprint = excluded.source_fingerprint,
+                    updated_at = excluded.updated_at
+            """
+            now = _now()
+            for row in material_rows:
+                source_key = _server_material_identity_key(
+                    str(row[8] or ""), row[2], row[3], row[4], row[6], row[7]
+                )
+                for allocation in allocations_by_material[source_key]:
+                    production.connection.execute(
+                        material_sql,
+                        (
+                            str(allocation[1]).upper(), str(row[2] or ""), str(row[3] or ""),
+                            str(row[4] or ""), float(allocation[2] or 0), str(row[6] or ""),
+                            str(row[7] or ""), "aihouse", str(row[8] or ""),
+                            str(row[9] or ""), now,
+                        ),
+                    )
+
+            allocation_columns = [
+                item[1]
+                for item in preview.connection.execute(
+                    "pragma table_info(server_material_allocations)"
+                ).fetchall()
+            ]
+            allocation_insert_columns = [
+                column for column in allocation_columns if column != "id"
+            ]
+            for source_path in source_paths:
+                production.connection.execute(
+                    "delete from server_material_allocations where source_path = ?",
+                    (source_path,),
+                )
+            allocation_placeholders = ",".join("?" for _ in source_paths)
+            allocation_rows = (
+                preview.connection.execute(
+                    f"select * from server_material_allocations where source_path in ({allocation_placeholders})",
+                    tuple(source_paths),
+                ).fetchall()
+                if source_paths
+                else []
+            )
+            if allocation_rows:
+                id_index = allocation_columns.index("id")
+                placeholders = ",".join("?" for _ in allocation_insert_columns)
+                production.connection.executemany(
+                    f"insert or replace into server_material_allocations({','.join(allocation_insert_columns)}) values({placeholders})",
+                    [tuple(value for index, value in enumerate(row) if index != id_index) for row in allocation_rows],
+                )
+
+            source_columns = [
+                item[1]
+                for item in preview.connection.execute("pragma table_info(source_files)").fetchall()
+            ]
+            source_order_index = source_columns.index("order_id")
+            for source_path in source_paths:
+                source_row = preview.connection.execute(
+                    "select * from source_files where path = ?", (source_path,)
+                ).fetchone()
+                if source_row is None:
+                    continue
+                values = list(source_row)
+                existing_orders = {
+                    value.strip().upper()
+                    for value in str(values[source_order_index] or "").split("、")
+                    if value.strip()
+                }
+                existing_orders.update(orders_by_source_path.get(source_path, set()))
+                values[source_order_index] = "、".join(sorted(existing_orders))
+                placeholders = ",".join("?" for _ in source_columns)
+                production.connection.execute(
+                    f"insert or replace into source_files({','.join(source_columns)}) values({placeholders})",
+                    tuple(values),
+                )
+
+            production.connection.commit()
+            # A successful transaction is not enough for the UI to claim
+            # completion. Read the committed rows back from the production
+            # database and verify the exact source-path quantities.
+            for order_id in affected_orders:
+                expected = defaultdict(float)
+                for row in material_rows:
+                    source_key = _server_material_identity_key(
+                        str(row[8] or ""), row[2], row[3], row[4], row[6], row[7]
+                    )
+                    for allocation in allocations_by_material[source_key]:
+                        if str(allocation[1]).upper() != order_id:
+                            continue
+                        expected[
+                            (
+                                str(row[2] or ""), str(row[3] or ""),
+                                str(row[4] or ""), str(row[6] or ""), str(row[7] or ""),
+                            )
+                        ] += float(allocation[2] or 0)
+                actual = {
+                    (
+                        str(row[0] or ""), str(row[1] or ""),
+                        str(row[2] or ""), str(row[3] or ""), str(row[4] or ""),
+                    ): float(row[5] or 0)
+                    for row in production.connection.execute(
+                        """
+                        select material_type, color, thickness, unit, edge,
+                               sum(quantity)
+                        from material_items
+                        where order_id = ? and source_type = 'aihouse'
+                          and source_path in ({})
+                        group by material_type, color, thickness, unit, edge
+                        """.format(",".join("?" for _ in source_paths)),
+                        (order_id, *source_paths),
+                    ).fetchall()
+                }
+                if set(expected) != set(actual) or any(
+                    abs(expected[key] - actual.get(key, 0.0)) > MATERIAL_ALLOCATION_EPSILON
+                    for key in expected
+                ):
+                    raise RuleError(
+                        "server_material_persistence",
+                        f"订单 {order_id} 的材料写入后回读数量不一致，已停止报告成功",
+                        order_id=order_id,
+                    )
+        except Exception:
+            production.connection.rollback()
+            raise
+        finally:
+            production.close()
+        return {
+            "server_material_write_confirmed": True,
+            "orders": affected_orders,
+            "material_count": len(material_rows),
+            "database": str(config.workflow_database),
+        }
+    finally:
+        preview.close()
+
+
+def confirm_server_material_preview(
+    config: Config,
+    token: str,
+    *,
+    confirm_write: bool = False,
+) -> dict:
+    """Confirm all order-level materials in a Server preview at once."""
+    result = confirm_server_material_allocations(
+        config,
+        token,
+        confirm_write=confirm_write,
+    )
+    result["confirmation_mode"] = "order_materials"
+    result["factory_order_selection_required"] = False
+    return result
+
+
+def confirm_server_preview(
+    config: Config,
+    token: str,
+    order_id: str,
+    factory_order: str,
+    *,
+    confirm_write: bool = False,
+) -> dict:
+    """Merge only the selected order/factory evidence into production."""
+    if not confirm_write:
+        raise RuleError("write_confirmation_required", "写入 Server 订单事实需要用户明确确认")
+    preview_path = _server_preview_path(config, token)
+    order_id = str(order_id or "").strip().upper()
+    factory_order = str(factory_order or "").strip().upper()
+    if not order_id or not factory_order:
+        raise ValueError("确认写入需要订单号和工厂单号")
+    preview = OrderIndexStore(preview_path)
+    selected = preview.connection.execute(
+        "select * from factory_orders where factory_order = ? and order_id = ?",
+        (factory_order, order_id),
+    ).fetchone()
+    if selected is None:
+        preview.close()
+        raise ValueError("所选工厂单不属于该订单或已不在预览中，请重新扫描")
+    production = OrderIndexStore(config.workflow_database)
+    try:
+        production.connection.execute("begin")
+        order_row = preview.connection.execute("select * from orders where order_id = ?", (order_id,)).fetchone()
+        if order_row is not None:
+            columns = [row[1] for row in preview.connection.execute("pragma table_info(orders)").fetchall()]
+            placeholders = ",".join("?" for _ in columns)
+            production.connection.execute(
+                f"insert or replace into orders({','.join(columns)}) values({placeholders})",
+                tuple(order_row),
+            )
+        material_columns = [
+            row[1] for row in preview.connection.execute("pragma table_info(material_items)").fetchall()
+        ]
+        material_rows = preview.connection.execute(
+            "select * from material_items where order_id = ? and source_type = 'aihouse'",
+            (order_id,),
+        ).fetchall()
+        material_id_index = material_columns.index("id")
+        source_path_index = material_columns.index("source_path")
+        material_insert_columns = [column for column in material_columns if column != "id"]
+        material_source_paths = {
+            str(row[source_path_index] or "") for row in material_rows if str(row[source_path_index] or "")
+        }
+        for source_path in material_source_paths:
+            production.connection.execute(
+                "delete from material_items where order_id = ? and source_type = 'aihouse' and source_path = ?",
+                (order_id, source_path),
+            )
+        if material_rows:
+            material_placeholders = ",".join("?" for _ in material_insert_columns)
+            production.connection.executemany(
+                f"insert or replace into material_items({','.join(material_insert_columns)}) values({material_placeholders})",
+                [
+                    tuple(value for index, value in enumerate(row) if index != material_id_index)
+                    for row in material_rows
+                ],
+            )
+        factory_columns = [row[1] for row in preview.connection.execute("pragma table_info(factory_orders)").fetchall()]
+        production.connection.execute(
+            f"insert or replace into factory_orders({','.join(factory_columns)}) values({','.join('?' for _ in factory_columns)})",
+            tuple(selected),
+        )
+        for table, where, args in (
+            ("hardware_items", "factory_order = ?", (factory_order,)),
+        ):
+            columns = [row[1] for row in preview.connection.execute(f"pragma table_info({table})").fetchall()]
+            production.connection.execute(f"delete from {table} where {where}", args)
+            rows = preview.connection.execute(
+                f"select {','.join(columns)} from {table} where {where}", args
+            ).fetchall()
+            if rows:
+                production.connection.executemany(
+                    f"insert into {table}({','.join(columns)}) values({','.join('?' for _ in columns)})",
+                    rows,
+                )
+        source_rows = preview.connection.execute(
+            """
+            select * from source_files
+            where source_folder = ? or source_folder like ?
+            """,
+            (selected[7], str(selected[7]).rstrip("/") + "/%"),
+        ).fetchall()
+        source_columns = [row[1] for row in preview.connection.execute("pragma table_info(source_files)").fetchall()]
+        for row in source_rows:
+            values = tuple(row)
+            source_order = str(values[source_columns.index("order_id")] or "").upper()
+            source_factories = str(values[source_columns.index("factory_order")] or "").upper().split(",")
+            if order_id not in source_order.split("、") and factory_order not in source_factories:
+                continue
+            production.connection.execute(
+                f"insert or replace into source_files({','.join(source_columns)}) values({','.join('?' for _ in source_columns)})",
+                values,
+            )
+        for table, predicate in (
+            ("production_batches", "batch_number in (select batch_number from batch_evidence where factory_order = ?)"),
+            ("batch_evidence", "factory_order = ?"),
+        ):
+            columns = [row[1] for row in preview.connection.execute(f"pragma table_info({table})").fetchall()]
+            rows = preview.connection.execute(
+                f"select {','.join(columns)} from {table} where {predicate}",
+                (factory_order,),
+            ).fetchall()
+            if rows:
+                production.connection.executemany(
+                    f"insert or replace into {table}({','.join(columns)}) values({','.join('?' for _ in columns)})",
+                    rows,
+                )
+        production.connection.commit()
+    except Exception:
+        production.connection.rollback()
+        raise
+    finally:
+        preview.close()
+        production.close()
+    verification = sqlite3.connect(config.workflow_database)
+    try:
+        verified_order = verification.execute(
+            "select 1 from orders where order_id = ?",
+            (order_id,),
+        ).fetchone()
+        verified_factory = verification.execute(
+            "select 1 from factory_orders where order_id = ? and factory_order = ?",
+            (order_id, factory_order),
+        ).fetchone()
+    finally:
+        verification.close()
+    if verified_order is None or verified_factory is None:
+        raise RuleError(
+            "server_write_persistence",
+            f"Server 确认事务已提交，但回读不到订单 {order_id} 或工厂单 {factory_order}",
+            order_id=order_id,
+            factory_order=factory_order,
+        )
+    return {
+        "server_write_confirmed": True,
+        "order_id": order_id,
+        "factory_order": factory_order,
+        "database": str(config.workflow_database),
+    }
 
 
 def process_server_changes(
@@ -5264,6 +7092,26 @@ def list_order_index(config: Config) -> dict:
     }
     store.close()
     return result
+
+
+def save_order_annotations(
+    config: Config,
+    order_id: str,
+    *,
+    user_note: str,
+    planned_days: list[dict[str, str]],
+    actual_days: list[dict[str, str]],
+) -> dict:
+    store = OrderIndexStore(config.workflow_database)
+    try:
+        return store.save_order_annotations(
+            order_id,
+            user_note=user_note,
+            planned_days=planned_days,
+            actual_days=actual_days,
+        )
+    finally:
+        store.close()
 
 
 def ignore_aimes_factories(config: Config, ignore_keys: list[str]) -> dict:

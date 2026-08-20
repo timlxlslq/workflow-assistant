@@ -13,7 +13,9 @@ from openpyxl import Workbook, load_workbook
 from traveler_assistant.core import Config, RuleError
 from traveler_assistant.inventory import (
     InventoryMappings,
+    InventoryPreview,
     InventorySyncStore,
+    OutboundItem,
     Product,
     ProductDatabase,
     ProductCatalog,
@@ -26,11 +28,14 @@ from traveler_assistant.inventory import (
     _is_inventory_authenticated_url,
     _is_inventory_domain_url,
     _is_inventory_service_workbench_url,
+    _persist_completed_outbound_results,
     build_database_preview,
     build_preview,
     check_stock,
+    database_outbound_fingerprint,
     import_catalog,
     list_traveler_names,
+    mark_customer_supplied_outbound,
     open_inventory_chrome,
     order_stock_requirements,
     parse_traveler,
@@ -39,12 +44,14 @@ from traveler_assistant.inventory import (
     reconcile_folder_status,
     run_jdy,
     resolve_inventory_items,
+    outbound_scope_decisions,
     set_ignored_mapping,
     save_manual_mapping,
     set_outbound_scope,
     stock_requirements,
     bootstrap_product_database,
     TravelerItem,
+    TravelerData,
     update_catalog_online,
     update_manual_mapping,
 )
@@ -52,6 +59,7 @@ from traveler_assistant.order_index import (
     OrderIndexStore,
     _refresh_outbound_status,
     assert_factory_orders_outbound_allowed,
+    reconcile_outbound_statuses,
 )
 
 
@@ -140,6 +148,126 @@ def make_priced_catalog(path: Path):
 
 
 class InventoryTests(unittest.TestCase):
+    def test_customer_supplied_outbound_marks_database_only_and_reopens_on_fact_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = Config(state_dir=root / "state")
+            config.prepare_storage()
+            store = OrderIndexStore(config.workflow_database)
+            store.connection.execute(
+                "insert into orders(order_id, order_type, updated_at) values(?,?,?)",
+                ("CS001", "cutToSize", "now"),
+            )
+            store.connection.execute(
+                "insert into factory_orders(factory_order, order_id, factory_name, optimized, outbound_status, updated_at) values(?,?,?,?,?,?)",
+                ("F1001", "CS001", "CS001-KITCHEN", 1, "未出库", "now"),
+            )
+            store.connection.execute(
+                "insert into material_items(order_id, material_type, color, thickness, quantity, unit, source_type, updated_at) values(?,?,?,?,?,?,?,?)",
+                ("CS001", "panel", "Customer Panel", "19.1", 4, "张", "aihouse", "now"),
+            )
+            store.commit()
+            store.close()
+
+            set_outbound_scope(
+                config,
+                "CS001",
+                "material",
+                "customer_supplied",
+                reason="客户提供材料，本公司只负责加工",
+            )
+            fingerprint = database_outbound_fingerprint(config, "CS001", "F1001")
+            result = mark_customer_supplied_outbound(config, "CS001", ["F1001"])
+            self.assertEqual(result["outbound_mode"], "customer_supplied")
+            self.assertEqual(result["outbound_status"], "已出库")
+
+            connection = sqlite3.connect(config.workflow_database)
+            row = connection.execute(
+                "select outbound_status, outbound_document, outbound_mode, outbound_fingerprint from factory_orders where factory_order='F1001'"
+            ).fetchone()
+            self.assertEqual(row, ("已出库", "", "customer_supplied", fingerprint))
+            self.assertEqual(
+                _refresh_outbound_status(
+                    config,
+                    {"order_id": "CS001", "factory_order": "F1001", "factory_name": "CS001-KITCHEN"},
+                    [],
+                ),
+                ("已出库", ""),
+            )
+            connection.execute(
+                "update material_items set quantity=5 where order_id='CS001'"
+            )
+            connection.commit()
+            connection.close()
+            self.assertNotEqual(
+                database_outbound_fingerprint(config, "CS001", "F1001"),
+                fingerprint,
+            )
+            self.assertEqual(
+                _refresh_outbound_status(
+                    config,
+                    {"order_id": "CS001", "factory_order": "F1001", "factory_name": "CS001-KITCHEN"},
+                    [],
+                ),
+                ("需要更新", ""),
+            )
+
+    def test_hardware_scope_requires_actual_positive_hardware_facts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(state_dir=Path(directory) / "state")
+            config.prepare_storage()
+            store = OrderIndexStore(config.workflow_database)
+            store.connection.execute(
+                "insert into orders(order_id, order_type, updated_at) values(?,?,?)",
+                ("CS004", "cutToSize", "now"),
+            )
+            store.connection.execute(
+                "insert into factory_orders(factory_order, order_id, factory_name, optimized, outbound_status, updated_at) values(?,?,?,?,?,?)",
+                ("F4004", "CS004", "CS004-KITCHEN", 1, "未出库", "now"),
+            )
+            store.commit()
+            store.close()
+
+            scope = outbound_scope_decisions(config, "CS004")
+            self.assertEqual(scope["hardware"], {})
+            with self.assertRaisesRegex(RuleError, "没有.*可出库五金数据"):
+                set_outbound_scope(config, "CS004", "hardware", "required", factory_order="F4004")
+
+    def test_outbound_scope_read_returns_latest_relevant_saved_decision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(state_dir=Path(directory) / "state")
+            config.prepare_storage()
+            store = OrderIndexStore(config.workflow_database)
+            store.connection.execute(
+                "insert into orders(order_id, order_type, updated_at) values(?,?,?)",
+                ("CS005", "cutToSize", "now"),
+            )
+            store.connection.execute(
+                "insert into factory_orders(factory_order, order_id, factory_name, optimized, outbound_status, updated_at) values(?,?,?,?,?,?)",
+                ("F5005", "CS005", "CS005-KITCHEN", 1, "未出库", "now"),
+            )
+            store.connection.execute(
+                "insert into material_items(order_id, material_type, color, thickness, quantity, unit, source_type, updated_at) values(?,?,?,?,?,?,?,?)",
+                ("CS005", "panel", "Blanco HG", "19.1", 1, "张", "manual", "now"),
+            )
+            store.connection.execute(
+                "insert into hardware_items(order_id, factory_order, scope, product_code, name, quantity, unit, source_type, updated_at) values(?,?,?,?,?,?,?,?,?)",
+                ("CS005", "F5005", "factory_order", "M1001", "Hinge", 1, "件", "database", "now"),
+            )
+            store.commit()
+            store.close()
+
+            set_outbound_scope(config, "CS005", "material", "customer_supplied", reason="客户提供板材")
+            material_scope = outbound_scope_decisions(config, "CS005", ["F5005"])
+            self.assertEqual(material_scope["last_decision"]["scope_type"], "material")
+            self.assertEqual(material_scope["material"]["requirement"], "customer_supplied")
+            self.assertEqual(material_scope["last_decision"]["reason"], "客户提供板材")
+
+            set_outbound_scope(config, "CS005", "hardware", "required", factory_order="F5005")
+            hardware_scope = outbound_scope_decisions(config, "CS005", ["F5005"])
+            self.assertEqual(hardware_scope["last_decision"]["scope_type"], "hardware")
+            self.assertEqual(hardware_scope["last_decision"]["factory_order"], "F5005")
+
     def test_cut_to_size_customer_supplied_material_stays_fact_but_is_not_outbound(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -193,8 +321,22 @@ class InventoryTests(unittest.TestCase):
             )
             store.commit()
             store.close()
-            with self.assertRaisesRegex(RuleError, "只有来料加工"):
+            with self.assertRaisesRegex(RuleError, "自有订单不支持设置出库范围"):
                 set_outbound_scope(config, "PP9999", "material", "customer_supplied", reason="误操作")
+
+    def test_owned_order_rejects_even_normalized_outbound_scope_decision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Config(state_dir=Path(directory) / "state")
+            config.prepare_storage()
+            store = OrderIndexStore(config.workflow_database)
+            store.connection.execute(
+                "insert into orders(order_id, order_type, updated_at) values(?,?,?)",
+                ("PP9998", "owned", "now"),
+            )
+            store.connection.commit()
+            store.close()
+            with self.assertRaisesRegex(RuleError, "自有订单不支持设置出库范围"):
+                set_outbound_scope(config, "PP9998", "material", "required")
 
     def test_remainder_decision_allows_empty_order_without_opening_browser(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -270,6 +412,28 @@ class InventoryTests(unittest.TestCase):
         self.assertIn('"order-preview", "--order-id"', swift)
         self.assertIn('var arguments = ["outbound"]', swift)
         self.assertIn('arguments += ["--order-id", orderID]', swift)
+        self.assertIn('"get-outbound-scope", "--order-id"', swift)
+        self.assertIn("loadOutboundScope", swift)
+        self.assertIn('finishInventoryStep(\n                named: "预检订单出库数据"', swift)
+        self.assertNotIn("case .inventory", swift)
+        self.assertNotIn("selection = .inventory", swift)
+        self.assertNotIn("onChange(of: model.inventoryMappingRequestPath", swift)
+        self.assertIn("showInventoryMappingWorkspace", swift)
+        self.assertIn("inventoryMappingTargetNames", swift)
+        self.assertIn("PendingInventoryMappingWorkspace", swift)
+        self.assertIn("PendingInventoryIgnoreSheet", swift)
+        self.assertIn('Button("忽略")', swift)
+        self.assertIn('Button("加入全局忽略")', swift)
+        self.assertIn('Button("处理映射")', swift)
+        self.assertIn("inventoryMappingSourceFolderPath", swift)
+        self.assertIn("refreshDashboardOrdersAfterInventoryMapping", swift)
+        self.assertIn('runOrder(["list-index"], failureStatus: "订单列表刷新失败"', swift)
+        self.assertIn("InventoryView(", dashboard)
+        detail_card = dashboard.split("struct OrderDashboardDetailCard", 1)[1].split(
+            "struct OutboundScopeSheet", 1
+        )[0]
+        self.assertIn('if orderType != "owned"', detail_card)
+        self.assertIn('Button("设置出库范围")', detail_card)
         detail = dashboard.split("struct OrderDashboardDetailPage", 1)[1].split(
             "struct OrderDashboardDetailCard", 1
         )[0]
@@ -278,7 +442,9 @@ class InventoryTests(unittest.TestCase):
         self.assertIn("min(max(0, geometry.size.width - AppLayout.contentPadding * 2), 1120)", detail)
         self.assertIn("ScrollView(.vertical)", detail)
         self.assertEqual(detail.count("ScrollView(.vertical)"), 1)
-        self.assertIn("ScrollView(.vertical) {\n                    hardwareSection", detail)
+        self.assertIn("ScrollView(.vertical)", detail)
+        self.assertIn("boardAndEdgeSection", detail)
+        self.assertIn("hardwareSection", detail)
         self.assertIn("HStack(alignment: .center", detail)
         self.assertIn('Text("订单 (\\(order.orderId))")', detail)
         self.assertNotIn("order.orderType", detail)
@@ -289,7 +455,7 @@ class InventoryTests(unittest.TestCase):
         self.assertIn("value: row.quantity.formatted()", detail)
         self.assertNotIn("model.loadOrderDetailFromDatabase(order)", detail)
         self.assertNotIn("if model.selectedOrderId.caseInsensitiveCompare(order.orderId)", detail)
-        self.assertIn('Text(isOrderContext ? "订单材料" : "Traveler 材料")', swift)
+        self.assertIn('Text("订单材料")', swift)
         self.assertIn("orderDetailGridColumnCount", detail)
         self.assertIn("inventoryIgnoredMappings", swift)
         self.assertIn("inventoryManualMappings", swift)
@@ -421,6 +587,7 @@ class InventoryTests(unittest.TestCase):
         self.assertIn("const waitForOtherOutboundListFrame", source)
         self.assertIn("const waitForOtherOutboundFormFrame", source)
         self.assertIn("const clickOtherOutboundHistory", source)
+        self.assertIn("const clickOtherOutboundHistoryWithRetry", source)
         self.assertIn("其他出库单中的历史单据", source)
         self.assertIn("准备点击“历史单据”进入记录列表", source)
         self.assertIn("const assertOutboundFormMatchesRequest", source)
@@ -439,6 +606,11 @@ class InventoryTests(unittest.TestCase):
         self.assertIn("本机已有出库单", source)
         self.assertIn("已停止，不新建重复出库单", source)
 
+    def test_outbound_timeout_persists_completed_documents_before_retry(self):
+        source = (Path(__file__).resolve().parents[1] / "traveler_assistant" / "inventory.py").read_text(encoding="utf-8")
+        self.assertIn("_persist_completed_outbound_results", source)
+        self.assertIn("后续单据结果需要先查询库存历史再重试", source)
+
     def test_jdy_error_detail_explains_reused_page_menu_timeout(self):
         detail = _jdy_error_detail(
             "库存系统自动操作失败：左侧菜单中等待可见“仓库”超过 30 秒；当前页面："
@@ -454,10 +626,13 @@ class InventoryTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         source = (root / "macos" / "TravelerAssistant.swift").read_text(encoding="utf-8")
         dashboard_source = (root / "macos" / "OrderDashboardView.swift").read_text(encoding="utf-8")
-        self.assertIn("private func togglePreviewRow(_ id: UUID)", source)
-        self.assertIn("togglePreviewRow(row.id)", source)
+        self.assertIn("private func previewRowContent(_ row: InventoryPreviewRow)", source)
+        self.assertNotIn("selectedPreviewRows", source)
+        self.assertNotIn("togglePreviewRow(row.id)", source)
+        self.assertNotIn("点击记录行即可整行选中；按住 Command 可多选", source)
+        self.assertIn(".frame(maxWidth: .infinity)\n        .frame(height: AppLayout.operationLogHeight)", source)
+        self.assertIn("HStack(spacing: 8) {\n                    Button(\"取消\")", source)
         self.assertIn("ScrollView(.vertical)", source)
-        self.assertIn("inventoryContentContainer", source)
         self.assertIn("inventoryWriteBlocked", source)
         self.assertIn("inventoryWriteCompleted", source)
         self.assertIn('text: model.inventoryWriteCompleted', source)
@@ -471,6 +646,20 @@ class InventoryTests(unittest.TestCase):
         self.assertNotIn('Text("\\(model.inventoryPreviewRows.count) 行")', source)
         self.assertIn('if model.inventoryChromeStatus.hasPrefix("❌")', source)
         self.assertNotIn('Text("已选 \\(selectedFactoryIDs.count) 个工厂单")', dashboard_source)
+
+    def test_order_dashboard_outbound_refresh_and_panel_color_layout_contract(self):
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "macos" / "TravelerAssistant.swift").read_text(encoding="utf-8")
+        dashboard_source = (root / "macos" / "OrderDashboardView.swift").read_text(encoding="utf-8")
+        self.assertIn("func refreshDashboardOrdersAfterOutbound()", source)
+        self.assertIn('runOrder(["list-index"], failureStatus: "订单列表刷新失败"', source)
+        self.assertIn("pendingDashboardOutboundRefresh", source)
+        self.assertIn("HStack(alignment: .center, spacing: AppLayout.actionSpacing)", source)
+        self.assertIn(".frame(maxWidth: .infinity, alignment: .center)", source)
+        self.assertIn("model.refreshDashboardOrdersAfterOutbound()", dashboard_source)
+        self.assertIn('.fixedSize(horizontal: true, vertical: false)', dashboard_source)
+        self.assertIn('.lineLimit(2)', dashboard_source)
+        self.assertIn('.multilineTextAlignment(.leading)', dashboard_source)
 
     def test_inventory_chrome_success_result_has_no_hidden_login_prompt(self):
         source = (Path(__file__).resolve().parents[1] / "traveler_assistant" / "inventory.py").read_text(encoding="utf-8")
@@ -1251,6 +1440,132 @@ class InventoryTests(unittest.TestCase):
             make_traveler(path, [("18mm--Plywood", 3)])
             reloaded = InventorySyncStore(root / "sync.json", root / "backups")
             self.assertEqual(reloaded.status_for(parse_traveler(path))[0], "需要更新")
+
+    def test_order_material_outbound_links_only_selected_split_factories(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = Config(state_dir=root / "state")
+            config.prepare_storage()
+            store = OrderIndexStore(config.workflow_database)
+            store.upsert_order("CS004", validation_status="正常")
+            for factory_order, factory_name in (
+                ("F-KITCHEN", "CS004-KITCHEN"),
+                ("F-VANITY", "CS004-vanity"),
+            ):
+                store.upsert_factory(
+                    factory_order,
+                    order_id="CS004",
+                    factory_name=factory_name,
+                    sales_order_name="CS004",
+                    name_source="AIMES",
+                    ownership_status="已确认",
+                    optimized=True,
+                    outbound_status="未出库",
+                )
+            store.connection.execute(
+                "insert into material_items(order_id, material_type, color, thickness, quantity, unit, source_type, updated_at) values(?,?,?,?,?,?,?,?)",
+                ("CS004", "plywood", "", "18", 2, "张", "database", "now"),
+            )
+            store.commit()
+            store.close()
+
+            source_item = TravelerItem(1, "板材与封边", "18mm--Plywood", 2, "CS004")
+            outbound_item = OutboundItem(
+                traveler_name="18mm--Plywood",
+                product_code="M0001",
+                product_name="18mm Plywood",
+                quantity=2,
+                section="板材与封边",
+                match_source="test",
+                document_remark="CS004",
+                unit="张",
+            )
+
+            def preview(factory_order):
+                traveler = TravelerData(
+                    path=config.workflow_database.resolve(),
+                    pp_folder="CS004",
+                    order_id="CS004",
+                    order_name="CS004",
+                    items=[source_item],
+                    zero_items=[],
+                    documents={"CS004": [source_item]},
+                    modified_at="2026-08-20T00:00:00",
+                    fingerprint="test-fingerprint",
+                )
+                return InventoryPreview(
+                    traveler=traveler,
+                    outbound_items=[outbound_item],
+                    selected_factory_orders=(factory_order,),
+                    source_type="database",
+                )
+
+            sync = InventorySyncStore(
+                config.state_dir / "inventory-outbound-records.json",
+                config.backup_root,
+            )
+            sync.save_success(preview("F-KITCHEN"), [{
+                "remark": "CS004",
+                "saved": True,
+                "documentNumber": "QTCK-001",
+            }])
+            links = sqlite3.connect(config.workflow_database).execute(
+                "select factory_order from outbound_document_factories "
+                "where document_number='QTCK-001' order by factory_order"
+            ).fetchall()
+            self.assertEqual(links, [("F-KITCHEN",)])
+
+            # The second factory reuses the unchanged order-level material
+            # document; it must append its explicit identity without creating
+            # another inventory document.
+            sync = InventorySyncStore(
+                config.state_dir / "inventory-outbound-records.json",
+                config.backup_root,
+            )
+            sync.save_success(preview("F-VANITY"), [{
+                "remark": "CS004",
+                "unchanged": True,
+                "saved": True,
+                "documentNumber": "QTCK-001",
+            }])
+            connection = sqlite3.connect(config.workflow_database)
+            links = connection.execute(
+                "select factory_order from outbound_document_factories "
+                "where document_number='QTCK-001' order by factory_order"
+            ).fetchall()
+            self.assertEqual(links, [("F-KITCHEN",), ("F-VANITY",)])
+            self.assertEqual(reconcile_outbound_statuses(config), 2)
+            statuses = connection.execute(
+                "select factory_order, outbound_status, outbound_document "
+                "from factory_orders where order_id='CS004' order by factory_order"
+            ).fetchall()
+            connection.close()
+            self.assertEqual(
+                statuses,
+                [
+                    ("F-KITCHEN", "已出库", "QTCK-001"),
+                    ("F-VANITY", "已出库", "QTCK-001"),
+                ],
+            )
+
+            connection = sqlite3.connect(config.workflow_database)
+            connection.execute("update material_items set quantity=3 where order_id='CS004'")
+            connection.commit()
+            connection.close()
+            self.assertEqual(reconcile_outbound_statuses(config), 2)
+            connection = sqlite3.connect(config.workflow_database)
+            changed_statuses = connection.execute(
+                "select factory_order, outbound_status, outbound_document "
+                "from factory_orders where order_id='CS004' order by factory_order"
+            ).fetchall()
+            connection.close()
+            self.assertEqual(
+                changed_statuses,
+                [
+                    ("F-KITCHEN", "需要更新", "QTCK-001"),
+                    ("F-VANITY", "需要更新", "QTCK-001"),
+                ],
+            )
 
     def test_previous_hardware_block_becoming_empty_requires_manual_void(self):
         with tempfile.TemporaryDirectory() as directory:

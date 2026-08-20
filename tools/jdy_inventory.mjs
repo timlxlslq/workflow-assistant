@@ -173,9 +173,10 @@ const hasOtherOutboundListControls = async frame => {
   return true;
 };
 const isOtherOutboundListFrame = async frame => {
-  if (isOtherOutboundListURL(frame.url())) return true;
+  // The route can appear before initOiList has rendered its query controls.
+  // A URL alone is therefore not evidence that the page is query-ready.
   // Some tenant workbenches keep the shell URL while rendering the list
-  // inside a route/frame. Recognize the visible list form as well.
+  // inside a route/frame, so visible controls are the readiness contract.
   return hasOtherOutboundListControls(frame);
 };
 const isOtherOutboundFormFrame = async frame => {
@@ -283,6 +284,14 @@ const clickOtherOutboundHistory = async page => {
   }
   return null;
 };
+const clickOtherOutboundHistoryWithRetry = async currentPage => {
+  const first = await clickOtherOutboundHistory(currentPage);
+  if (first) return first;
+  log("历史单据页面未完成加载，准备重新打开后重试");
+  await currentPage.reload({ waitUntil: "domcontentloaded", timeout: 12000 }).catch(() => {});
+  await currentPage.waitForTimeout(500);
+  return clickOtherOutboundHistory(currentPage);
+};
 const openOtherOutboundMenuItem = async (page, label = "其他出库单") => {
   const warehouseItems = await waitForVisibleLeftNavigationItem(page, "仓库", PAGE_NAVIGATION_TIMEOUT);
   const warehouse = warehouseItems.at(-1);
@@ -340,7 +349,7 @@ const openOtherOutboundList = async currentPage => {
     if (ready) return ready;
     log("当前其他出库单列表控件未就绪，准备通过左侧菜单重新打开");
   }
-  const historyFromCurrentPage = await clickOtherOutboundHistory(currentPage);
+  const historyFromCurrentPage = await clickOtherOutboundHistoryWithRetry(currentPage);
   if (historyFromCurrentPage) {
     page = historyFromCurrentPage.page;
     return historyFromCurrentPage.listFrame;
@@ -355,7 +364,7 @@ const openOtherOutboundList = async currentPage => {
   // Do not treat the entry form as a failed list load; follow the page's own
   // navigation to the actual initOiList view.
   log("“其他出库单”已打开新增表单，准备点击“历史单据”进入记录列表");
-  const historyFromForm = await clickOtherOutboundHistory(page);
+  const historyFromForm = await clickOtherOutboundHistoryWithRetry(page);
   if (historyFromForm) {
     page = historyFromForm.page;
     return historyFromForm.listFrame;

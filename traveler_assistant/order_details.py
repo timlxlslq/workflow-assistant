@@ -15,14 +15,39 @@ def order_detail(config: Config, order_id: str) -> dict:
     connection = sqlite3.connect(config.workflow_database)
     connection.row_factory = sqlite3.Row
     try:
+        connection.execute(
+            """
+            create table if not exists order_installation_days(
+                order_id text not null,
+                date_type text not null check(date_type in ('planned', 'actual')),
+                install_date text not null,
+                installer text not null default '',
+                updated_at text not null,
+                primary key(order_id, date_type, install_date)
+            )
+            """
+        )
         order = connection.execute(
             "select * from orders where order_id=?", (order_id.upper(),)
         ).fetchone()
+        installation_rows = connection.execute(
+            """
+            select date_type, install_date, installer
+            from order_installation_days
+            where order_id=?
+            order by date_type, install_date
+            """,
+            (order_id.upper(),),
+        ).fetchall()
+        installation = {"planned": [], "actual": []}
+        for row in installation_rows:
+            installation[row[0]].append({"date": row[1], "installer": row[2]})
         factories = connection.execute(
             """
             select factory_order, factory_name, sales_order_name, split_time,
                    report_state, ownership_status, has_hardware, optimized,
-                   outbound_status, outbound_document, production_batch_id
+                   outbound_status, outbound_document, outbound_mode,
+                   outbound_fingerprint, production_batch_id
             from factory_orders where order_id=? and aimes_status='active' order by factory_order
             """, (order_id.upper(),)
         ).fetchall()
@@ -55,9 +80,19 @@ def order_detail(config: Config, order_id: str) -> dict:
         ]
         outbound = connection.execute(
             """
-            select document_number, document_type, factory_order, status,
-                   source, issued_at, source_path, updated_at
-            from outbound_documents where order_id=? order by issued_at desc, document_number
+            select od.document_number, od.document_type,
+                   coalesce(
+                       (
+                           select group_concat(linked.factory_order, ',')
+                           from outbound_document_factories linked
+                           where linked.document_number = od.document_number
+                           order by linked.factory_order
+                       ),
+                       od.factory_order
+                   ) as factory_order,
+                   od.status, od.source, od.issued_at, od.source_path, od.updated_at
+            from outbound_documents od
+            where od.order_id=? order by od.issued_at desc, od.document_number
             """, (order_id.upper(),)
         ).fetchall()
         issues = connection.execute(
@@ -68,6 +103,7 @@ def order_detail(config: Config, order_id: str) -> dict:
         ).fetchall()
         return {
             "order": dict(order) if order else {"order_id": order_id.upper()},
+            "installation": installation,
             "factory_orders": [dict(row) for row in factories],
             "materials": [dict(row) for row in materials],
             "hardware": [dict(row) for row in hardware],

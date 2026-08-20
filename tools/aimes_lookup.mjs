@@ -173,6 +173,7 @@ try {
   if (request.verifyFactoryOrders) {
     const rows = [];
     const missing = [];
+    const verificationStartedAt = performance.now();
     const recentFactoryOrders = new Set(
       (output.recent_rows || []).map(row => String(row.factory_order || "").toUpperCase()),
     );
@@ -216,6 +217,7 @@ try {
         split_time: "",
       });
     }
+    recordStage("factory_order_verify", "精确核验工厂单存在性", verificationStartedAt);
     const payload = request.recentLimit
       ? { rows: output.recent_rows || [], verify_rows: rows, missing, timings }
       : { rows, missing, timings };

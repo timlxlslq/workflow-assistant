@@ -12,6 +12,59 @@ from traveler_assistant.order_index import OrderIndexStore
 
 
 class WorkflowDatabaseTests(unittest.TestCase):
+    def test_grouped_outbound_document_migrates_to_factory_links(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "workflow.sqlite3"
+            connection = sqlite3.connect(path)
+            connection.executescript(
+                """
+                create table factory_orders(
+                    factory_order text primary key,
+                    order_id text not null default '',
+                    factory_name text not null default '',
+                    sales_order_name text not null default '',
+                    aimes_status text not null default 'active'
+                );
+                create table outbound_documents(
+                    id integer primary key,
+                    document_number text not null unique,
+                    document_type text not null default '',
+                    order_id text not null default '',
+                    factory_order text not null default '',
+                    status text not null default 'recorded',
+                    source text not null default '',
+                    issued_at text not null default '',
+                    source_path text not null default '',
+                    updated_at text not null
+                );
+                insert into factory_orders(factory_order, order_id, factory_name, sales_order_name)
+                    values
+                    ('F100', 'PP9999', 'PP9999-MASTER', 'PP9999'),
+                    ('F101', 'PP9999', 'PP9999-1ST', 'PP9999'),
+                    ('F102', 'PP9999', 'PP9999-2ND', 'PP9999');
+                insert into outbound_documents(
+                    document_number, document_type, order_id, factory_order,
+                    status, source, issued_at, updated_at
+                ) values(
+                    'QTCK-GROUPED', '库存出库单', 'PP9999', 'F100,F101,F102',
+                    '已出库', 'user-confirmed-grouped', '2026-08-19', 'now'
+                );
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            ensure_schema(path)
+
+            connection = sqlite3.connect(path)
+            links = connection.execute(
+                "select factory_order from outbound_document_factories "
+                "where document_number='QTCK-GROUPED' order by factory_order"
+            ).fetchall()
+            connection.close()
+
+        self.assertEqual(links, [("F100",), ("F101",), ("F102",)])
+
     def test_material_table_migrates_to_order_scope_and_removes_allocations(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "workflow.sqlite3"
